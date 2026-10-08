@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use shared::Stats;
+use shared::{SettingsInput, SettingsView, Stats};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -12,17 +12,41 @@ use tauri::{
 use tauri_plugin_positioner::{Position, WindowExt};
 use tokio::sync::Notify;
 
-use crate::litellm::Client;
+use crate::{litellm::Client, settings::SettingsStore};
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
-const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
 type SharedStats = Arc<Mutex<Stats>>;
 
 #[tauri::command]
 fn close_window(window: tauri::WebviewWindow) {
     let _ = window.hide();
+}
+
+#[tauri::command]
+fn get_settings(store: State<'_, Arc<SettingsStore>>) -> SettingsView {
+    store.view()
+}
+
+/// Enregistre les paramètres. Si l'endpoint ou la clé changent, les données affichées sont réinitialisées
+/// et un rafraîchissement immédiat est demandé.
+#[tauri::command]
+fn save_settings(
+    input: SettingsInput,
+    store: State<'_, Arc<SettingsStore>>,
+    stats: State<'_, SharedStats>,
+    refresh: State<'_, Arc<Notify>>,
+    app: AppHandle,
+) -> Result<SettingsView, String> {
+    let changed = store.save(input)?;
+    if changed {
+        let fresh = Stats::default();
+        *stats.lock().unwrap() = fresh.clone();
+        let _ = app.emit("stats-updated", &fresh);
+    }
+    refresh.notify_one();
+    Ok(store.view())
 }
 
 #[tauri::command]
@@ -79,6 +103,12 @@ fn cache_path(app: &AppHandle) -> Option<PathBuf> {
     Some(dir.join("stats.json"))
 }
 
+fn settings_path(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("settings.json"))
+}
+
 fn load_cache(path: &Path) -> Option<Stats> {
     let mut stats: Stats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     // Les tokens d'un autre jour ne doivent pas apparaître comme ceux d'aujourd'hui.
@@ -102,7 +132,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .manage(stats.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window])
+        .manage(refresh.clone())
+        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
@@ -135,6 +166,8 @@ pub fn run() {
 
             // Cache disque : le dernier état connu s'affiche tout de suite, avant tout appel réseau.
             let cache = cache_path(app.handle());
+            let store = Arc::new(SettingsStore::load(settings_path(app.handle())));
+            app.manage(store.clone());
             if let Some(cached) = cache.as_deref().and_then(load_cache) {
                 let _ = tray.set_title(Some(title_for(&cached)));
                 *stats.lock().unwrap() = cached;
@@ -144,8 +177,6 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let client = Client::from_env();
-                // Applique une mise à jour partielle, puis met à jour le titre, le cache et le front.
                 let update = |f: &dyn Fn(&mut Stats)| {
                     let snapshot = {
                         let mut s = stats.lock().unwrap();
@@ -159,12 +190,18 @@ pub fn run() {
                     }
                 };
                 loop {
-                    match &client {
-                        Ok(c) => run_cycle(c, &update).await,
-                        Err(e) => update(&|s| s.error = Some(e.clone())),
+                    let settings = store.get();
+                    match store.api_key() {
+                        None => update(&|s| {
+                            s.error = Some("Aucune clé API : renseignez-la dans les paramètres (⚙︎).".into())
+                        }),
+                        Some(key) => match Client::new(&settings.base_url, key) {
+                            Ok(c) => run_cycle(&c, &update).await,
+                            Err(e) => update(&|s| s.error = Some(e.clone())),
+                        },
                     }
                     tokio::select! {
-                        _ = tokio::time::sleep(REFRESH_EVERY) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(settings.refresh_secs.into())) => {}
                         _ = refresh.notified() => {}
                     }
                 }

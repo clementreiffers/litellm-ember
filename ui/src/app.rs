@@ -3,8 +3,15 @@ use shared::Stats;
 
 use crate::{
     chart::{Bars, Donut, TokenSplit},
+    settings::Settings,
     tauri,
 };
+
+/// Icône d'engrenage (traits arrondis, couleur héritée du bouton).
+const GEAR_SVG: &str = r#"<svg class="gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="19.20" y1="12.00" x2="22.00" y2="12.00"/><line x1="17.09" y1="17.09" x2="19.07" y2="19.07"/><line x1="12.00" y1="19.20" x2="12.00" y2="22.00"/><line x1="6.91" y1="17.09" x2="4.93" y2="19.07"/><line x1="4.80" y1="12.00" x2="2.00" y2="12.00"/><line x1="6.91" y1="6.91" x2="4.93" y2="4.93"/><line x1="12.00" y1="4.80" x2="12.00" y2="2.00"/><line x1="17.09" y1="6.91" x2="19.07" y2="4.93"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2.2"/></svg>"#;
+
+/// Croix de fermeture, même style que l'engrenage.
+const CLOSE_SVG: &str = r#"<svg class="gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>"#;
 
 pub fn fmt_tokens(n: u64) -> String {
     match n {
@@ -17,6 +24,7 @@ pub fn fmt_tokens(n: u64) -> String {
 #[component]
 pub fn App() -> impl IntoView {
     let stats = RwSignal::new(Stats::default());
+    let show_settings = RwSignal::new(false);
 
     leptos::task::spawn_local(async move {
         if let Some(s) = tauri::get_stats().await {
@@ -25,10 +33,20 @@ pub fn App() -> impl IntoView {
         tauri::on_stats_updated(move |s| stats.set(s)).await;
     });
 
+    view! {
+      <div class="scroller">
+        <Show when=move || show_settings.get() fallback=move || view! { <Dashboard stats show_settings /> }>
+            <Settings on_close=Callback::new(move |_| show_settings.set(false)) />
+        </Show>
+      </div>
+    }
+}
+
+#[component]
+fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl IntoView {
     let today = Signal::derive(move || stats.with(|s| s.today.clone()));
     let today_spend: Signal<f64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
     let today_tokens: Signal<u64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
-
     let totals_rows = Signal::derive(move || {
         stats.with(|s| {
             s.models_total
@@ -59,14 +77,16 @@ pub fn App() -> impl IntoView {
     let donut_label = Signal::derive(move || fmt_tokens(today_tokens.get()));
 
     view! {
-      <div class="scroller">
         <header>
             <div>
                 <div class="caption">"Coût LiteLLM de la semaine"</div>
                 <div class="total">{move || format!("${:.2}", stats.with(|s| s.total_spend))}</div>
             </div>
             <div class="right">
-                <button class="close" on:click=|_| leptos::task::spawn_local(tauri::close_window())>"✕"</button>
+                <div class="btns">
+                    <button class="icon-btn" title="Paramètres" on:click=move |_| show_settings.set(true) inner_html=GEAR_SVG></button>
+                    <button class="icon-btn" title="Fermer" on:click=|_| leptos::task::spawn_local(tauri::close_window()) inner_html=CLOSE_SVG></button>
+                </div>
                 <div class="updated">{move || stats.with(|s| s.updated_at.clone().map(|t| format!("maj {t}")).unwrap_or_default())}</div>
             </div>
         </header>
@@ -101,6 +121,5 @@ pub fn App() -> impl IntoView {
             <Bars rows=totals_rows />
             <div class="hint">"Les modèles sans prix dans LiteLLM apparaissent à $0 et sont masqués."</div>
         </section>
-      </div>
     }
 }

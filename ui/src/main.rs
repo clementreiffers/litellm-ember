@@ -1,5 +1,6 @@
 mod app;
 mod chart;
+mod settings;
 mod tauri;
 
 fn main() {

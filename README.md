@@ -6,14 +6,19 @@ App Tauri v2 (macOS) : affiche le coût total LiteLLM dans la menu bar. Un clic 
 - Front : Rust/WASM avec Leptos + charming (`ui/`).
 - Données partagées : `shared/`.
 
-## Configuration (variables d'environnement)
+## Configuration
 
-| Variable | Rôle |
+Après le changement d’identité de l’application, renseignez à nouveau votre endpoint et votre clé. Les anciennes données locales sont conservées sans être importées automatiquement ; macOS peut demander une nouvelle autorisation des notifications.
+
+Bouton ⚙︎ du panneau : l’endpoint est vide au premier lancement et doit être renseigné avec votre clé API.
+
+| Paramètre | Stockage |
 |---|---|
-| `OPENAI_API_KEY` | Clé virtuelle LiteLLM (obligatoire). Jamais écrite dans le code ni dans les logs. |
-| `LITELLM_BASE_URL` | URL de votre instance LiteLLM (obligatoire). |
+| Endpoint LiteLLM | `settings.json` (dossier de données de l'app) |
+| Fréquence de rafraîchissement (5 à 3600 s) | `settings.json` |
+| Clé API LiteLLM | Trousseau macOS (service `io.github.clementreiffers.ember`), jamais dans un fichier |
 
-Une app lancée depuis le Finder n'hérite pas des variables du shell : lancez-la depuis un terminal (`open -a "LiteLLM Menubar"` ou `cargo tauri dev`).
+Sans clé dans le Trousseau, l'app n'appelle pas l'API et le demande dans le panneau. Le front ne relit jamais la clé.
 
 ## Lancer
 
@@ -23,5 +28,5 @@ cargo install trunk --locked
 cargo tauri dev            # dev
 cargo tauri build          # .app dans target/release/bundle/macos
 cargo test -p litellm-menubar                                   # tests unitaires
-cargo test -p litellm-menubar live -- --ignored --nocapture     # appel réel (nécessite OPENAI_API_KEY et LITELLM_BASE_URL)
+cargo test -p litellm-menubar live -- --ignored --nocapture     # appel réel (lit OPENAI_API_KEY et LITELLM_BASE_URL, test seulement)
 ```

@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Deserialize;
 use shared::{ModelCost, ModelUsage};
 
+
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
@@ -11,25 +12,17 @@ pub struct Client {
 }
 
 impl Client {
-    /// Lit `OPENAI_API_KEY` (obligatoire) et `LITELLM_BASE_URL` (obligatoire) dans l'environnement.
-    pub fn from_env() -> Result<Self, String> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .ok_or("OPENAI_API_KEY absente ou vide")?;
-        let base_url = std::env::var("LITELLM_BASE_URL")
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-            .ok_or("LITELLM_BASE_URL absente ou vide")?
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+    pub fn new(base_url: &str, api_key: String) -> Result<Self, String> {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            return Err("Endpoint LiteLLM manquant : renseignez-le dans les paramètres (⚙︎).".into());
+        }
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .map_err(|e| e.to_string())?,
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         })
     }
@@ -206,6 +199,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_rejects_blank_endpoints_before_any_request() {
+        for url in ["", "   "] {
+            assert!(matches!(Client::new(url, "test-key".into()), Err(e) if e.contains("Endpoint LiteLLM manquant")));
+        }
+    }
+
+    #[test]
+    fn client_trims_a_configured_endpoint() {
+        let client = Client::new("  https://example.com/llm/  ", "test-key".into()).unwrap();
+        assert_eq!(client.base_url, "https://example.com/llm");
+    }
+
+    #[test]
     fn parses_budget_durations() {
         assert_eq!(parse_days("7d"), 7);
         assert_eq!(parse_days("2w"), 14);
@@ -309,7 +315,11 @@ mod live {
     #[tokio::test]
     #[ignore]
     async fn fetch_stats_live() {
-        let c = Client::from_env().unwrap();
+        let c = Client::new(
+            &std::env::var("LITELLM_BASE_URL").expect("LITELLM_BASE_URL doit être définie pour le test réseau"),
+            std::env::var("OPENAI_API_KEY").unwrap(),
+        )
+        .unwrap();
         let t = std::time::Instant::now();
         let key = c.fetch_key().await.unwrap();
         println!("période ${:.2} depuis {:?} ({:?})", key.period_spend, key.period_start, t.elapsed());
