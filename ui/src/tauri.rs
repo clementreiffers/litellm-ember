@@ -1,6 +1,6 @@
 //! Pont vers l'API JS de Tauri (`withGlobalTauri: true`).
 use serde::Serialize;
-use shared::{SettingsInput, SettingsView, Stats, WeekDetails};
+use shared::{Activity, SettingsInput, SettingsView, Stats, WeekDetails};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -65,4 +65,8 @@ async fn invoke_as<T: serde::de::DeserializeOwned>(cmd: &str) -> Result<T, Strin
 
 pub async fn get_week() -> Result<WeekDetails, String> {
     invoke_as("get_week").await
+}
+
+pub async fn get_activity() -> Result<Activity, String> {
+    invoke_as("get_activity").await
 }

@@ -83,6 +83,53 @@ pub struct WeekDetails {
     pub projection: Option<f64>,
 }
 
+/// Activité d'un modèle sur la journée.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelActivity {
+    pub model: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub spend: f64,
+    pub avg_cost: f64,
+    pub avg_tokens: f64,
+    pub latency_p50_ms: Option<f64>,
+    pub latency_p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HourBucket {
+    pub requests: u64,
+    pub spend: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TopRequest {
+    pub model: String,
+    pub spend: f64,
+    pub total_tokens: u64,
+    /// Heure locale (HH:MM).
+    pub time: String,
+}
+
+/// Onglet « Activité » : statistiques du jour calculées sur les logs détaillés.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Activity {
+    pub requests: u64,
+    pub errors: u64,
+    pub avg_cost: f64,
+    pub avg_tokens: f64,
+    /// Part de requêtes servies par le cache, si le cache est utilisé (`None` sinon).
+    pub cache_rate: Option<f64>,
+    pub latency_p50_ms: Option<f64>,
+    pub latency_p95_ms: Option<f64>,
+    /// Délai médian avant le premier token (requêtes en streaming).
+    pub ttft_p50_ms: Option<f64>,
+    pub per_model: Vec<ModelActivity>,
+    /// 24 entrées, une par heure locale.
+    pub hourly: Vec<HourBucket>,
+    pub top_request: Option<TopRequest>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,10 +2,10 @@
 use std::future::Future;
 
 use leptos::prelude::*;
-use shared::WeekDetails;
+use shared::{Activity, WeekDetails};
 
 use crate::{
-    app::budget_level,
+    app::{budget_level, fmt_tokens},
     chart::Columns,
 };
 
@@ -69,6 +69,18 @@ fn Status(loading: Signal<bool>, has_data: Signal<bool>, error: Signal<Option<St
         })}
         {move || error.get().map(|e| view! { <div class="error">{e}</div> })}
     }
+}
+
+fn fmt_ms(ms: Option<f64>) -> String {
+    match ms {
+        None => "—".into(),
+        Some(v) if v >= 1000.0 => format!("{:.1} s", v / 1000.0),
+        Some(v) => format!("{v:.0} ms"),
+    }
+}
+
+fn fmt_cost(v: f64) -> String {
+    if v >= 1.0 { format!("${v:.2}") } else { format!("${v:.3}") }
 }
 
 /// « 2026-10-08 » -> « 08/10 ».
@@ -139,6 +151,90 @@ pub fn WeekTab(week: RwSignal<Remote<WeekDetails>>, max_budget: Signal<Option<f6
                     <h2>"Évolution sur la période"</h2>
                     <Columns cols highlight=today_idx />
                 </section>
+            }
+        })}
+    }
+}
+
+#[component]
+pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
+    let loading = Signal::derive(move || activity.with(|r| r.loading));
+    let has_data = Signal::derive(move || activity.with(|r| r.data.is_some()));
+    let error = Signal::derive(move || activity.with(|r| r.error.clone()));
+    let hourly = Signal::derive(move || {
+        activity.with(|r| {
+            r.data
+                .as_ref()
+                .map(|a| {
+                    a.hourly
+                        .iter()
+                        .enumerate()
+                        .map(|(h, b)| {
+                            let label = if h % 6 == 0 { format!("{h}h") } else { String::new() };
+                            (label, b.requests as f64, format!("{h}h : {} req · ${:.2}", b.requests, b.spend))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    });
+    let no_highlight = Signal::derive(|| None);
+
+    view! {
+        <Status loading has_data error />
+        {move || activity.with(|r| r.data.clone()).map(|a| {
+            let error_pct = if a.requests > 0 { a.errors as f64 / a.requests as f64 * 100.0 } else { 0.0 };
+            let cache = a.cache_rate.map(|c| format!("{:.0} %", c * 100.0)).unwrap_or("non utilisé".into());
+            view! {
+                <section class="card">
+                    <h2>"Aujourd'hui en un coup d'œil"</h2>
+                    <div class="kpis">
+                        <div class="kpi"><div class="caption">"Requêtes"</div><div class="kpi-val">{a.requests}</div></div>
+                        <div class="kpi"><div class="caption">"Coût moyen / req"</div><div class="kpi-val">{fmt_cost(a.avg_cost)}</div></div>
+                        <div class="kpi"><div class="caption">"Tokens moyens / req"</div><div class="kpi-val">{fmt_tokens(a.avg_tokens as u64)}</div></div>
+                        <div class="kpi"><div class="caption">"Taux d'erreur"</div>
+                            <div class=format!("kpi-val {}", if error_pct >= 10.0 { "crit" } else if error_pct >= 3.0 { "warn" } else { "" })>
+                                {format!("{error_pct:.1} %")}
+                            </div>
+                            <div class="caption">{format!("{} échec(s)", a.errors)}</div>
+                        </div>
+                        <div class="kpi"><div class="caption">"Cache"</div><div class="kpi-val">{cache}</div></div>
+                        <div class="kpi"><div class="caption">"Latence p50 / p95"</div>
+                            <div class="kpi-val">{fmt_ms(a.latency_p50_ms)}</div>
+                            <div class="caption">{format!("p95 {} · 1er token {}", fmt_ms(a.latency_p95_ms), fmt_ms(a.ttft_p50_ms))}</div>
+                        </div>
+                    </div>
+                </section>
+                <section class="card">
+                    <h2>"Par modèle"</h2>
+                    <table class="models">
+                        <tr class="th"><td>"modèle"</td><td class="num">"req"</td><td class="num">"$/req"</td><td class="num">"p50"</td><td class="num">"p95"</td><td class="num">"err"</td></tr>
+                        {a.per_model.iter().map(|m| {
+                            let err_class = if m.errors > 0 { "num crit" } else { "num" };
+                            view! {
+                            <tr>
+                                <td class="name">{m.model.clone()}</td>
+                                <td class="num">{m.requests}</td>
+                                <td class="num">{fmt_cost(m.avg_cost)}</td>
+                                <td class="num">{fmt_ms(m.latency_p50_ms)}</td>
+                                <td class="num">{fmt_ms(m.latency_p95_ms)}</td>
+                                <td class=err_class>{m.errors}</td>
+                            </tr>
+                        }}).collect_view()}
+                    </table>
+                </section>
+                <section class="card">
+                    <h2>"Rythme horaire (requêtes)"</h2>
+                    <Columns cols=hourly highlight=no_highlight compact=true />
+                    <div class="hint">"Heure locale. Survolez une barre pour le détail."</div>
+                </section>
+                {a.top_request.clone().map(|t| view! {
+                    <section class="card">
+                        <h2>"Requête la plus chère"</h2>
+                        <div class="big">{format!("${:.2}", t.spend)}</div>
+                        <div class="caption">{format!("{} · {} tokens · à {}", t.model, fmt_tokens(t.total_tokens), t.time)}</div>
+                    </section>
+                })}
             }
         })}
     }

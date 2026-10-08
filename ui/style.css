@@ -64,6 +64,8 @@ h3 { font-size: 11px; color: #aeaeb2; margin: 14px 0 6px; font-weight: 500; }
 .lvl-text.lvl-ok { color: #30d158; }
 .lvl-text.lvl-warn { color: #ff9f0a; }
 .lvl-text.lvl-crit { color: #ff453a; }
+.crit { color: #ff6961; }
+.warn { color: #ffb340; }
 
 /* Onglets */
 .tabs { display: flex; gap: 2px; padding: 3px; margin: 4px 0 12px; border-radius: 11px; background: rgba(255,255,255,.07); border: .5px solid rgba(255,255,255,.1); }
@@ -92,3 +94,13 @@ h3 { font-size: 11px; color: #aeaeb2; margin: 14px 0 6px; font-weight: 500; }
 .delta { margin-left: auto; font-weight: 700; padding: 4px 9px; border-radius: 8px; }
 .delta.up { color: #ff9f0a; background: rgba(255,159,10,.15); }
 .delta.down { color: #30d158; background: rgba(48,209,88,.15); }
+
+/* KPI et tableau */
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.kpi { background: rgba(255,255,255,.05); border-radius: 10px; padding: 9px; min-width: 0; }
+.kpi-val { font-size: 17px; font-weight: 700; margin: 2px 0; font-variant-numeric: tabular-nums; }
+table.models { width: 100%; border-collapse: collapse; font-size: 11px; }
+table.models td { padding: 5px 3px; border-bottom: .5px solid rgba(255,255,255,.08); }
+table.models td.name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.models td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.models tr.th td { color: #8e8e93; font-size: 10px; }

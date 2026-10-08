@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use shared::{SettingsInput, SettingsView, Stats, WeekDetails};
+use shared::{Activity, SettingsInput, SettingsView, Stats, WeekDetails};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -66,6 +66,12 @@ async fn get_week(
         (s.period_start.clone(), s.budget_reset_at.clone(), s.period_spend)
     };
     client.fetch_week(start.as_deref(), reset.as_deref(), spend).await
+}
+
+/// Onglet « Activité », chargé à la demande.
+#[tauri::command]
+async fn get_activity(store: State<'_, Arc<SettingsStore>>) -> Result<Activity, String> {
+    client_for(&store)?.fetch_activity().await
 }
 
 #[tauri::command]
@@ -152,7 +158,7 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(stats.clone())
         .manage(refresh.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week])
+        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 

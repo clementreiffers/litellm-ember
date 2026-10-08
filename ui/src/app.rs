@@ -1,9 +1,9 @@
 use leptos::prelude::*;
-use shared::{Stats, WeekDetails};
+use shared::{Activity, Stats, WeekDetails};
 
 use crate::{
     chart::{Bars, Donut, TokenSplit},
-    details::{self, Remote, WeekTab},
+    details::{self, ActivityTab, Remote, WeekTab},
     settings::Settings,
     tauri,
 };
@@ -37,6 +37,7 @@ pub fn budget_level(pct: f64) -> &'static str {
 enum Tab {
     Usage,
     Week,
+    Activity,
 }
 
 #[component]
@@ -46,6 +47,7 @@ pub fn App() -> impl IntoView {
     let tab = RwSignal::new(Tab::Usage);
     // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
     let week = RwSignal::new(Remote::<WeekDetails>::default());
+    let activity = RwSignal::new(Remote::<Activity>::default());
 
     leptos::task::spawn_local(async move {
         if let Some(s) = tauri::get_stats().await {
@@ -57,13 +59,14 @@ pub fn App() -> impl IntoView {
     let close_settings = Callback::new(move |_| {
         // L'endpoint ou la clé ont pu changer : les données à la demande sont à recharger.
         week.set(Remote::default());
+        activity.set(Remote::default());
         show_settings.set(false);
     });
 
     view! {
       <div class="scroller">
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week /> }>
+            fallback=move || view! { <Main stats show_settings tab week activity /> }>
             <Settings on_close=close_settings />
         </Show>
       </div>
@@ -76,10 +79,12 @@ fn Main(
     show_settings: RwSignal<bool>,
     tab: RwSignal<Tab>,
     week: RwSignal<Remote<WeekDetails>>,
+    activity: RwSignal<Remote<Activity>>,
 ) -> impl IntoView {
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
     Effect::new(move |_| match tab.get() {
         Tab::Week => details::load(week, tauri::get_week),
+        Tab::Activity => details::load(activity, tauri::get_activity),
         Tab::Usage => {}
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
@@ -110,11 +115,13 @@ fn Main(
         <nav class="tabs">
             {tab_button(Tab::Usage, "Consommation")}
             {tab_button(Tab::Week, "Semaine")}
+            {tab_button(Tab::Activity, "Activité")}
         </nav>
 
         {move || match tab.get() {
             Tab::Usage => view! { <UsageTab stats /> }.into_any(),
             Tab::Week => view! { <WeekTab week max_budget /> }.into_any(),
+            Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
     }
 }

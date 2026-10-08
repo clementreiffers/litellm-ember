@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use shared::{
-    DayCost, ModelCost, ModelUsage, WeekDetails,
+    Activity, DayCost, HourBucket, ModelActivity, ModelCost, ModelUsage, TopRequest, WeekDetails,
 };
 
 pub struct Client {
@@ -68,6 +68,10 @@ impl Client {
 
     /// Étape 3 (lente, 5 à 10 s : l'API renvoie les messages) : tokens et $ du jour par modèle.
     pub async fn fetch_today(&self) -> Result<Vec<ModelUsage>, String> {
+        Ok(aggregate_today(&self.fetch_today_rows().await?, Local::now().date_naive()))
+    }
+
+    async fn fetch_today_rows(&self) -> Result<Vec<LogRow>, String> {
         let today = Local::now().date_naive();
         // On ne demande que le jour UTC où commence le jour local, pas la veille entière.
         let start = today
@@ -76,10 +80,12 @@ impl Client {
             .map(|d| d.with_timezone(&Utc).date_naive())
             .unwrap_or_else(|| Utc::now().date_naive());
         let end = Utc::now().date_naive() + Duration::days(1);
-        let logs: Vec<LogRow> = self
-            .get(&format!("/spend/logs?summarize=false&start_date={start}&end_date={end}"))
-            .await?;
-        Ok(aggregate_today(&logs, today))
+        self.get(&format!("/spend/logs?summarize=false&start_date={start}&end_date={end}")).await
+    }
+
+    /// Onglet « Activité », appelé à la demande : même source que `fetch_today`, autres agrégations.
+    pub async fn fetch_activity(&self) -> Result<Activity, String> {
+        Ok(aggregate_activity(&self.fetch_today_rows().await?, Local::now().date_naive()))
     }
 
     /// Onglet « Semaine », appelé à la demande : coût par jour depuis le début de la période + projection.
@@ -212,6 +218,43 @@ struct LogRow {
     total: u64,
     #[serde(rename = "startTime")]
     start_time: Option<DateTime<Utc>>,
+    #[serde(default, rename = "endTime")]
+    end_time: Option<DateTime<Utc>>,
+    #[serde(default, rename = "completionStartTime")]
+    completion_start: Option<DateTime<Utc>>,
+    /// `"success"` ou `"failure"`.
+    #[serde(default)]
+    status: Option<String>,
+    /// Booléen ou chaîne (`"True"`, `"False"`, `"None"`) selon la version de LiteLLM.
+    #[serde(default)]
+    cache_hit: Option<serde_json::Value>,
+}
+
+impl LogRow {
+    fn failed(&self) -> bool {
+        self.status.as_deref() == Some("failure")
+    }
+
+    /// `Some(true)` si servie par le cache, `Some(false)` si le cache a été consulté sans succès, `None` s'il n'est pas utilisé.
+    fn cache(&self) -> Option<bool> {
+        use serde_json::Value;
+        match self.cache_hit.as_ref()? {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
+            Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
+            _ => None,
+        }
+    }
+
+    fn latency_ms(&self) -> Option<f64> {
+        let ms = (self.end_time? - self.start_time?).num_milliseconds() as f64;
+        (ms > 0.0).then_some(ms)
+    }
+
+    fn ttft_ms(&self) -> Option<f64> {
+        let ms = (self.completion_start? - self.start_time?).num_milliseconds() as f64;
+        (ms > 0.0).then_some(ms)
+    }
 }
 
 /// `openai/gpt-6-sol` et `gpt-6-sol` sont le même modèle ; `bedrock/invoke/x` → `x`.
@@ -253,6 +296,114 @@ fn aggregate_today(rows: &[LogRow], today: NaiveDate) -> Vec<ModelUsage> {
     out
 }
 
+/// Percentile par rang le plus proche ; `None` si la liste est vide.
+fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let idx = ((p / 100.0) * (values.len() - 1) as f64).round() as usize;
+    Some(values[idx])
+}
+
+fn aggregate_activity(rows: &[LogRow], today: NaiveDate) -> Activity {
+    let rows: Vec<&LogRow> = rows
+        .iter()
+        .filter(|r| r.start_time.is_some_and(|t| t.with_timezone(&Local).date_naive() == today))
+        .collect();
+    let mut hourly = vec![HourBucket::default(); 24];
+    if rows.is_empty() {
+        return Activity { hourly, ..Default::default() };
+    }
+
+    #[derive(Default)]
+    struct Acc {
+        requests: u64,
+        errors: u64,
+        spend: f64,
+        tokens: u64,
+        latencies: Vec<f64>,
+    }
+    let mut per_model: HashMap<String, Acc> = HashMap::new();
+    let (mut errors, mut spend, mut tokens) = (0_u64, 0.0_f64, 0_u64);
+    let (mut hits, mut tracked) = (0_u64, 0_u64);
+    let (mut latencies, mut ttfts) = (Vec::new(), Vec::new());
+
+    for r in &rows {
+        let failed = r.failed();
+        errors += failed as u64;
+        spend += r.spend;
+        tokens += r.total;
+        if let Some(hit) = r.cache() {
+            tracked += 1;
+            hits += hit as u64;
+        }
+        if !failed {
+            latencies.extend(r.latency_ms());
+            ttfts.extend(r.ttft_ms());
+        }
+        if let Some(t) = r.start_time {
+            let b = &mut hourly[t.with_timezone(&Local).hour() as usize];
+            b.requests += 1;
+            b.spend += r.spend;
+        }
+        if let Some(model) = normalize_model(&r.model) {
+            let a = per_model.entry(model).or_default();
+            a.requests += 1;
+            a.errors += failed as u64;
+            a.spend += r.spend;
+            a.tokens += r.total;
+            if !failed {
+                a.latencies.extend(r.latency_ms());
+            }
+        }
+    }
+
+    let ok = (rows.len() as u64 - errors).max(1) as f64;
+    let mut per_model: Vec<ModelActivity> = per_model
+        .into_iter()
+        .map(|(model, mut a)| {
+            let ok = (a.requests - a.errors).max(1) as f64;
+            ModelActivity {
+                model,
+                requests: a.requests,
+                errors: a.errors,
+                spend: a.spend,
+                avg_cost: a.spend / ok,
+                avg_tokens: a.tokens as f64 / ok,
+                latency_p50_ms: percentile(&mut a.latencies, 50.0),
+                latency_p95_ms: percentile(&mut a.latencies, 95.0),
+            }
+        })
+        .collect();
+    per_model.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.model.cmp(&b.model)));
+
+    let top_request = rows
+        .iter()
+        .filter(|r| r.spend > 0.0)
+        .max_by(|a, b| a.spend.total_cmp(&b.spend))
+        .map(|r| TopRequest {
+            model: normalize_model(&r.model).unwrap_or_default(),
+            spend: r.spend,
+            total_tokens: r.total,
+            time: r.start_time.map(|t| t.with_timezone(&Local).format("%H:%M").to_string()).unwrap_or_default(),
+        });
+
+    Activity {
+        requests: rows.len() as u64,
+        errors,
+        avg_cost: spend / ok,
+        avg_tokens: tokens as f64 / ok,
+        cache_rate: (tracked > 0).then(|| hits as f64 / tracked as f64),
+        latency_p50_ms: percentile(&mut latencies, 50.0),
+        latency_p95_ms: percentile(&mut latencies, 95.0),
+        ttft_p50_ms: percentile(&mut ttfts, 50.0),
+        per_model,
+        hourly,
+        top_request,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +419,48 @@ mod tests {
     fn client_trims_a_configured_endpoint() {
         let client = Client::new("  https://example.com/llm/  ", "test-key".into()).unwrap();
         assert_eq!(client.base_url, "https://example.com/llm");
+    }
+
+    fn row(json: &str) -> LogRow {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn percentiles() {
+        let mut v = vec![40.0, 10.0, 30.0, 20.0, 50.0];
+        assert_eq!(percentile(&mut v, 50.0), Some(30.0));
+        assert_eq!(percentile(&mut v, 95.0), Some(50.0));
+        assert_eq!(percentile(&mut [], 50.0), None);
+    }
+
+    #[test]
+    fn activity_stats() {
+        let now = Utc::now();
+        let t = |ms: i64| (now + Duration::milliseconds(ms)).to_rfc3339();
+        let rows = vec![
+            row(&format!(
+                r#"{{"model":"openai/m","spend":1.0,"total_tokens":100,"status":"success","cache_hit":"False",
+                "startTime":"{}","endTime":"{}","completionStartTime":"{}"}}"#,
+                t(0), t(2000), t(500)
+            )),
+            row(&format!(
+                r#"{{"model":"m","spend":3.0,"total_tokens":300,"status":"success","cache_hit":true,
+                "startTime":"{}","endTime":"{}"}}"#,
+                t(0), t(4000)
+            )),
+            row(&format!(r#"{{"model":"","spend":0.0,"total_tokens":0,"status":"failure","cache_hit":"None","startTime":"{}"}}"#, t(0))),
+        ];
+        let a = aggregate_activity(&rows, Local::now().date_naive());
+        assert_eq!((a.requests, a.errors), (3, 1));
+        assert!((a.avg_cost - 2.0).abs() < 1e-9); // 4 $ sur 2 requêtes réussies
+        assert_eq!(a.avg_tokens, 200.0);
+        assert_eq!(a.cache_rate, Some(0.5)); // la valeur "None" n'est pas comptée
+        assert_eq!(a.latency_p50_ms, Some(4000.0));
+        assert_eq!(a.ttft_p50_ms, Some(500.0));
+        assert_eq!(a.per_model.len(), 1);
+        assert_eq!(a.per_model[0].requests, 2);
+        assert_eq!(a.top_request.as_ref().unwrap().spend, 3.0);
+        assert_eq!(a.hourly.iter().map(|h| h.requests).sum::<u64>(), 3);
     }
 
     #[test]
@@ -434,6 +627,33 @@ mod tests {
     }
 
     #[test]
+    fn log_row_cache_hit_variants() {
+        let cache = |v: &str| row(&format!(r#"{{"cache_hit":{v}}}"#)).cache();
+        assert_eq!(cache("true"), Some(true));
+        assert_eq!(cache("false"), Some(false));
+        assert_eq!(cache(r#""True""#), Some(true));
+        assert_eq!(cache(r#""False""#), Some(false));
+        assert_eq!(cache(r#""None""#), None);
+        assert_eq!(cache("null"), None);
+        assert_eq!(row("{}").cache(), None);
+    }
+
+    #[test]
+    fn log_row_tolerates_missing_fields_and_computes_latencies() {
+        let r = row("{}");
+        assert!(!r.failed() && r.start_time.is_none() && r.latency_ms().is_none() && r.ttft_ms().is_none());
+        let r = row(
+            r#"{"status":"failure","startTime":"2026-10-12T10:00:00Z","completionStartTime":"2026-10-12T10:00:01Z","endTime":"2026-10-12T10:00:03Z"}"#,
+        );
+        assert!(r.failed());
+        assert_eq!(r.latency_ms(), Some(3000.0));
+        assert_eq!(r.ttft_ms(), Some(1000.0));
+        // Durées négatives ou nulles ignorées.
+        let r = row(r#"{"startTime":"2026-10-12T10:00:00Z","endTime":"2026-10-12T10:00:00Z"}"#);
+        assert_eq!(r.latency_ms(), None);
+    }
+
+    #[test]
     fn totals_ignore_empty_model_names() {
         let days: Vec<DaySummary> =
             serde_json::from_str(r#"[{"models":{"":1.0,"a/m":2.0},"spend":3.0,"startTime":"2026-10-12"}]"#).unwrap();
@@ -470,6 +690,17 @@ mod live {
         for d in &week.days {
             println!("{} ${:.2}", d.date, d.spend);
         }
+        let act = c.fetch_activity().await.unwrap();
+        println!("--- activité ({:?})", t.elapsed());
+        println!(
+            "req {} err {} avg ${:.4} avg tok {:.0} cache {:?} p50 {:?} p95 {:?} ttft {:?}",
+            act.requests, act.errors, act.avg_cost, act.avg_tokens, act.cache_rate, act.latency_p50_ms, act.latency_p95_ms, act.ttft_p50_ms
+        );
+        for m in &act.per_model {
+            println!("{:<50} {:>4} req {:>3} err ${:.4}/req p50 {:?}", m.model, m.requests, m.errors, m.avg_cost, m.latency_p50_ms);
+        }
+        println!("heures: {:?}", act.hourly.iter().map(|h| h.requests).collect::<Vec<_>>());
+        println!("top: {:?}", act.top_request);
         let today = c.fetch_today().await.unwrap();
         println!("--- aujourd'hui ({:?})", t.elapsed());
         for u in &today {
