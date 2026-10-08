@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use shared::{SettingsInput, SettingsView, Stats};
+use shared::{SettingsInput, SettingsView, Stats, WeekDetails};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -47,6 +47,25 @@ fn save_settings(
     }
     refresh.notify_one();
     Ok(store.view())
+}
+
+fn client_for(store: &SettingsStore) -> Result<Client, String> {
+    let key = store.api_key().ok_or("Aucune clé API : renseignez-la dans les paramètres.")?;
+    Client::new(&store.get().base_url, key)
+}
+
+/// Onglet « Semaine », chargé à la demande.
+#[tauri::command]
+async fn get_week(
+    store: State<'_, Arc<SettingsStore>>,
+    stats: State<'_, SharedStats>,
+) -> Result<WeekDetails, String> {
+    let client = client_for(&store)?;
+    let (start, reset, spend) = {
+        let s = stats.lock().unwrap();
+        (s.period_start.clone(), s.budget_reset_at.clone(), s.period_spend)
+    };
+    client.fetch_week(start.as_deref(), reset.as_deref(), spend).await
 }
 
 #[tauri::command]
@@ -133,7 +152,7 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(stats.clone())
         .manage(refresh.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings])
+        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 

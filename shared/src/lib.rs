@@ -68,6 +68,21 @@ pub struct SettingsInput {
     pub clear_key: bool,
 }
 
+/// Coût d'un jour (UTC, YYYY-MM-DD).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DayCost {
+    pub date: String,
+    pub spend: f64,
+}
+
+/// Onglet « Semaine » : évolution jour par jour et projection de fin de période.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WeekDetails {
+    pub days: Vec<DayCost>,
+    /// Dépense estimée à la fin de la période de budget, au rythme actuel.
+    pub projection: Option<f64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

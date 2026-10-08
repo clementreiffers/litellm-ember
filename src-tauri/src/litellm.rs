@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Deserialize;
-use shared::{ModelCost, ModelUsage};
-
+use shared::{
+    DayCost, ModelCost, ModelUsage, WeekDetails,
+};
 
 pub struct Client {
     http: reqwest::Client,
@@ -80,6 +81,60 @@ impl Client {
             .await?;
         Ok(aggregate_today(&logs, today))
     }
+
+    /// Onglet « Semaine », appelé à la demande : coût par jour depuis le début de la période + projection.
+    pub async fn fetch_week(
+        &self,
+        period_start: Option<&str>,
+        budget_reset_at: Option<&str>,
+        period_spend: f64,
+    ) -> Result<WeekDetails, String> {
+        let now = Utc::now();
+        let today = now.date_naive();
+        let start = period_start.and_then(parse_date).unwrap_or(today - Duration::days(6));
+        let summary: Vec<DaySummary> = self
+            .get(&format!(
+                "/spend/logs?summarize=true&start_date={start}&end_date={}",
+                today + Duration::days(1)
+            ))
+            .await?;
+        Ok(WeekDetails {
+            days: aggregate_days(&summary, start, today),
+            projection: budget_reset_at
+                .and_then(parse_date)
+                .and_then(|reset| project(period_spend, start, reset, now)),
+        })
+    }
+}
+
+fn parse_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()
+}
+
+/// Un point par jour de `start` à `today` (les jours sans dépense valent 0), au plus les 14 derniers.
+fn aggregate_days(summary: &[DaySummary], start: NaiveDate, today: NaiveDate) -> Vec<DayCost> {
+    let mut by_day: HashMap<NaiveDate, f64> = HashMap::new();
+    for d in summary {
+        if let Some(date) = d.start_time.as_deref().and_then(parse_date) {
+            *by_day.entry(date).or_default() += d.spend;
+        }
+    }
+    let first = start.max(today - Duration::days(13));
+    (0..=(today - first).num_days())
+        .map(|i| {
+            let date = first + Duration::days(i);
+            DayCost { date: date.to_string(), spend: by_day.get(&date).copied().unwrap_or(0.0) }
+        })
+        .collect()
+}
+
+/// Extrapole la dépense de la période au rythme moyen observé depuis son début.
+fn project(spend: f64, start: NaiveDate, reset: NaiveDate, now: DateTime<Utc>) -> Option<f64> {
+    let total_days = (reset - start).num_days() as f64;
+    let begin = start.and_hms_opt(0, 0, 0)?.and_utc();
+    // Au moins 6 h écoulées, sinon l'extrapolation n'a pas de sens.
+    let elapsed_days = (now - begin).num_seconds() as f64 / 86_400.0;
+    (total_days > 0.0 && elapsed_days >= 0.25).then(|| spend / elapsed_days * total_days)
 }
 
 pub struct KeyData {
@@ -137,6 +192,10 @@ struct KeyInfoInner {
 struct DaySummary {
     #[serde(default)]
     models: HashMap<String, f64>,
+    #[serde(default)]
+    spend: f64,
+    #[serde(default, rename = "startTime")]
+    start_time: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +271,28 @@ mod tests {
     }
 
     #[test]
+    fn week_days_are_filled_and_projection_extrapolates() {
+        let start = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let summary: Vec<DaySummary> = serde_json::from_str(
+            r#"[{"startTime":"2026-10-05","spend":0.0,"models":{}},{"startTime":"2026-10-07","spend":7.5,"models":{}},
+                {"startTime":"2026-10-08","spend":21.0,"models":{}}]"#,
+        )
+        .unwrap();
+        let days = aggregate_days(&summary, start, today);
+        assert_eq!(days.len(), 4);
+        assert_eq!(days[1].spend, 0.0); // 2026-10-06 absent
+        assert_eq!(days[3].spend, 21.0);
+
+        let reset = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z").unwrap().with_timezone(&Utc);
+        // 3,5 jours écoulés sur 7 : 28 $ -> 56 $
+        assert!((project(28.0, start, reset, now).unwrap() - 56.0).abs() < 1e-9);
+        let early = DateTime::parse_from_rfc3339("2026-10-05T03:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(project(1.0, start, reset, early), None);
+    }
+
+    #[test]
     fn parses_budget_durations() {
         assert_eq!(parse_days("7d"), 7);
         assert_eq!(parse_days("2w"), 14);
@@ -256,6 +337,14 @@ mod tests {
         assert!((today[0].spend - 0.75).abs() < 1e-9);
     }
 
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn parse_days_handles_units_and_garbage() {
         assert_eq!(parse_days("7d"), 7);
@@ -286,6 +375,54 @@ mod tests {
         assert_eq!(period_start(&info(None, Some("7d"))), None);
         assert_eq!(period_start(&info(Some("pas une date"), Some("7d"))), None);
         assert_eq!(period_start(&info(Some("2026"), Some("7d"))), None);
+    }
+
+    #[test]
+    fn project_edge_cases() {
+        let start = d("2026-10-01");
+        let reset = d("2026-10-11");
+        // 5 jours écoulés sur 10 : on double.
+        let p = project(50.0, start, reset, at("2026-10-06T00:00:00Z")).unwrap();
+        assert!((p - 100.0).abs() < 1e-9);
+        // Dépense nulle.
+        assert_eq!(project(0.0, start, reset, at("2026-10-06T00:00:00Z")), Some(0.0));
+        // Moins de 6 h écoulées (frontière incluse à exactement 6 h).
+        assert_eq!(project(1.0, start, reset, at("2026-10-01T05:59:59Z")), None);
+        assert!(project(1.0, start, reset, at("2026-10-01T06:00:00Z")).is_some());
+        // Maintenant avant le début, ou période vide / inversée.
+        assert_eq!(project(1.0, start, reset, at("2026-09-30T00:00:00Z")), None);
+        assert_eq!(project(1.0, start, start, at("2026-10-06T00:00:00Z")), None);
+        assert_eq!(project(1.0, reset, start, at("2026-10-12T00:00:00Z")), None);
+    }
+
+    #[test]
+    fn parse_date_needs_a_full_iso_prefix() {
+        assert_eq!(parse_date("2026-10-12T00:00:00Z"), Some(d("2026-10-12")));
+        assert_eq!(parse_date("2026-10-12"), Some(d("2026-10-12")));
+        assert_eq!(parse_date("2026-10"), None);
+        assert_eq!(parse_date(""), None);
+        assert_eq!(parse_date("éééééééééééé"), None); // pas de panique sur un découpage hors frontière
+    }
+
+    #[test]
+    fn aggregate_days_caps_at_14_days_and_sums_duplicates() {
+        let day = |date: &str, spend: f64| DaySummary {
+            models: HashMap::new(),
+            spend,
+            start_time: Some(format!("{date}T00:00:00Z")),
+        };
+        let summary = [day("2026-10-20", 1.0), day("2026-10-20", 2.0), day("2026-10-21", 0.5)];
+        let days = aggregate_days(&summary, d("2026-09-01"), d("2026-10-21"));
+        assert_eq!(days.len(), 14);
+        assert_eq!(days[0].date, "2026-10-08");
+        assert!((days[12].spend - 3.0).abs() < 1e-9);
+        assert!((days[13].spend - 0.5).abs() < 1e-9);
+        assert_eq!(days[1].spend, 0.0);
+        // `start` après `today` : liste vide, sans panique.
+        assert!(aggregate_days(&summary, d("2026-10-22"), d("2026-10-21")).is_empty());
+        // Entrée sans date ignorée.
+        let nodate = [DaySummary { models: HashMap::new(), spend: 9.0, start_time: None }];
+        assert!(aggregate_days(&nodate, d("2026-10-21"), d("2026-10-21")).iter().all(|x| x.spend == 0.0));
     }
 
     #[test]
@@ -327,6 +464,11 @@ mod live {
         println!("modèles ({:?})", t.elapsed());
         for m in &models {
             println!("{:<55} ${:.2}", m.model, m.spend);
+        }
+        let week = c.fetch_week(key.period_start.as_deref(), key.budget_reset_at.as_deref(), key.period_spend).await.unwrap();
+        println!("--- semaine: projection {:?}", week.projection);
+        for d in &week.days {
+            println!("{} ${:.2}", d.date, d.spend);
         }
         let today = c.fetch_today().await.unwrap();
         println!("--- aujourd'hui ({:?})", t.elapsed());

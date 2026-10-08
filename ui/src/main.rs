@@ -1,5 +1,6 @@
 mod app;
 mod chart;
+mod details;
 mod settings;
 mod tauri;
 

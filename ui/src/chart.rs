@@ -107,3 +107,37 @@ pub fn TokenSplit(usage: Signal<Vec<ModelUsage>>) -> impl IntoView {
         }}
     }
 }
+
+/// Colonnes verticales (histogramme). `highlight` met en avant une colonne (ex. aujourd'hui).
+#[component]
+pub fn Columns(
+    /// (étiquette sous la colonne, valeur, texte au survol)
+    cols: Signal<Vec<(String, f64, String)>>,
+    highlight: Signal<Option<usize>>,
+    #[prop(optional)] compact: bool,
+) -> impl IntoView {
+    view! {
+        <div class="columns" class:compact=compact>
+            {move || {
+                let cols = cols.get();
+                let max = cols.iter().map(|c| c.1).fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+                let hl = highlight.get();
+                cols.into_iter()
+                    .enumerate()
+                    .map(|(i, (label, value, tip))| {
+                        let pct = (value / max * 100.0).max(if value > 0.0 { 3.0 } else { 0.0 });
+                        let (c1, c2) = if hl == Some(i) { ("#7c5cff", "#b49cff") } else { ("#4a4a6a", "#7d7da6") };
+                        view! {
+                            <div class="col" title=tip>
+                                <div class="col-bar">
+                                    <div class="col-fill" style=format!("height:{pct:.1}%;background:linear-gradient(0deg,{c1},{c2})")></div>
+                                </div>
+                                <div class="col-label">{label}</div>
+                            </div>
+                        }
+                    })
+                    .collect_view()
+            }}
+        </div>
+    }
+}

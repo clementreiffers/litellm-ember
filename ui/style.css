@@ -4,7 +4,8 @@ html { height: 100%; border-radius: 22px; overflow: hidden; }
 html, body { margin: 0; background: transparent; color: #f5f5f7; font-size: 12px; -webkit-font-smoothing: antialiased; }
 body { height: 100%; overflow: hidden; border-radius: 22px; }
 /* Le défilement est dans un conteneur décalé du bord : la barre reste dans la zone arrondie. */
-.scroller { height: calc(100% - 28px); margin: 14px 6px 14px 0; padding: 4px 10px 4px 16px; overflow-y: auto; overflow-x: hidden; }
+/* L'emplacement de la barre est toujours réservé : sa présence ne décale plus le contenu d'un onglet à l'autre. */
+.scroller { height: calc(100% - 28px); margin: 14px 6px 14px 0; padding: 4px 10px 4px 16px; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; }
 .scroller::-webkit-scrollbar { width: 8px; }
 .scroller::-webkit-scrollbar-thumb { background: rgba(255,255,255,.25); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
 .scroller::-webkit-scrollbar-track { background: transparent; margin: 6px 0; }
@@ -63,6 +64,31 @@ h3 { font-size: 11px; color: #aeaeb2; margin: 14px 0 6px; font-weight: 500; }
 .lvl-text.lvl-ok { color: #30d158; }
 .lvl-text.lvl-warn { color: #ff9f0a; }
 .lvl-text.lvl-crit { color: #ff453a; }
-.crit { color: #ff6961; }
-.warn { color: #ffb340; }
 
+/* Onglets */
+.tabs { display: flex; gap: 2px; padding: 3px; margin: 4px 0 12px; border-radius: 11px; background: rgba(255,255,255,.07); border: .5px solid rgba(255,255,255,.1); }
+.tabs button { flex: 1; padding: 6px 4px; border: 0; border-radius: 8px; background: transparent; color: #aeaeb2; font-size: 12px; font-family: inherit; cursor: pointer; transition: background .15s, color .15s; }
+.tabs button:hover { color: #fff; }
+.tabs button.active { background: rgba(255,255,255,.18); color: #fff; font-weight: 600; box-shadow: 0 1px 4px rgba(0,0,0,.25); }
+
+/* Chargement à la demande */
+.pending, .refreshing { display: flex; align-items: center; gap: 8px; color: #aeaeb2; }
+.pending { justify-content: center; padding: 28px 0; background: rgba(255,255,255,.05); border: .5px solid rgba(255,255,255,.1); border-radius: 16px; margin-bottom: 12px; }
+.refreshing { justify-content: flex-end; font-size: 10px; color: #8e8e93; margin-bottom: 6px; }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255,255,255,.2); border-top-color: #b49cff; animation: spin .8s linear infinite; }
+.spinner.small { width: 9px; height: 9px; border-width: 1.5px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Colonnes */
+.columns { display: flex; align-items: flex-end; gap: 6px; height: 130px; }
+.columns.compact { gap: 2px; height: 90px; }
+.col { flex: 1; height: 100%; display: flex; flex-direction: column; min-width: 0; }
+.col-bar { flex: 1; display: flex; align-items: flex-end; }
+.col-fill { width: 100%; border-radius: 4px 4px 2px 2px; transition: height .5s cubic-bezier(.2,.8,.2,1); }
+.col-label { height: 14px; margin-top: 4px; text-align: center; font-size: 9px; color: #8e8e93; white-space: nowrap; overflow: visible; }
+
+/* Comparaison */
+.compare { display: flex; align-items: center; gap: 22px; }
+.delta { margin-left: auto; font-weight: 700; padding: 4px 9px; border-radius: 8px; }
+.delta.up { color: #ff9f0a; background: rgba(255,159,10,.15); }
+.delta.down { color: #30d158; background: rgba(48,209,88,.15); }

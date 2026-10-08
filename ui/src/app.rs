@@ -1,8 +1,9 @@
 use leptos::prelude::*;
-use shared::Stats;
+use shared::{Stats, WeekDetails};
 
 use crate::{
     chart::{Bars, Donut, TokenSplit},
+    details::{self, Remote, WeekTab},
     settings::Settings,
     tauri,
 };
@@ -32,10 +33,19 @@ pub fn budget_level(pct: f64) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Usage,
+    Week,
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let stats = RwSignal::new(Stats::default());
     let show_settings = RwSignal::new(false);
+    let tab = RwSignal::new(Tab::Usage);
+    // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
+    let week = RwSignal::new(Remote::<WeekDetails>::default());
 
     leptos::task::spawn_local(async move {
         if let Some(s) = tauri::get_stats().await {
@@ -44,17 +54,105 @@ pub fn App() -> impl IntoView {
         tauri::on_stats_updated(move |s| stats.set(s)).await;
     });
 
+    let close_settings = Callback::new(move |_| {
+        // L'endpoint ou la clé ont pu changer : les données à la demande sont à recharger.
+        week.set(Remote::default());
+        show_settings.set(false);
+    });
+
     view! {
       <div class="scroller">
-        <Show when=move || show_settings.get() fallback=move || view! { <Dashboard stats show_settings /> }>
-            <Settings on_close=Callback::new(move |_| show_settings.set(false)) />
+        <Show when=move || show_settings.get()
+            fallback=move || view! { <Main stats show_settings tab week /> }>
+            <Settings on_close=close_settings />
         </Show>
       </div>
     }
 }
 
 #[component]
-fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl IntoView {
+fn Main(
+    stats: RwSignal<Stats>,
+    show_settings: RwSignal<bool>,
+    tab: RwSignal<Tab>,
+    week: RwSignal<Remote<WeekDetails>>,
+) -> impl IntoView {
+    // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
+    Effect::new(move |_| match tab.get() {
+        Tab::Week => details::load(week, tauri::get_week),
+        Tab::Usage => {}
+    });
+    let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
+
+    let tab_button = move |t: Tab, label: &'static str| {
+        view! {
+            <button class:active=move || tab.get() == t on:click=move |_| tab.set(t)>{label}</button>
+        }
+    };
+
+    view! {
+        <header>
+            <div>
+                <div class="caption">"Coût LiteLLM de la semaine"</div>
+                <div class="total">{move || format!("${:.2}", stats.with(|s| s.total_spend))}</div>
+            </div>
+            <div class="right">
+                <div class="btns">
+                    <button class="icon-btn" title="Paramètres" on:click=move |_| show_settings.set(true) inner_html=GEAR_SVG></button>
+                    <button class="icon-btn" title="Fermer" on:click=|_| leptos::task::spawn_local(tauri::close_window()) inner_html=CLOSE_SVG></button>
+                </div>
+                <div class="updated">{move || stats.with(|s| s.updated_at.clone().map(|t| format!("maj {t}")).unwrap_or_default())}</div>
+            </div>
+        </header>
+        {move || stats.with(|s| s.error.clone()).map(|e| view! { <div class="error">{e}</div> })}
+        <BudgetBar stats />
+
+        <nav class="tabs">
+            {tab_button(Tab::Usage, "Consommation")}
+            {tab_button(Tab::Week, "Semaine")}
+        </nav>
+
+        {move || match tab.get() {
+            Tab::Usage => view! { <UsageTab stats /> }.into_any(),
+            Tab::Week => view! { <WeekTab week max_budget /> }.into_any(),
+        }}
+    }
+}
+
+/// Jauge de consommation du budget de la période, colorée selon le niveau.
+#[component]
+fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
+    view! {
+        {move || stats.with(|s| {
+            let since = s.period_start.clone().map(|d| format!("depuis le {d}")).unwrap_or_default();
+            let reset = s.budget_reset_at.clone().map(|d| format!("reset le {d}")).unwrap_or_default();
+            match s.max_budget.filter(|b| *b > 0.0) {
+                Some(max) => {
+                    let pct = s.period_spend / max * 100.0;
+                    let level = budget_level(pct);
+                    view! {
+                        <div class="budget">
+                            <div class="budget-head">
+                                <span>{format!("${:.2} / ${max:.0}", s.period_spend)}</span>
+                                <span class=format!("lvl-text lvl-{level}")>{format!("{pct:.0} %")}</span>
+                            </div>
+                            <div class="track tall">
+                                <div class=format!("fill lvl-{level}") style=format!("width:{:.1}%", pct.clamp(0.0, 100.0))></div>
+                            </div>
+                            <div class="budget-foot"><span>{since}</span><span>{reset}</span></div>
+                        </div>
+                    }.into_any()
+                }
+                None => view! {
+                    <div class="hint">{format!("{since} · budget ${:.2} (aucun plafond) · {reset}", s.period_spend)}</div>
+                }.into_any(),
+            }
+        })}
+    }
+}
+
+#[component]
+fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
     let today = Signal::derive(move || stats.with(|s| s.today.clone()));
     let today_spend: Signal<f64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
     let today_tokens: Signal<u64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
@@ -88,22 +186,6 @@ fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl Into
     let donut_label = Signal::derive(move || fmt_tokens(today_tokens.get()));
 
     view! {
-        <header>
-            <div>
-                <div class="caption">"Coût LiteLLM de la semaine"</div>
-                <div class="total">{move || format!("${:.2}", stats.with(|s| s.total_spend))}</div>
-            </div>
-            <div class="right">
-                <div class="btns">
-                    <button class="icon-btn" title="Paramètres" on:click=move |_| show_settings.set(true) inner_html=GEAR_SVG></button>
-                    <button class="icon-btn" title="Fermer" on:click=|_| leptos::task::spawn_local(tauri::close_window()) inner_html=CLOSE_SVG></button>
-                </div>
-                <div class="updated">{move || stats.with(|s| s.updated_at.clone().map(|t| format!("maj {t}")).unwrap_or_default())}</div>
-            </div>
-        </header>
-        {move || stats.with(|s| s.error.clone()).map(|e| view! { <div class="error">{e}</div> })}
-        <BudgetBar stats />
-
         <section class="card">
             <h2>"Aujourd'hui"</h2>
             <div class="today">
@@ -125,37 +207,5 @@ fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl Into
             <Bars rows=totals_rows />
             <div class="hint">"Les modèles sans prix dans LiteLLM apparaissent à $0 et sont masqués."</div>
         </section>
-    }
-}
-
-/// Jauge de consommation du budget de la période, colorée selon le niveau.
-#[component]
-fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
-    view! {
-        {move || stats.with(|s| {
-            let since = s.period_start.clone().map(|d| format!("depuis le {d}")).unwrap_or_default();
-            let reset = s.budget_reset_at.clone().map(|d| format!("reset le {d}")).unwrap_or_default();
-            match s.max_budget.filter(|b| *b > 0.0) {
-                Some(max) => {
-                    let pct = s.period_spend / max * 100.0;
-                    let level = budget_level(pct);
-                    view! {
-                        <div class="budget">
-                            <div class="budget-head">
-                                <span>{format!("${:.2} / ${max:.0}", s.period_spend)}</span>
-                                <span class=format!("lvl-text lvl-{level}")>{format!("{pct:.0} %")}</span>
-                            </div>
-                            <div class="track tall">
-                                <div class=format!("fill lvl-{level}") style=format!("width:{:.1}%", pct.clamp(0.0, 100.0))></div>
-                            </div>
-                            <div class="budget-foot"><span>{since}</span><span>{reset}</span></div>
-                        </div>
-                    }.into_any()
-                }
-                None => view! {
-                    <div class="hint">{format!("{since} · budget ${:.2} (aucun plafond) · {reset}", s.period_spend)}</div>
-                }.into_any(),
-            }
-        })}
     }
 }

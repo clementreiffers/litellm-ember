@@ -1,6 +1,6 @@
 //! Pont vers l'API JS de Tauri (`withGlobalTauri: true`).
 use serde::Serialize;
-use shared::{SettingsInput, SettingsView, Stats};
+use shared::{SettingsInput, SettingsView, Stats, WeekDetails};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -54,4 +54,15 @@ pub async fn save_settings(input: &SettingsInput) -> Result<SettingsView, String
         Ok(v) => serde_wasm_bindgen::from_value(v).map_err(|e| e.to_string()),
         Err(e) => Err(e.as_string().unwrap_or_else(|| "Échec de l'enregistrement".into())),
     }
+}
+
+async fn invoke_as<T: serde::de::DeserializeOwned>(cmd: &str) -> Result<T, String> {
+    match invoke(cmd).await {
+        Ok(v) => serde_wasm_bindgen::from_value(v).map_err(|e| e.to_string()),
+        Err(e) => Err(e.as_string().unwrap_or_else(|| "Échec de la récupération".into())),
+    }
+}
+
+pub async fn get_week() -> Result<WeekDetails, String> {
+    invoke_as("get_week").await
 }
