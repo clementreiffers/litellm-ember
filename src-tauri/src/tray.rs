@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,12 +65,35 @@ async fn run_cycle(c: &Client, update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync)) {
         match c.fetch_today().await {
             Ok(t) => update(&|s| {
                 s.today = t.clone();
+                s.today_date = Some(Local::now().format("%Y-%m-%d").to_string());
                 s.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
             }),
             Err(e) => update(&|s| s.error = Some(e.clone())),
         }
     };
     tokio::join!(models, today);
+}
+
+fn cache_path(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("stats.json"))
+}
+
+fn load_cache(path: &Path) -> Option<Stats> {
+    let mut stats: Stats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    // Les tokens d'un autre jour ne doivent pas apparaître comme ceux d'aujourd'hui.
+    if stats.today_date.as_deref() != Some(Local::now().format("%Y-%m-%d").to_string().as_str()) {
+        stats.today.clear();
+    }
+    stats.error = None;
+    Some(stats)
+}
+
+fn save_cache(path: &Path, stats: &Stats) {
+    if let Ok(json) = serde_json::to_vec(stats) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 pub fn run() {
@@ -110,12 +134,19 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Cache disque : le dernier état connu s'affiche tout de suite, avant tout appel réseau.
+            let cache = cache_path(app.handle());
+            if let Some(cached) = cache.as_deref().and_then(load_cache) {
+                let _ = tray.set_title(Some(title_for(&cached)));
+                *stats.lock().unwrap() = cached;
+            }
+
             create_window(app.handle())?;
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let client = Client::from_env();
-                // Applique une mise à jour partielle, puis met à jour le titre et le front.
+                // Applique une mise à jour partielle, puis met à jour le titre, le cache et le front.
                 let update = |f: &dyn Fn(&mut Stats)| {
                     let snapshot = {
                         let mut s = stats.lock().unwrap();
@@ -124,6 +155,9 @@ pub fn run() {
                     };
                     let _ = tray.set_title(Some(title_for(&snapshot)));
                     let _ = handle.emit("stats-updated", &snapshot);
+                    if let Some(path) = &cache {
+                        save_cache(path, &snapshot);
+                    }
                 };
                 loop {
                     match &client {
@@ -225,6 +259,16 @@ fn toggle_window(app: &AppHandle) {
 mod tests {
     use super::*;
 
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ember-tray-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn today() -> String {
+        Local::now().format("%Y-%m-%d").to_string()
+    }
+
     #[test]
     fn title_reflects_error_and_freshness() {
         let ok = Stats { total_spend: 4.256, ..Default::default() };
@@ -234,4 +278,49 @@ mod tests {
         let err_stale = Stats { error: Some("x".into()), updated_at: Some("10:00:00".into()), total_spend: 1.0, ..Default::default() };
         assert_eq!(title_for(&err_stale), "$1.00 ⚠︎");
     }
+
+    #[test]
+    fn cache_roundtrip_keeps_today_and_drops_the_error() {
+        let path = tmp("fresh.json");
+        let stats = Stats {
+            today: vec![shared::ModelUsage { model: "m".into(), ..Default::default() }],
+            today_date: Some(today()),
+            error: Some("old error".into()),
+            total_spend: 7.0,
+            ..Default::default()
+        };
+        save_cache(&path, &stats);
+        let loaded = load_cache(&path).unwrap();
+        assert_eq!(loaded.today.len(), 1);
+        assert_eq!(loaded.total_spend, 7.0);
+        assert_eq!(loaded.error, None);
+    }
+
+    #[test]
+    fn stale_cache_drops_todays_tokens_but_keeps_the_rest() {
+        let path = tmp("stale.json");
+        let stats = Stats {
+            today: vec![shared::ModelUsage { model: "m".into(), ..Default::default() }],
+            today_date: Some("2000-01-01".into()),
+            total_spend: 7.0,
+            ..Default::default()
+        };
+        save_cache(&path, &stats);
+        let loaded = load_cache(&path).unwrap();
+        assert!(loaded.today.is_empty());
+        assert_eq!(loaded.total_spend, 7.0);
+
+        // Sans date du tout, même traitement.
+        save_cache(&path, &Stats { today: stats.today.clone(), ..Default::default() });
+        assert!(load_cache(&path).unwrap().today.is_empty());
+    }
+
+    #[test]
+    fn missing_or_corrupt_cache_yields_none() {
+        assert!(load_cache(&tmp("absent.json")).is_none());
+        let bad = tmp("bad.json");
+        std::fs::write(&bad, b"nope").unwrap();
+        assert!(load_cache(&bad).is_none());
+    }
+
 }

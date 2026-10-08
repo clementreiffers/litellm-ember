@@ -18,8 +18,9 @@ pub struct ModelUsage {
     pub total_tokens: u64,
 }
 
-/// État complet envoyé au front.
+/// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Stats {
     /// Coût de la semaine (période de budget en cours), affiché dans la menu bar.
     pub total_spend: f64,
@@ -32,7 +33,38 @@ pub struct Stats {
     pub period_start: Option<String>,
     pub models_total: Vec<ModelCost>,
     pub today: Vec<ModelUsage>,
+    /// Jour (local, YYYY-MM-DD) auquel correspond `today`, pour ignorer un cache périmé.
+    pub today_date: Option<String>,
     /// Heure locale de la dernière mise à jour réussie (HH:MM:SS).
     pub updated_at: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_roundtrip() {
+        let stats = Stats {
+            total_spend: 12.5,
+            max_budget: Some(125.0),
+            today: vec![ModelUsage { model: "m".into(), requests: 2, ..Default::default() }],
+            updated_at: Some("10:00:00".into()),
+            ..Default::default()
+        };
+        let back: Stats = serde_json::from_str(&serde_json::to_string(&stats).unwrap()).unwrap();
+        assert_eq!(back, stats);
+    }
+
+    #[test]
+    fn stats_from_an_older_cache_file_still_loads() {
+        let old = r#"{"total_spend":3.0,"models_total":[]}"#;
+        let stats: Stats = serde_json::from_str(old).unwrap();
+        assert_eq!(stats.total_spend, 3.0);
+        assert_eq!(stats.max_budget, None);
+        assert!(stats.today.is_empty());
+        assert_eq!(serde_json::from_str::<Stats>("{}").unwrap(), Stats::default());
+    }
+
 }
