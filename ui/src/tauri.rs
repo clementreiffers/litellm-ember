@@ -70,3 +70,7 @@ pub async fn get_week() -> Result<WeekDetails, String> {
 pub async fn get_activity() -> Result<Activity, String> {
     invoke_as("get_activity").await
 }
+
+pub async fn refresh_now() {
+    let _ = invoke("refresh_now").await;
+}

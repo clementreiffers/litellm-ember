@@ -57,6 +57,11 @@ where
     });
 }
 
+/// Marque les données comme périmées : le prochain `load` les rechargera malgré le délai de fraîcheur.
+pub fn invalidate<T: Send + Sync + 'static>(slot: RwSignal<Remote<T>>) {
+    slot.update(|r| r.fetched_at = 0.0);
+}
+
 /// Bandeau d'état commun : attente (première charge), actualisation (données déjà là) ou erreur.
 #[component]
 fn Status(loading: Signal<bool>, has_data: Signal<bool>, error: Signal<Option<String>>) -> impl IntoView {

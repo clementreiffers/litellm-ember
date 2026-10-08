@@ -11,6 +11,9 @@ use crate::{
 /// Icône d'engrenage (traits arrondis, couleur héritée du bouton).
 const GEAR_SVG: &str = r#"<svg class="gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="19.20" y1="12.00" x2="22.00" y2="12.00"/><line x1="17.09" y1="17.09" x2="19.07" y2="19.07"/><line x1="12.00" y1="19.20" x2="12.00" y2="22.00"/><line x1="6.91" y1="17.09" x2="4.93" y2="19.07"/><line x1="4.80" y1="12.00" x2="2.00" y2="12.00"/><line x1="6.91" y1="6.91" x2="4.93" y2="4.93"/><line x1="12.00" y1="4.80" x2="12.00" y2="2.00"/><line x1="17.09" y1="6.91" x2="19.07" y2="4.93"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2.2"/></svg>"#;
 
+/// Flèche circulaire de rafraîchissement.
+const REFRESH_SVG: &str = r#"<svg class="gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><polyline points="20 3.5 20 8.5 15 8.5"/></svg>"#;
+
 /// Croix de fermeture, même style que l'engrenage.
 const CLOSE_SVG: &str = r#"<svg class="gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>"#;
 
@@ -89,6 +92,33 @@ fn Main(
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
 
+    // Rafraîchissement forcé : relance le cycle du backend et recharge les onglets à la demande.
+    // L'animation s'arrête quand le cycle a mis à jour les données (ou après 60 s au plus).
+    let refreshing = RwSignal::new(false);
+    let updated_at_click = RwSignal::new(None::<String>);
+    Effect::new(move |_| {
+        let updated = stats.with(|s| s.updated_at.clone());
+        if refreshing.get_untracked() && updated != updated_at_click.get_untracked() {
+            refreshing.set(false);
+        }
+    });
+    let force_refresh = move |_| {
+        if refreshing.get_untracked() {
+            return;
+        }
+        updated_at_click.set(stats.with_untracked(|s| s.updated_at.clone()));
+        refreshing.set(true);
+        set_timeout(move || refreshing.set(false), std::time::Duration::from_secs(60));
+        leptos::task::spawn_local(tauri::refresh_now());
+        details::invalidate(week);
+        details::invalidate(activity);
+        match tab.get_untracked() {
+            Tab::Week => details::load(week, tauri::get_week),
+            Tab::Activity => details::load(activity, tauri::get_activity),
+            Tab::Usage => {}
+        }
+    };
+
     let tab_button = move |t: Tab, label: &'static str| {
         view! {
             <button class:active=move || tab.get() == t on:click=move |_| tab.set(t)>{label}</button>
@@ -103,6 +133,8 @@ fn Main(
             </div>
             <div class="right">
                 <div class="btns">
+                    <button class="icon-btn" class:spinning=move || refreshing.get() title="Rafraîchir tout"
+                        on:click=force_refresh inner_html=REFRESH_SVG></button>
                     <button class="icon-btn" title="Paramètres" on:click=move |_| show_settings.set(true) inner_html=GEAR_SVG></button>
                     <button class="icon-btn" title="Fermer" on:click=|_| leptos::task::spawn_local(tauri::close_window()) inner_html=CLOSE_SVG></button>
                 </div>

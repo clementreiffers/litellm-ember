@@ -74,6 +74,12 @@ async fn get_activity(store: State<'_, Arc<SettingsStore>>) -> Result<Activity, 
     client_for(&store)?.fetch_activity().await
 }
 
+/// Bouton « rafraîchir » du panneau : relance un cycle immédiatement.
+#[tauri::command]
+fn refresh_now(refresh: State<'_, Arc<Notify>>) {
+    refresh.notify_one();
+}
+
 #[tauri::command]
 fn get_stats(state: State<'_, SharedStats>) -> Stats {
     state.lock().unwrap().clone()
@@ -158,7 +164,7 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(stats.clone())
         .manage(refresh.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity])
+        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity, refresh_now])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
