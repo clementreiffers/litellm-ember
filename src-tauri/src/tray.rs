@@ -311,7 +311,7 @@ fn apply_glass(_window: &tauri::WebviewWindow) {}
 /// sans rechargement de la page ni flash blanc.
 fn create_window(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("LiteLLM")
+        .title("Ember")
         .inner_size(460.0, 700.0)
         .decorations(false)
         .resizable(false)

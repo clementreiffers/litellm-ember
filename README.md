@@ -1,6 +1,6 @@
-# LiteLLM Menubar
+# Ember
 
-App Tauri v2 (macOS) : affiche le coût total LiteLLM dans la menu bar. Un clic ouvre un panneau avec le coût par modèle et un graphique du jour (tokens et $ par modèle). Rafraîchissement toutes les 30 s.
+Ember est une app Tauri v2 (macOS) qui affiche le coût total LiteLLM dans la menu bar. Un clic ouvre un panneau avec le coût par modèle et un graphique du jour (tokens et $ par modèle). Rafraîchissement toutes les 30 s.
 
 - Backend : Rust (`src-tauri/`), il appelle l'API LiteLLM et met à jour le titre du tray.
 - Front : Rust/WASM avec Leptos + charming (`ui/`).
@@ -29,6 +29,6 @@ cargo install tauri-cli --version "^2" --locked
 cargo install trunk --locked
 cargo tauri dev            # dev
 cargo tauri build          # .app dans target/release/bundle/macos
-cargo test -p litellm-menubar                                   # tests unitaires
-cargo test -p litellm-menubar live -- --ignored --nocapture     # appel réel (lit OPENAI_API_KEY et LITELLM_BASE_URL, test seulement)
+cargo test -p ember                                   # tests unitaires
+cargo test -p ember live -- --ignored --nocapture     # appel réel (lit OPENAI_API_KEY et LITELLM_BASE_URL, test seulement)
 ```

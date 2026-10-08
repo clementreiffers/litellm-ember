@@ -668,7 +668,7 @@ mod tests {
 mod live {
     use super::*;
 
-    /// Appel réel : `cargo test -p litellm-menubar live -- --ignored --nocapture` (nécessite OPENAI_API_KEY et LITELLM_BASE_URL).
+    /// Appel réel : `cargo test -p ember live -- --ignored --nocapture` (nécessite OPENAI_API_KEY et LITELLM_BASE_URL).
     #[tokio::test]
     #[ignore]
     async fn fetch_stats_live() {

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "LiteLLM Menubar",
+  "productName": "Ember",
   "version": "0.1.0",
   "identifier": "io.github.clementreiffers.ember",
   "build": {
