@@ -1,5 +1,7 @@
-use leptos::prelude::*;
+mod app;
+mod chart;
+mod tauri;
 
 fn main() {
-    leptos::mount::mount_to_body(|| view! { <main></main> });
+    leptos::mount::mount_to_body(app::App);
 }
