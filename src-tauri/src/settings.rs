@@ -13,9 +13,15 @@ const KEYCHAIN_SERVICE: &str = "io.github.clementreiffers.ember";
 const KEYCHAIN_ACCOUNT: &str = "litellm-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub base_url: String,
     pub refresh_secs: u32,
+    pub notifications_enabled: bool,
+    /// Moitié du budget consommée par défaut.
+    pub notify_info_percent: u32,
+    /// Il reste 1/4 du budget par défaut.
+    pub notify_critical_percent: u32,
 }
 
 impl Default for Settings {
@@ -23,6 +29,9 @@ impl Default for Settings {
         Self {
             base_url: String::new(),
             refresh_secs: DEFAULT_REFRESH_SECS,
+            notifications_enabled: true,
+            notify_info_percent: 50,
+            notify_critical_percent: 75,
         }
     }
 }
@@ -131,6 +140,7 @@ impl SettingsStore {
         let new = Settings {
             base_url,
             refresh_secs: input.refresh_secs,
+            ..self.get()
         };
         {
             let mut cur = self.settings.lock().unwrap();
@@ -152,7 +162,7 @@ mod tests {
     fn store() -> SettingsStore {
         SettingsStore {
             path: None,
-            settings: Mutex::new(Settings { base_url: "https://x/llm".into(), refresh_secs: 30 }),
+            settings: Mutex::new(Settings { base_url: "https://x/llm".into(), refresh_secs: 30, ..Settings::default() }),
             key: Mutex::new(None),
             storage: Box::new(MemoryKeys::default()),
         }
@@ -319,5 +329,12 @@ mod tests {
         let corrupt = SettingsStore::load_with(Some(path), Box::new(MemoryKeys::default())).get();
         assert_eq!(corrupt.refresh_secs, DEFAULT_REFRESH_SECS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_old_settings_files_with_defaults() {
+        let old: Settings = serde_json::from_str(r#"{"base_url":"https://x","refresh_secs":45}"#).unwrap();
+        assert_eq!((old.notify_info_percent, old.notify_critical_percent), (50, 75));
+        assert!(old.notifications_enabled);
     }
 }
