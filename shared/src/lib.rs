@@ -40,6 +40,34 @@ pub struct Stats {
     pub error: Option<String>,
 }
 
+/// D'où vient la clé API utilisée par le backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum KeySource {
+    /// Enregistrée dans le Trousseau macOS via les paramètres.
+    Keychain,
+    #[default]
+    Missing,
+}
+
+/// Paramètres tels que vus par le front. La clé API n'y figure jamais.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SettingsView {
+    pub base_url: String,
+    pub refresh_secs: u32,
+    pub key_source: KeySource,
+}
+
+/// Paramètres envoyés par le front à l'enregistrement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SettingsInput {
+    pub base_url: String,
+    pub refresh_secs: u32,
+    /// `None` ou vide : on conserve la clé actuelle.
+    pub api_key: Option<String>,
+    /// Supprime la clé du Trousseau.
+    pub clear_key: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,4 +95,12 @@ mod tests {
         assert_eq!(serde_json::from_str::<Stats>("{}").unwrap(), Stats::default());
     }
 
+    #[test]
+    fn key_source_serializes_as_a_stable_string() {
+        // Contrat avec le front : ces valeurs ne doivent pas changer silencieusement.
+        let json = serde_json::to_string(&[KeySource::Keychain, KeySource::Missing]).unwrap();
+        assert_eq!(json, r#"["Keychain","Missing"]"#);
+        let back: Vec<KeySource> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, vec![KeySource::Keychain, KeySource::Missing]);
+    }
 }
