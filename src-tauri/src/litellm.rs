@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Deserialize;
-use shared::{ModelCost, ModelUsage, Stats};
+use shared::{ModelCost, ModelUsage};
 
 pub struct Client {
     http: reqwest::Client,
@@ -50,42 +50,50 @@ impl Client {
         resp.json().await.map_err(|e| format!("réponse invalide ({path}): {e}"))
     }
 
-    /// Étape rapide : coût de la période de budget en cours (`/key/info`), pour afficher le prix tout de suite.
-    pub async fn fetch_key(&self) -> Result<Stats, String> {
+    /// Étape 1 (≈0,5 s) : dépense de la période de budget en cours (`/key/info`).
+    pub async fn fetch_key(&self) -> Result<KeyData, String> {
         let key: KeyInfo = self.get("/key/info").await?;
-        Ok(Stats {
-            total_spend: key.info.spend,
+        Ok(KeyData {
             period_spend: key.info.spend,
             max_budget: key.info.max_budget,
             budget_reset_at: key.info.budget_reset_at.as_ref().map(|d| d.chars().take(10).collect()),
             period_start: period_start(&key.info),
-            ..Default::default()
         })
     }
 
-    /// Étape lourde : détail par modèle sur la période, et consommation du jour.
-    pub async fn fetch_details(&self, base: Stats) -> Result<Stats, String> {
+    /// Étape 2 (≈0,5 s) : coût par modèle depuis le début de la période (agrégat, sans tokens).
+    pub async fn fetch_models(&self, period_start: Option<&str>) -> Result<Vec<ModelCost>, String> {
         let now = Utc::now().date_naive();
-        let tomorrow = (now + Duration::days(1)).to_string();
-        // Le jour local peut commencer la veille en UTC : on prend hier et on filtre ensuite.
-        let yesterday = (now - Duration::days(1)).to_string();
-        let start = base.period_start.clone().unwrap_or_else(|| (now - Duration::days(7)).to_string());
-
+        let tomorrow = now + Duration::days(1);
+        let start = period_start.map(str::to_string).unwrap_or_else(|| (now - Duration::days(7)).to_string());
         let summary: Vec<DaySummary> = self
             .get(&format!("/spend/logs?summarize=true&start_date={start}&end_date={tomorrow}"))
             .await?;
-        let logs: Vec<LogRow> = self
-            .get(&format!("/spend/logs?summarize=false&start_date={yesterday}&end_date={tomorrow}"))
-            .await?;
-
-        Ok(Stats {
-            models_total: aggregate_totals(&summary),
-            today: aggregate_today(&logs, Local::now().date_naive()),
-            updated_at: Some(Local::now().format("%H:%M:%S").to_string()),
-            error: None,
-            ..base
-        })
+        Ok(aggregate_totals(&summary))
     }
+
+    /// Étape 3 (lente, 5 à 10 s : l'API renvoie les messages) : tokens et $ du jour par modèle.
+    pub async fn fetch_today(&self) -> Result<Vec<ModelUsage>, String> {
+        let today = Local::now().date_naive();
+        // On ne demande que le jour UTC où commence le jour local, pas la veille entière.
+        let start = today
+            .and_hms_opt(0, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).earliest())
+            .map(|d| d.with_timezone(&Utc).date_naive())
+            .unwrap_or_else(|| Utc::now().date_naive());
+        let end = Utc::now().date_naive() + Duration::days(1);
+        let logs: Vec<LogRow> = self
+            .get(&format!("/spend/logs?summarize=false&start_date={start}&end_date={end}"))
+            .await?;
+        Ok(aggregate_today(&logs, today))
+    }
+}
+
+pub struct KeyData {
+    pub period_spend: f64,
+    pub max_budget: Option<f64>,
+    pub budget_reset_at: Option<String>,
+    pub period_start: Option<String>,
 }
 
 /// Début de la période de budget : date de reset moins la durée du budget (`7d`, `24h`, `2w`, `1mo`).
@@ -302,14 +310,17 @@ mod live {
     #[ignore]
     async fn fetch_stats_live() {
         let c = Client::from_env().unwrap();
-        let stats = c.fetch_key().await.unwrap();
-        let stats = c.fetch_details(stats).await.unwrap();
-        println!("total ${:.2} (depuis {:?})", stats.total_spend, stats.period_start);
-        for m in &stats.models_total {
+        let t = std::time::Instant::now();
+        let key = c.fetch_key().await.unwrap();
+        println!("période ${:.2} depuis {:?} ({:?})", key.period_spend, key.period_start, t.elapsed());
+        let models = c.fetch_models(key.period_start.as_deref()).await.unwrap();
+        println!("modèles ({:?})", t.elapsed());
+        for m in &models {
             println!("{:<55} ${:.2}", m.model, m.spend);
         }
-        println!("--- aujourd'hui");
-        for u in &stats.today {
+        let today = c.fetch_today().await.unwrap();
+        println!("--- aujourd'hui ({:?})", t.elapsed());
+        for u in &today {
             println!("{:<55} {:>10} tok ${:.2} ({} req)", u.model, u.total_tokens, u.spend, u.requests);
         }
     }

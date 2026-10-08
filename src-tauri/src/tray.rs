@@ -1,18 +1,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use shared::Stats;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    window::Color,
     ActivationPolicy, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    window::Color,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 use tokio::sync::Notify;
 
 use crate::litellm::Client;
 
+/// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
@@ -34,6 +36,40 @@ fn title_for(stats: &Stats) -> String {
         (Some(_), true) => format!("${:.2} ⚠︎", stats.total_spend),
         _ => format!("${:.2}", stats.total_spend),
     }
+}
+
+/// Un cycle : le prix d'abord, puis le détail par modèle et les tokens du jour en parallèle.
+/// Chaque étape met à jour l'état dès qu'elle finit ; en cas d'erreur on garde les dernières valeurs.
+async fn run_cycle(c: &Client, update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync)) {
+    let key = match c.fetch_key().await {
+        Ok(k) => k,
+        Err(e) => return update(&|s| s.error = Some(e.clone())),
+    };
+    update(&|s| {
+        s.total_spend = key.period_spend;
+        s.period_spend = key.period_spend;
+        s.max_budget = key.max_budget;
+        s.budget_reset_at = key.budget_reset_at.clone();
+        s.period_start = key.period_start.clone();
+        s.error = None;
+    });
+
+    let models = async {
+        match c.fetch_models(key.period_start.as_deref()).await {
+            Ok(m) => update(&|s| s.models_total = m.clone()),
+            Err(e) => update(&|s| s.error = Some(e.clone())),
+        }
+    };
+    let today = async {
+        match c.fetch_today().await {
+            Ok(t) => update(&|s| {
+                s.today = t.clone();
+                s.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
+            }),
+            Err(e) => update(&|s| s.error = Some(e.clone())),
+        }
+    };
+    tokio::join!(models, today);
 }
 
 pub fn run() {
@@ -79,38 +115,20 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let client = Client::from_env();
-                // Applique un résultat : en cas d'erreur on garde les dernières valeurs et on signale l'erreur.
-                let apply = |result: Result<Stats, String>| {
+                // Applique une mise à jour partielle, puis met à jour le titre et le front.
+                let update = |f: &dyn Fn(&mut Stats)| {
                     let snapshot = {
                         let mut s = stats.lock().unwrap();
-                        match result {
-                            Ok(new) => *s = new,
-                            Err(e) => s.error = Some(e),
-                        }
+                        f(&mut s);
                         s.clone()
                     };
                     let _ = tray.set_title(Some(title_for(&snapshot)));
                     let _ = handle.emit("stats-updated", &snapshot);
-                    snapshot
                 };
                 loop {
                     match &client {
-                        Ok(c) => {
-                            // 1) prix tout de suite (appel léger), 2) détails (appels lourds).
-                            // On garde le détail précédent pendant que les appels lourds tournent,
-                            // sinon les graphiques se vident à chaque cycle.
-                            let quick = c.fetch_key().await.map(|k| {
-                                let old = stats.lock().unwrap().clone();
-                                Stats { models_total: old.models_total, today: old.today, updated_at: old.updated_at, ..k }
-                            });
-                            let quick = apply(quick);
-                            if quick.error.is_none() {
-                                apply(c.fetch_details(quick).await);
-                            }
-                        }
-                        Err(e) => {
-                            apply(Err(e.clone()));
-                        }
+                        Ok(c) => run_cycle(c, &update).await,
+                        Err(e) => update(&|s| s.error = Some(e.clone())),
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(REFRESH_EVERY) => {}
