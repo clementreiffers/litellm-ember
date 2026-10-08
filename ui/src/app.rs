@@ -21,6 +21,17 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Niveau de la jauge de budget : vert sous 60 %, orange sous 85 %, rouge au-delà.
+pub fn budget_level(pct: f64) -> &'static str {
+    if pct < 60.0 {
+        "ok"
+    } else if pct < 85.0 {
+        "warn"
+    } else {
+        "crit"
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let stats = RwSignal::new(Stats::default());
@@ -91,14 +102,7 @@ fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl Into
             </div>
         </header>
         {move || stats.with(|s| s.error.clone()).map(|e| view! { <div class="error">{e}</div> })}
-        <div class="hint">
-            {move || stats.with(|s| {
-                let budget = s.max_budget.map(|b| format!(" / ${b:.0}")).unwrap_or_default();
-                let reset = s.budget_reset_at.clone().map(|d| format!(" · reset le {d}")).unwrap_or_default();
-                let since = s.period_start.clone().map(|d| format!("depuis le {d} · ")).unwrap_or_default();
-                format!("{since}budget ${:.2}{budget}{reset}", s.period_spend)
-            })}
-        </div>
+        <BudgetBar stats />
 
         <section class="card">
             <h2>"Aujourd'hui"</h2>
@@ -121,5 +125,37 @@ fn Dashboard(stats: RwSignal<Stats>, show_settings: RwSignal<bool>) -> impl Into
             <Bars rows=totals_rows />
             <div class="hint">"Les modèles sans prix dans LiteLLM apparaissent à $0 et sont masqués."</div>
         </section>
+    }
+}
+
+/// Jauge de consommation du budget de la période, colorée selon le niveau.
+#[component]
+fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
+    view! {
+        {move || stats.with(|s| {
+            let since = s.period_start.clone().map(|d| format!("depuis le {d}")).unwrap_or_default();
+            let reset = s.budget_reset_at.clone().map(|d| format!("reset le {d}")).unwrap_or_default();
+            match s.max_budget.filter(|b| *b > 0.0) {
+                Some(max) => {
+                    let pct = s.period_spend / max * 100.0;
+                    let level = budget_level(pct);
+                    view! {
+                        <div class="budget">
+                            <div class="budget-head">
+                                <span>{format!("${:.2} / ${max:.0}", s.period_spend)}</span>
+                                <span class=format!("lvl-text lvl-{level}")>{format!("{pct:.0} %")}</span>
+                            </div>
+                            <div class="track tall">
+                                <div class=format!("fill lvl-{level}") style=format!("width:{:.1}%", pct.clamp(0.0, 100.0))></div>
+                            </div>
+                            <div class="budget-foot"><span>{since}</span><span>{reset}</span></div>
+                        </div>
+                    }.into_any()
+                }
+                None => view! {
+                    <div class="hint">{format!("{since} · budget ${:.2} (aucun plafond) · {reset}", s.period_spend)}</div>
+                }.into_any(),
+            }
+        })}
     }
 }

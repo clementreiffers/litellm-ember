@@ -51,3 +51,18 @@ h3 { font-size: 11px; color: #aeaeb2; margin: 14px 0 6px; font-weight: 500; }
 .icon-btn:hover { background: rgba(255,255,255,.24); }
 .gear { width: 16px; height: 16px; transition: transform .2s; }
 .icon-btn[title="Paramètres"]:hover .gear { transform: rotate(45deg); }
+
+/* Jauge de budget */
+.budget { margin: 6px 0 12px; }
+.budget-head { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 5px; }
+.budget-foot { display: flex; justify-content: space-between; color: #8e8e93; font-size: 10px; margin-top: 4px; }
+.track.tall { height: 10px; border-radius: 5px; }
+.fill.lvl-ok { background: linear-gradient(90deg,#30d158,#7ee29a); box-shadow: 0 0 10px rgba(48,209,88,.45); }
+.fill.lvl-warn { background: linear-gradient(90deg,#ff9f0a,#ffd166); box-shadow: 0 0 10px rgba(255,159,10,.45); }
+.fill.lvl-crit { background: linear-gradient(90deg,#ff453a,#ff8a80); box-shadow: 0 0 10px rgba(255,69,58,.5); }
+.lvl-text.lvl-ok { color: #30d158; }
+.lvl-text.lvl-warn { color: #ff9f0a; }
+.lvl-text.lvl-crit { color: #ff453a; }
+.crit { color: #ff6961; }
+.warn { color: #ffb340; }
+
