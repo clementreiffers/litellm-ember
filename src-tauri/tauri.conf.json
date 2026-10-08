@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LiteLLM Menubar",
+  "version": "0.1.0",
+  "identifier": "io.github.clementreiffers.ember",
+  "build": {
+    "beforeDevCommand": "cd ui && trunk serve --port 1420",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "cd ui && trunk build --release",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "app",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}
