@@ -2264,6 +2264,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-positioner",
  "tokio",
+ "window-vibrancy",
 ]
 
 [[package]]

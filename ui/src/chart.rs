@@ -57,7 +57,7 @@ pub fn Donut(
     let circ = 2.0 * std::f64::consts::PI * R;
     view! {
         <svg class="donut" viewBox="0 0 120 120">
-            <circle cx="60" cy="60" r=R fill="none" stroke="#2c2c2e" stroke-width="14" />
+            <circle cx="60" cy="60" r=R fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="14" />
             {move || {
                 let vals = values.get();
                 let total: f64 = vals.iter().sum();

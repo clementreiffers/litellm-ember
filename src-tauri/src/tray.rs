@@ -8,7 +8,6 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     ActivationPolicy, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
-    window::Color,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 use tokio::sync::Notify;
@@ -193,6 +192,31 @@ fn since(slot: &Mutex<Option<Instant>>) -> Option<Duration> {
     slot.lock().ok().and_then(|g| g.map(|t| t.elapsed()))
 }
 
+const PANEL_RADIUS: f64 = 22.0;
+
+/// Effet Liquid Glass (macOS 26+), avec repli sur le flou "HUD" sombre des versions précédentes.
+#[cfg(target_os = "macos")]
+fn apply_glass(window: &tauri::WebviewWindow) {
+    use window_vibrancy::{
+        apply_liquid_glass, apply_vibrancy, LiquidGlassOptions, NSGlassEffectViewStyle,
+        NSVisualEffectMaterial, NSVisualEffectState,
+    };
+    let glass = LiquidGlassOptions::new(NSGlassEffectViewStyle::Regular)
+        .radius(PANEL_RADIUS)
+        .tint_color((20, 20, 28, 90));
+    if apply_liquid_glass(window, glass).is_err() {
+        let _ = apply_vibrancy(
+            window,
+            NSVisualEffectMaterial::HudWindow,
+            Some(NSVisualEffectState::Active),
+            Some(PANEL_RADIUS),
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_glass(_window: &tauri::WebviewWindow) {}
+
 /// Crée le panneau une seule fois, caché et avec un fond sombre : l'afficher ensuite est instantané,
 /// sans rechargement de la page ni flash blanc.
 fn create_window(app: &AppHandle) -> tauri::Result<()> {
@@ -204,8 +228,13 @@ fn create_window(app: &AppHandle) -> tauri::Result<()> {
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
-        .background_color(Color(21, 21, 23, 255))
+        // Fenêtre transparente en thème sombre : le verre est posé derrière le webview.
+        .transparent(true)
+        // L'ombre native suit le rectangle de la fenêtre et dessine un cadre derrière les coins arrondis.
+        .shadow(false)
+        .theme(Some(tauri::Theme::Dark))
         .build()?;
+    apply_glass(&window);
 
     // Masque le panneau au clic ailleurs. La perte de focus pendant l'ouverture est normale
     // (le clic sur le tray vole le focus un instant) : on revérifie à la fin du délai.

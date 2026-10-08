@@ -59,6 +59,7 @@ pub fn App() -> impl IntoView {
     let donut_label = Signal::derive(move || fmt_tokens(today_tokens.get()));
 
     view! {
+      <div class="scroller">
         <header>
             <div>
                 <div class="caption">"Coût LiteLLM de la semaine"</div>
@@ -100,5 +101,6 @@ pub fn App() -> impl IntoView {
             <Bars rows=totals_rows />
             <div class="hint">"Les modèles sans prix dans LiteLLM apparaissent à $0 et sont masqués."</div>
         </section>
+      </div>
     }
 }
