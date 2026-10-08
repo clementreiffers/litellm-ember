@@ -55,6 +55,11 @@ pub struct SettingsView {
     pub base_url: String,
     pub refresh_secs: u32,
     pub key_source: KeySource,
+    pub notifications_enabled: bool,
+    /// Seuil d'information, en % du budget consommé.
+    pub notify_info_percent: u32,
+    /// Seuil critique, en % du budget consommé.
+    pub notify_critical_percent: u32,
 }
 
 /// Paramètres envoyés par le front à l'enregistrement.
@@ -66,6 +71,9 @@ pub struct SettingsInput {
     pub api_key: Option<String>,
     /// Supprime la clé du Trousseau.
     pub clear_key: bool,
+    pub notifications_enabled: bool,
+    pub notify_info_percent: u32,
+    pub notify_critical_percent: u32,
 }
 
 /// Coût d'un jour (UTC, YYYY-MM-DD).

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tauri_plugin_notification::NotificationExt;
 
 use crate::settings::Settings;
 
@@ -49,16 +51,25 @@ impl Notifier {
         Self { path, state: Mutex::new(state) }
     }
 
-    /// Évalue les seuils et persiste leur état avant l’intégration du transport natif.
-    fn check(&self, cfg: &Settings, spend: f64, max_budget: Option<f64>, reset_at: Option<&str>) -> Option<Notice> {
-        let mut st = self.state.lock().unwrap();
-        let notice = st.evaluate(cfg, spend, max_budget, reset_at);
-        if let Some(path) = &self.path {
-            if let Ok(json) = serde_json::to_vec(&*st) {
-                let _ = std::fs::write(path, json);
+    /// À appeler après chaque lecture de `/key/info`.
+    pub fn check(&self, app: &AppHandle, cfg: &Settings, spend: f64, max_budget: Option<f64>, reset_at: Option<&str>) {
+        let notice = {
+            let mut st = self.state.lock().unwrap();
+            let notice = st.evaluate(cfg, spend, max_budget, reset_at);
+            if let Some(path) = &self.path {
+                if let Ok(json) = serde_json::to_vec(&*st) {
+                    let _ = std::fs::write(path, json);
+                }
+            }
+            notice
+        };
+
+        if let Some(Notice { level, threshold, pct, max }) = notice {
+            let (title, body) = message(level, threshold, pct, spend, max, reset_at);
+            if let Err(e) = send(app, level, &title, &body) {
+                eprintln!("{e}");
             }
         }
-        notice
     }
 }
 
@@ -99,6 +110,19 @@ fn message(level: Level, threshold: u32, pct: f64, spend: f64, max: f64, reset_a
         Level::Critical => format!("⚠️ Budget LiteLLM : plus que {:.0} % restant", (100.0 - pct).max(0.0)),
     };
     (title, body)
+}
+
+fn send(app: &AppHandle, level: Level, title: &str, body: &str) -> Result<(), String> {
+    let mut n = app.notification().builder().title(title).body(body);
+    if level == Level::Critical {
+        n = n.sound("Sosumi");
+    }
+    n.show().map_err(|e| format!("Envoi de la notification impossible: {e}"))
+}
+
+/// Notification d'essai (bouton « Tester » des paramètres) : déclenche aussi la demande d'autorisation macOS.
+pub fn send_test(app: &AppHandle) -> Result<(), String> {
+    send(app, Level::Critical, "⚠️ Budget LiteLLM : notification de test", "Si vous lisez ceci, les notifications fonctionnent.")
 }
 
 #[cfg(test)]

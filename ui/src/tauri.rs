@@ -74,3 +74,10 @@ pub async fn get_activity() -> Result<Activity, String> {
 pub async fn refresh_now() {
     let _ = invoke("refresh_now").await;
 }
+
+pub async fn test_notification() -> Result<(), String> {
+    invoke("test_notification")
+        .await
+        .map(|_| ())
+        .map_err(|e| e.as_string().unwrap_or_else(|| "Échec de l'envoi".into()))
+}

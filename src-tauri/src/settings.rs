@@ -109,6 +109,9 @@ impl SettingsStore {
         SettingsView {
             base_url: s.base_url,
             refresh_secs: s.refresh_secs,
+            notifications_enabled: s.notifications_enabled,
+            notify_info_percent: s.notify_info_percent,
+            notify_critical_percent: s.notify_critical_percent,
             key_source: self.key.lock().unwrap().as_ref().map(|(_, src)| *src).unwrap_or(KeySource::Missing),
         }
     }
@@ -126,6 +129,13 @@ impl SettingsStore {
             return Err(format!("La fréquence doit être entre {MIN_REFRESH_SECS} et {MAX_REFRESH_SECS} secondes"));
         }
 
+        if !(1..=99).contains(&input.notify_info_percent) || !(2..=100).contains(&input.notify_critical_percent) {
+            return Err("Les seuils de notification doivent être entre 1 et 100 % du budget consommé".into());
+        }
+        if input.notify_info_percent >= input.notify_critical_percent {
+            return Err("Le seuil d'information doit être inférieur au seuil critique".into());
+        }
+
         let mut changed = false;
         if input.clear_key {
             self.storage.delete();
@@ -140,7 +150,9 @@ impl SettingsStore {
         let new = Settings {
             base_url,
             refresh_secs: input.refresh_secs,
-            ..self.get()
+            notifications_enabled: input.notifications_enabled,
+            notify_info_percent: input.notify_info_percent,
+            notify_critical_percent: input.notify_critical_percent,
         };
         {
             let mut cur = self.settings.lock().unwrap();
@@ -197,6 +209,9 @@ mod tests {
             refresh_secs: secs,
             api_key: None,
             clear_key: false,
+            notifications_enabled: true,
+            notify_info_percent: 50,
+            notify_critical_percent: 75,
         }
     }
 
@@ -224,6 +239,26 @@ mod tests {
         assert!(s.save(input("https://x", 1)).is_err());
         assert!(s.save(input("https://x", 99_999)).is_err());
         assert_eq!(s.get().base_url, "https://x/llm");
+    }
+
+    #[test]
+    fn rejects_invalid_thresholds() {
+        let s = store();
+        let mut i = input("https://x", 30);
+        i.notify_info_percent = 80;
+        assert!(s.save(i.clone()).is_err()); // info >= critique
+        i.notify_info_percent = 0;
+        assert!(s.save(i.clone()).is_err());
+        i.notify_info_percent = 50;
+        i.notify_critical_percent = 101;
+        assert!(s.save(i).is_err());
+    }
+
+    #[test]
+    fn loads_old_settings_files_with_defaults() {
+        let old: Settings = serde_json::from_str(r#"{"base_url":"https://x","refresh_secs":45}"#).unwrap();
+        assert_eq!((old.notify_info_percent, old.notify_critical_percent), (50, 75));
+        assert!(old.notifications_enabled);
     }
 
     #[test]
@@ -312,29 +347,42 @@ mod tests {
     }
 
     #[test]
+    fn threshold_boundaries() {
+        let st = store();
+        let with = |info, crit| SettingsInput { notify_info_percent: info, notify_critical_percent: crit, ..input("https://x/llm", 30) };
+        assert!(st.save(with(1, 2)).is_ok());
+        assert!(st.save(with(99, 100)).is_ok());
+        assert!(st.save(with(0, 50)).is_err());
+        assert!(st.save(with(50, 101)).is_err());
+        assert!(st.save(with(60, 60)).is_err());
+        assert!(st.save(input("https://x/llm", MIN_REFRESH_SECS)).is_ok());
+        assert!(st.save(input("https://x/llm", MAX_REFRESH_SECS)).is_ok());
+        assert!(st.save(input("https://x/llm", MIN_REFRESH_SECS - 1)).is_err());
+        assert!(st.save(input("https://x/llm", MAX_REFRESH_SECS + 1)).is_err());
+    }
+
+    #[test]
     fn settings_roundtrip_through_disk() {
         let dir = std::env::temp_dir().join(format!("ember-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
         let st = SettingsStore { path: Some(path.clone()), ..store() };
         let mut i = input("https://z/llm", 120);
+        i.notifications_enabled = false;
+        i.notify_info_percent = 40;
+        i.notify_critical_percent = 90;
         st.save(i).unwrap();
 
         let back = SettingsStore::load_with(Some(path.clone()), Box::new(MemoryKeys::default())).get();
         assert_eq!(back.base_url, "https://z/llm");
         assert_eq!(back.refresh_secs, 120);
+        assert!(!back.notifications_enabled);
+        assert_eq!((back.notify_info_percent, back.notify_critical_percent), (40, 90));
 
         // Un fichier corrompu retombe sur les valeurs par défaut.
         std::fs::write(&path, b"{{{").unwrap();
         let corrupt = SettingsStore::load_with(Some(path), Box::new(MemoryKeys::default())).get();
         assert_eq!(corrupt.refresh_secs, DEFAULT_REFRESH_SECS);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn loads_old_settings_files_with_defaults() {
-        let old: Settings = serde_json::from_str(r#"{"base_url":"https://x","refresh_secs":45}"#).unwrap();
-        assert_eq!((old.notify_info_percent, old.notify_critical_percent), (50, 75));
-        assert!(old.notifications_enabled);
     }
 }

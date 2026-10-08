@@ -12,7 +12,11 @@ use tauri::{
 use tauri_plugin_positioner::{Position, WindowExt};
 use tokio::sync::Notify;
 
-use crate::{litellm::Client, settings::SettingsStore};
+use crate::{
+    litellm::{Client, KeyData},
+    notify::{self, Notifier},
+    settings::SettingsStore,
+};
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
@@ -80,6 +84,12 @@ fn refresh_now(refresh: State<'_, Arc<Notify>>) {
     refresh.notify_one();
 }
 
+/// Bouton « Tester » des paramètres.
+#[tauri::command]
+fn test_notification(app: AppHandle) -> Result<(), String> {
+    notify::send_test(&app)
+}
+
 #[tauri::command]
 fn get_stats(state: State<'_, SharedStats>) -> Stats {
     state.lock().unwrap().clone()
@@ -95,7 +105,11 @@ fn title_for(stats: &Stats) -> String {
 
 /// Un cycle : le prix d'abord, puis le détail par modèle et les tokens du jour en parallèle.
 /// Chaque étape met à jour l'état dès qu'elle finit ; en cas d'erreur on garde les dernières valeurs.
-async fn run_cycle(c: &Client, update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync)) {
+async fn run_cycle(
+    c: &Client,
+    update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync),
+    notify: &(dyn Fn(&KeyData) + Sync),
+) {
     let key = match c.fetch_key().await {
         Ok(k) => k,
         Err(e) => return update(&|s| s.error = Some(e.clone())),
@@ -108,6 +122,7 @@ async fn run_cycle(c: &Client, update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync)) {
         s.period_start = key.period_start.clone();
         s.error = None;
     });
+    notify(&key);
 
     let models = async {
         match c.fetch_models(key.period_start.as_deref()).await {
@@ -128,16 +143,18 @@ async fn run_cycle(c: &Client, update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync)) {
     tokio::join!(models, today);
 }
 
-fn cache_path(app: &AppHandle) -> Option<PathBuf> {
+fn data_file(app: &AppHandle, name: &str) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("stats.json"))
+    Some(dir.join(name))
+}
+
+fn cache_path(app: &AppHandle) -> Option<PathBuf> {
+    data_file(app, "stats.json")
 }
 
 fn settings_path(app: &AppHandle) -> Option<PathBuf> {
-    let dir = app.path().app_data_dir().ok()?;
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("settings.json"))
+    data_file(app, "settings.json")
 }
 
 fn load_cache(path: &Path) -> Option<Stats> {
@@ -162,9 +179,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(stats.clone())
         .manage(refresh.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity, refresh_now])
+        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity, refresh_now, test_notification])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
@@ -206,8 +224,12 @@ pub fn run() {
 
             create_window(app.handle())?;
 
+            let notifier = Notifier::load(data_file(app.handle(), "notifications.json"));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let notify = |k: &KeyData| {
+                    notifier.check(&handle, &store.get(), k.period_spend, k.max_budget, k.budget_reset_at.as_deref())
+                };
                 let update = |f: &dyn Fn(&mut Stats)| {
                     let snapshot = {
                         let mut s = stats.lock().unwrap();
@@ -227,7 +249,7 @@ pub fn run() {
                             s.error = Some("Aucune clé API : renseignez-la dans les paramètres (⚙︎).".into())
                         }),
                         Some(key) => match Client::new(&settings.base_url, key) {
-                            Ok(c) => run_cycle(&c, &update).await,
+                            Ok(c) => run_cycle(&c, &update, &notify).await,
                             Err(e) => update(&|s| s.error = Some(e.clone())),
                         },
                     }
