@@ -442,4 +442,95 @@ mod tests {
         assert!(load_cache(&bad).is_none());
     }
 
+    mod cycle {
+        use super::super::*;
+        use httpmock::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Applique les mises à jour sur un `Stats` local, comme le fait le vrai `update`.
+        async fn run(server: &MockServer, stats: &Mutex<Stats>, notified: &AtomicUsize) {
+            let c = Client::new(&server.base_url(), "k".into()).unwrap();
+            let update = |f: &dyn Fn(&mut Stats)| f(&mut stats.lock().unwrap());
+            let notify = |_: &KeyData| {
+                notified.fetch_add(1, Ordering::SeqCst);
+            };
+            run_cycle(&c, &update, &notify).await;
+        }
+
+        fn mock_all(server: &MockServer) {
+            server.mock(|when, then| {
+                when.path("/key/info");
+                then.status(200).json_body(serde_json::json!({
+                    "info": {"spend": 10.0, "max_budget": 100.0, "budget_reset_at": "2026-10-12T00:00:00Z", "budget_duration": "7d"}
+                }));
+            });
+            server.mock(|when, then| {
+                when.path("/spend/logs").query_param("summarize", "true");
+                then.status(200).json_body(serde_json::json!([{"startTime": "2026-10-05", "spend": 10.0, "models": {"m": 10.0}}]));
+            });
+            server.mock(|when, then| {
+                when.path("/spend/logs").query_param("summarize", "false");
+                then.status(200).json_body(serde_json::json!([]));
+            });
+        }
+
+        #[tokio::test]
+        async fn successful_cycle_fills_the_state_and_notifies_once() {
+            let server = MockServer::start();
+            mock_all(&server);
+            let stats = Mutex::new(Stats { error: Some("avant".into()), ..Default::default() });
+            let notified = AtomicUsize::new(0);
+            run(&server, &stats, &notified).await;
+
+            let s = stats.lock().unwrap();
+            assert_eq!(s.period_spend, 10.0);
+            assert_eq!(s.max_budget, Some(100.0));
+            assert_eq!(s.period_start.as_deref(), Some("2026-10-05"));
+            assert_eq!(s.models_total.len(), 1);
+            assert_eq!(s.today_date, Some(Local::now().format("%Y-%m-%d").to_string()));
+            assert!(s.updated_at.is_some());
+            assert_eq!(s.error, None);
+            assert_eq!(notified.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn key_failure_keeps_previous_values_and_skips_notification() {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/key/info");
+                then.status(500);
+            });
+            let stats = Mutex::new(Stats { total_spend: 3.0, updated_at: Some("09:00:00".into()), ..Default::default() });
+            let notified = AtomicUsize::new(0);
+            run(&server, &stats, &notified).await;
+
+            let s = stats.lock().unwrap();
+            assert_eq!(s.total_spend, 3.0);
+            assert_eq!(s.updated_at.as_deref(), Some("09:00:00"));
+            assert!(s.error.as_deref().unwrap().contains("500"));
+            assert_eq!(notified.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn a_failing_detail_step_sets_the_error_but_keeps_the_price() {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/key/info");
+                then.status(200).json_body(serde_json::json!({"info": {"spend": 5.0}}));
+            });
+            server.mock(|when, then| {
+                when.path("/spend/logs");
+                then.status(503);
+            });
+            let stats = Mutex::new(Stats::default());
+            let notified = AtomicUsize::new(0);
+            run(&server, &stats, &notified).await;
+
+            let s = stats.lock().unwrap();
+            assert_eq!(s.total_spend, 5.0);
+            assert!(s.error.is_some());
+            assert_eq!(notified.load(Ordering::SeqCst), 1);
+            assert_eq!(title_for(&s), "⚠︎ LiteLLM"); // pas encore de mise à jour complète
+        }
+    }
 }

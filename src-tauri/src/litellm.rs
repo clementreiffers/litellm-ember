@@ -662,6 +662,106 @@ mod tests {
         assert_eq!(totals[0].model, "m");
     }
 
+    mod http {
+        use super::super::*;
+        use httpmock::prelude::*;
+
+        fn client(server: &MockServer) -> Client {
+            Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn fetch_key_parses_the_response_and_sends_the_bearer_token() {
+            let server = MockServer::start();
+            let m = server.mock(|when, then| {
+                when.method(GET).path("/llm/key/info").header("authorization", "Bearer sk-test");
+                then.status(200).json_body(serde_json::json!({
+                    "info": {"spend": 12.5, "max_budget": 125.0,
+                             "budget_reset_at": "2026-10-12T00:00:00.000000Z", "budget_duration": "7d"}
+                }));
+            });
+            let k = client(&server).fetch_key().await.unwrap();
+            m.assert();
+            assert_eq!(k.period_spend, 12.5);
+            assert_eq!(k.max_budget, Some(125.0));
+            assert_eq!(k.budget_reset_at.as_deref(), Some("2026-10-12"));
+            assert_eq!(k.period_start.as_deref(), Some("2026-10-05"));
+        }
+
+        #[tokio::test]
+        async fn fetch_key_without_budget_has_no_dates() {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/llm/key/info");
+                then.status(200).json_body(serde_json::json!({"info": {"spend": 1.0, "max_budget": null}}));
+            });
+            let k = client(&server).fetch_key().await.unwrap();
+            assert_eq!((k.max_budget, k.budget_reset_at, k.period_start), (None, None, None));
+        }
+
+        #[tokio::test]
+        async fn non_2xx_is_reported_with_the_status_and_path_only() {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/llm/key/info");
+                then.status(401);
+            });
+            let err = client(&server).fetch_key().await.err().unwrap();
+            assert!(err.contains("401") && err.contains("/key/info"), "{err}");
+            assert!(!err.contains("sk-test"));
+        }
+
+        #[tokio::test]
+        async fn invalid_json_is_reported() {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/llm/key/info");
+                then.status(200).body("<html>oops</html>");
+            });
+            let err = client(&server).fetch_key().await.err().unwrap();
+            assert!(err.starts_with("réponse invalide"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn unreachable_server_gives_a_message_without_the_url() {
+            let c = Client::new("http://127.0.0.1:1", "k".into()).unwrap();
+            let err = c.fetch_key().await.err().unwrap();
+            assert!(err.starts_with("requête échouée"), "{err}");
+            assert!(!err.contains("127.0.0.1:1/"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn fetch_models_uses_the_period_start_and_aggregates() {
+            let server = MockServer::start();
+            let m = server.mock(|when, then| {
+                when.path("/llm/spend/logs").query_param("summarize", "true").query_param("start_date", "2026-10-05");
+                then.status(200).json_body(serde_json::json!([
+                    {"startTime": "2026-10-05", "spend": 3.0, "models": {"openai/a": 1.0, "b": 2.0}},
+                    {"startTime": "2026-10-06", "spend": 1.0, "models": {"a": 1.0}}
+                ]));
+            });
+            let models = client(&server).fetch_models(Some("2026-10-05")).await.unwrap();
+            m.assert();
+            assert_eq!(models.len(), 2);
+            assert_eq!((models[0].model.as_str(), models[0].spend), ("a", 2.0));
+            assert_eq!((models[1].model.as_str(), models[1].spend), ("b", 2.0));
+        }
+
+        #[tokio::test]
+        async fn fetch_week_fills_days_from_the_period_start() {
+            let server = MockServer::start();
+            let start = (Utc::now().date_naive() - Duration::days(2)).to_string();
+            let m = server.mock(|when, then| {
+                when.path("/llm/spend/logs").query_param("start_date", start.as_str());
+                then.status(200).json_body(serde_json::json!([{"startTime": start, "spend": 2.0, "models": {}}]));
+            });
+            let week = client(&server).fetch_week(Some(&start), None, 2.0).await.unwrap();
+            m.assert();
+            assert_eq!(week.days.len(), 3);
+            assert_eq!(week.days[0].spend, 2.0);
+            assert_eq!(week.projection, None);
+        }
+    }
 }
 
 #[cfg(test)]
