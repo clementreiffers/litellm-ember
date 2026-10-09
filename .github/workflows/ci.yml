@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Un nouveau push rend obsolète la release du commit précédent, notamment si
+# les workflows changent : GITHUB_TOKEN ne peut pas taguer cet ancien workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     # Le backend dépend du Trousseau et des API macOS (keyring, window-vibrancy).
