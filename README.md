@@ -1,34 +1,130 @@
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="Ember logo: a flame surrounded by a budget gauge" width="128" height="128">
+</p>
+
 # Ember
 
-Ember est une app Tauri v2 (macOS) qui affiche le coût total LiteLLM dans la menu bar. Un clic ouvre un panneau avec le coût par modèle et un graphique du jour (tokens et $ par modèle). Rafraîchissement toutes les 30 s.
+I built Ember to keep an eye on my AI spending without having to open a dashboard every time. When requests pile up and you switch between models throughout the day, it helps to know where your budget stands at a glance.
 
-- Backend : Rust (`src-tauri/`), il appelle l'API LiteLLM et met à jour le titre du tray.
-- Front : Rust/WASM avec Leptos + charming (`ui/`).
-- Données partagées : `shared/`.
+Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it running all day: your spending stays visible while you work, the details are one click away, and notifications let you know when you reach your chosen budget thresholds.
 
-## Configuration
+## Your budget at a glance
 
-Après le changement d’identité de l’application, renseignez à nouveau votre endpoint et votre clé. Les anciennes données locales sont conservées sans être importées automatiquement ; macOS peut demander une nouvelle autorisation des notifications.
+- **Spending in the menu bar**: the amount spent during the current budget period, updated every 30 seconds by default.
+- **Usage by model**: costs, today's tokens, and the split between input and output tokens.
+- **A budget gauge**: spending, budget limit, and reset date.
+- **The Week tab**: daily spending, a comparison with yesterday, and an end-of-period projection.
+- **The Activity tab**: requests, errors, cache hits, latency, and hourly activity, with a breakdown by model.
+- **macOS notifications**: two configurable thresholds, set to 50% and 75% of the budget consumed by default.
 
-Bouton ⚙︎ du panneau : l’endpoint est vide au premier lancement et doit être renseigné avec votre clé API.
+The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The Week and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
 
-| Paramètre | Stockage |
-|---|---|
-| Endpoint LiteLLM | `settings.json` (dossier de données de l'app) |
-| Fréquence de rafraîchissement (5 à 3600 s) | `settings.json` |
-| Clé API LiteLLM | Trousseau macOS (service `io.github.clementreiffers.ember`), jamais dans un fichier |
+## Preview
 
-Notifications (activables) : une notification macOS native quand le budget de la période atteint un seuil, une seule fois par seuil et par période. Par défaut 💸 à 50 % consommé et ⚠️ à 75 % (il reste 1/4) ; les deux seuils sont réglables. Le bouton « Envoyer une notification de test » déclenche la demande d'autorisation de macOS.
+<!--
+To add screenshots:
+1. Create assets/screenshots/ and add the four PNG files referenced below.
+2. Uncomment each image line and remove its corresponding "Screenshot coming soon" blockquote.
+Relative paths will work directly on GitHub.
+-->
 
-Sans clé dans le Trousseau, l'app n'appelle pas l'API et le demande dans le panneau. Le front ne relit jamais la clé.
+### Menu bar and usage
 
-## Lancer
+Your spending at a glance, with the panel open to show costs and tokens by model.
+
+> 📸 Screenshot coming soon: the menu bar with the Usage panel open.
+
+<!-- ![Ember in the menu bar with the Usage panel open](assets/screenshots/consommation.png) -->
+
+### Budget trends
+
+Daily spending and a projection based on your current pace.
+
+> 📸 Screenshot coming soon: the Week tab.
+
+<!-- ![Week tab showing spending trends and the budget projection](assets/screenshots/semaine.png) -->
+
+### Activity details
+
+Request metrics and performance, grouped by model.
+
+> 📸 Screenshot coming soon: the Activity tab.
+
+<!-- ![Activity tab showing requests, latency, and hourly activity](assets/screenshots/activite.png) -->
+
+### Settings and notifications
+
+Configure your endpoint, API key, refresh interval, and alert thresholds from the panel.
+
+> 📸 Screenshot coming soon: settings with notification options.
+
+<!-- ![Ember settings and notification thresholds](assets/screenshots/parametres.png) -->
+
+## Build from source
+
+You will need a **Mac**, the Xcode Command Line Tools, [Rust](https://www.rust-lang.org/tools/install), and access to a LiteLLM instance.
+
+Install the required tools:
 
 ```bash
+xcode-select --install # If the Xcode Command Line Tools are not already installed
+rustup target add wasm32-unknown-unknown
 cargo install tauri-cli --version "^2" --locked
 cargo install trunk --locked
-cargo tauri dev            # dev
-cargo tauri build          # .app dans target/release/bundle/macos
-cargo test -p ember                                   # tests unitaires
-cargo test -p ember live -- --ignored --nocapture     # appel réel (lit OPENAI_API_KEY et LITELLM_BASE_URL, test seulement)
 ```
+
+From the root of your cloned repository, build the application:
+
+```bash
+cargo tauri build
+```
+
+The application is generated at `target/release/bundle/macos/Ember.app`. Copy it to your **Applications** folder and launch it. Ember will appear in the menu bar.
+
+## Getting started
+
+The application interface is currently in French. The tab names used above correspond to **Consommation** (Usage), **Semaine** (Week), and **Activité** (Activity).
+
+1. Click the amount in the menu bar, then **⚙︎**.
+2. The endpoint is initially empty. Enter your LiteLLM instance URL, including any path prefix, such as `https://litellm.example.com/llm`.
+3. Add your API key and choose a refresh interval between **5 and 3,600 seconds**.
+4. Save your settings, then click **Envoyer une notification de test** (Send a test notification) to check notification delivery and macOS permissions.
+
+Your key must have access to the `/key/info` and `/spend/logs` endpoints. Without a saved key, the application makes no requests to LiteLLM.
+
+### Local storage
+
+After upgrading from a build with the previous application identity, enter your endpoint and API key again. Existing local data and Keychain entries are left untouched and are not imported automatically. macOS may ask you to allow notifications again.
+
+Your API key is stored in the **macOS Keychain** and is never sent back to the interface. Preferences, the latest statistics, and alert state are stored locally in the application's data directory. The cache restores your latest figures as soon as the app starts.
+
+Alerts remember which thresholds have already been reported. They reset when a new budget period starts or when spending drops below the relevant threshold.
+
+### Understanding the numbers
+
+The displayed amount covers the **key's current budget period**, rather than its lifetime spending. Figures depend on the data and permissions provided by LiteLLM: a model without configured pricing may report a cost of $0. The projection is an estimate based on your current spending pace.
+
+## Development
+
+Ember is built with **Rust**, **Tauri v2**, and **Leptos**, with a frontend compiled to WebAssembly. Charts are rendered using HTML/CSS and SVG.
+
+| Directory | Purpose |
+|---|---|
+| `src-tauri/` | LiteLLM client, menu bar integration, settings, and notifications |
+| `ui/` | Leptos interface, charts, and styles |
+| `shared/` | Types shared between the backend and frontend |
+| `assets/` | SVG logo source and future screenshots |
+
+```bash
+cargo tauri dev                                      # Run in development mode
+cargo test -p ember -p shared --locked                # Backend and shared-type tests
+cargo clippy -p ember -p shared --all-targets --locked # Static analysis
+```
+
+An optional test can query a real LiteLLM instance. It requires both `OPENAI_API_KEY` and `LITELLM_BASE_URL` to be set in the environment; there is no default endpoint. These variables are used only by the test; the application uses its settings and the Keychain.
+
+```bash
+cargo test -p ember live -- --ignored --nocapture
+```
+
+See [AGENTS.md](AGENTS.md) for contribution guidelines.
