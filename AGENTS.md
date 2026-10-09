@@ -40,7 +40,7 @@ The optional live test runs with `cargo test -p ember live -- --ignored --nocapt
 
 ## Commit & Pull Request Guidelines
 
-History uses short imperative subjects, such as “Add configurable native budget notifications”. Follow that style. Describe behavior changes, link relevant issues, report validation, and include screenshots for UI changes. Ensure macOS CI passes.
+Use Conventional Commits, such as `feat: add configurable native budget notifications` or `fix: correct budget totals`. semantic-release uses these commits on `main` to choose the next `X.Y.Z` release: `fix` triggers a patch, `feat` a minor, and `!` or a `BREAKING CHANGE:` footer a major. For squash merges, the squash commit title and body must follow this convention. Describe behavior changes, link relevant issues, report validation, and include screenshots for UI changes. Ensure macOS CI passes.
 
 ## Security & Configuration
 

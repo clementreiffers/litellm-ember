@@ -70,7 +70,18 @@ Ready-to-use macOS builds are available on [GitHub Releases](https://github.com/
 
 The same universal build works on both **Apple Silicon and Intel Macs**. No Rust installation or local build is required.
 
-Releases are built automatically on every push to `main`, after tests and Clippy pass. Tags use `X.Y.Z`: `X.Y` comes from `src-tauri/tauri.conf.json`, and `Z` is the GitHub Actions run number. Pull requests and failed runs can leave gaps in the sequence. The version is injected into the build without committing generated changes. Each release includes a SHA-256 checksum file.
+After tests and Clippy pass on a push to `main`, semantic-release analyzes the commits since the last release and publishes a new version when needed. Tags and release names use `X.Y.Z`, without a `v` prefix. The version is injected into the universal macOS build without committing generated changes. Each release includes generated release notes and a SHA-256 checksum file.
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) for commits merged into `main` (or the squash commit title and body):
+
+| Commit | Release |
+|---|---|
+| `fix: correct the budget total` | Patch (`1.2.3` → `1.2.4`) |
+| `feat: add weekly spending` | Minor (`1.2.3` → `1.3.0`) |
+| `feat!: change the settings format` or a `BREAKING CHANGE:` footer | Major (`1.2.3` → `2.0.0`) |
+| `docs:`, `test:`, `ci:`, `chore:`, or other changes without a breaking change | No release |
+
+The highest required bump wins when multiple commits are pushed. Existing reachable `X.Y.Z` tags are used as the release baseline; without a previous release, the first releasable change creates `1.0.0`. Node.js 24 and `npm ci` install the release tooling; `npm test` verifies the versioning rules without publishing.
 
 These builds are not signed with an Apple Developer ID or notarized, so macOS may require approval in **System Settings → Privacy & Security** on first launch.
 
