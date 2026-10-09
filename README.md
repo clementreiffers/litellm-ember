@@ -60,6 +60,20 @@ Configure your endpoint, API key, refresh interval, and alert thresholds from th
 
 <!-- ![Ember settings and notification thresholds](assets/screenshots/parametres.png) -->
 
+## Download for macOS
+
+Ready-to-use macOS builds are available on [GitHub Releases](https://github.com/clementreiffers/litellm-ember/releases). Choose the version you want, or go directly to the [latest release](https://github.com/clementreiffers/litellm-ember/releases/latest).
+
+1. Open your chosen release and expand **Assets**.
+2. Download `Ember-X.Y.Z-macos-universal.zip`.
+3. Unzip it, move **Ember.app** to **Applications**, and launch it.
+
+The same universal build works on both **Apple Silicon and Intel Macs**. No Rust installation or local build is required.
+
+Releases are built automatically on every push to `main`, after tests and Clippy pass. Tags use `X.Y.Z`: `X.Y` comes from `src-tauri/tauri.conf.json`, and `Z` is the GitHub Actions run number. Pull requests and failed runs can leave gaps in the sequence. The version is injected into the build without committing generated changes. Each release includes a SHA-256 checksum file.
+
+These builds are not signed with an Apple Developer ID or notarized, so macOS may require approval in **System Settings → Privacy & Security** on first launch.
+
 ## Build from source
 
 You will need a **Mac**, the Xcode Command Line Tools, [Rust](https://www.rust-lang.org/tools/install), and access to a LiteLLM instance.
