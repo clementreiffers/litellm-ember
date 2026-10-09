@@ -1,34 +1,101 @@
-use std::collections::HashMap;
-
-use chrono::{DateTime, Duration, Local, NaiveDate, Timelike, Utc};
+#[cfg(test)]
+use chrono::DateTime;
+use chrono::{Duration, Local, NaiveDate, Utc};
+mod domain;
+pub use domain::KeyData;
+use domain::*;
 use serde::Deserialize;
-use shared::{
-    Activity, DayCost, HourBucket, ModelActivity, ModelCost, ModelUsage, TopRequest, WeekDetails,
-};
+use shared::{Activity, ModelCost, ModelUsage, WeekDetails};
 
+#[derive(Debug, thiserror::Error)]
+enum TransportError {
+    #[error("{0}")]
+    Request(String),
+    #[error("HTTP {status} sur {path}")]
+    Status {
+        status: reqwest::StatusCode,
+        path: String,
+    },
+    #[error("réponse invalide ({path}): {source}")]
+    Decode {
+        path: String,
+        source: reqwest::Error,
+    },
+}
+impl From<TransportError> for String {
+    fn from(error: TransportError) -> Self {
+        error.to_string()
+    }
+}
+
+#[derive(Clone)]
 pub struct Client {
+    rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
+    summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
     api_key: String,
 }
 
+struct RowsCache {
+    fetched: std::time::Instant,
+    day: NaiveDate,
+    rows: std::sync::Arc<Vec<LogRow>>,
+}
+struct SummaryCache {
+    fetched: std::time::Instant,
+    path: String,
+    rows: std::sync::Arc<Vec<DaySummary>>,
+}
+
 impl Client {
+    #[cfg(test)]
     pub fn new(base_url: &str, api_key: String) -> Result<Self, String> {
-        let base_url = base_url.trim();
-        if base_url.is_empty() {
-            return Err("Endpoint LiteLLM manquant : renseignez-le dans les paramètres (⚙︎).".into());
+        Self::with_http(base_url, api_key, Self::http()?)
+    }
+
+    pub fn http() -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(describe)
+    }
+
+    pub fn with_http(
+        base_url: &str,
+        api_key: String,
+        http: reqwest::Client,
+    ) -> Result<Self, String> {
+        if base_url.trim().is_empty() {
+            return Err("Endpoint LiteLLM manquant".into());
         }
         Ok(Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .map_err(|e| e.to_string())?,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            http,
+            base_url: crate::settings::validate_url(base_url)?,
             api_key,
+            rows: Default::default(),
+            summaries: Default::default(),
         })
     }
 
-    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
+    async fn summary(&self, path: String) -> Result<std::sync::Arc<Vec<DaySummary>>, String> {
+        let mut cache = self.summaries.lock().await;
+        if let Some(c) = cache
+            .as_ref()
+            .filter(|c| c.path == path && c.fetched.elapsed().as_secs() < 60)
+        {
+            return Ok(c.rows.clone());
+        }
+        let rows = std::sync::Arc::new(self.get::<Vec<DaySummary>>(&path).await?);
+        *cache = Some(SummaryCache {
+            fetched: std::time::Instant::now(),
+            path,
+            rows: rows.clone(),
+        });
+        Ok(rows)
+    }
+
+    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, TransportError> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http
@@ -36,12 +103,18 @@ impl Client {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| describe(e))?;
+            .map_err(|error| TransportError::Request(describe(error)))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("HTTP {status} sur {path}"));
+            return Err(TransportError::Status {
+                status,
+                path: path.to_owned(),
+            });
         }
-        resp.json().await.map_err(|e| format!("réponse invalide ({path}): {e}"))
+        resp.json().await.map_err(|source| TransportError::Decode {
+            path: path.to_owned(),
+            source: source.without_url(),
+        })
     }
 
     /// Étape 1 (≈0,5 s) : dépense de la période de budget en cours (`/key/info`).
@@ -50,7 +123,7 @@ impl Client {
         Ok(KeyData {
             period_spend: key.info.spend,
             max_budget: key.info.max_budget,
-            budget_reset_at: key.info.budget_reset_at.as_ref().map(|d| d.chars().take(10).collect()),
+            budget_reset_at: key.info.budget_reset_at.clone(),
             period_start: period_start(&key.info),
         })
     }
@@ -59,33 +132,62 @@ impl Client {
     pub async fn fetch_models(&self, period_start: Option<&str>) -> Result<Vec<ModelCost>, String> {
         let now = Utc::now().date_naive();
         let tomorrow = now + Duration::days(1);
-        let start = period_start.map(str::to_string).unwrap_or_else(|| (now - Duration::days(7)).to_string());
-        let summary: Vec<DaySummary> = self
-            .get(&format!("/spend/logs?summarize=true&start_date={start}&end_date={tomorrow}"))
+        let start = period_start
+            .and_then(parse_date)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| (now - Duration::days(7)).to_string());
+        let summary = self
+            .summary(format!(
+                "/spend/logs?summarize=true&start_date={start}&end_date={tomorrow}"
+            ))
             .await?;
         Ok(aggregate_totals(&summary))
     }
 
     /// Étape 3 (lente, 5 à 10 s : l'API renvoie les messages) : tokens et $ du jour par modèle.
+    #[cfg(test)]
     pub async fn fetch_today(&self) -> Result<Vec<ModelUsage>, String> {
-        Ok(aggregate_today(&self.fetch_today_rows().await?, Local::now().date_naive()))
+        self.fetch_today_snapshot().await.map(|(_, rows)| rows)
     }
 
-    async fn fetch_today_rows(&self) -> Result<Vec<LogRow>, String> {
-        let today = Local::now().date_naive();
-        // On ne demande que le jour UTC où commence le jour local, pas la veille entière.
+    pub async fn fetch_today_snapshot(&self) -> Result<(NaiveDate, Vec<ModelUsage>), String> {
+        let (today, rows) = self.fetch_today_rows().await?;
+        Ok((today, aggregate_today(&rows, today, &Local)))
+    }
+
+    async fn fetch_today_rows(&self) -> Result<(NaiveDate, std::sync::Arc<Vec<LogRow>>), String> {
+        let now = Local::now();
+        let today = now.date_naive();
+        let mut cache = self.rows.lock().await;
+        if let Some(c) = cache
+            .as_ref()
+            .filter(|c| c.day == today && c.fetched.elapsed().as_secs() < 60)
+        {
+            return Ok((today, c.rows.clone()));
+        }
         let start = today
             .and_hms_opt(0, 0, 0)
             .and_then(|d| d.and_local_timezone(Local).earliest())
             .map(|d| d.with_timezone(&Utc).date_naive())
-            .unwrap_or_else(|| Utc::now().date_naive());
-        let end = Utc::now().date_naive() + Duration::days(1);
-        self.get(&format!("/spend/logs?summarize=false&start_date={start}&end_date={end}")).await
+            .unwrap_or(now.with_timezone(&Utc).date_naive());
+        let end = now.with_timezone(&Utc).date_naive() + Duration::days(1);
+        let rows = std::sync::Arc::new(
+            self.get::<Vec<LogRow>>(&format!(
+                "/spend/logs?summarize=false&start_date={start}&end_date={end}"
+            ))
+            .await?,
+        );
+        *cache = Some(RowsCache {
+            fetched: std::time::Instant::now(),
+            day: today,
+            rows: rows.clone(),
+        });
+        Ok((today, rows))
     }
 
-    /// Onglet « Activité », appelé à la demande : même source que `fetch_today`, autres agrégations.
     pub async fn fetch_activity(&self) -> Result<Activity, String> {
-        Ok(aggregate_activity(&self.fetch_today_rows().await?, Local::now().date_naive()))
+        let (today, rows) = self.fetch_today_rows().await?;
+        Ok(aggregate_activity(&rows, today, &Local))
     }
 
     /// Onglet « Semaine », appelé à la demande : coût par jour depuis le début de la période + projection.
@@ -97,76 +199,23 @@ impl Client {
     ) -> Result<WeekDetails, String> {
         let now = Utc::now();
         let today = now.date_naive();
-        let start = period_start.and_then(parse_date).unwrap_or(today - Duration::days(6));
-        let summary: Vec<DaySummary> = self
-            .get(&format!(
+        let start = period_start
+            .and_then(parse_date)
+            .unwrap_or(today - Duration::days(6));
+        let summary = self
+            .summary(format!(
                 "/spend/logs?summarize=true&start_date={start}&end_date={}",
                 today + Duration::days(1)
             ))
             .await?;
         Ok(WeekDetails {
             days: aggregate_days(&summary, start, today),
-            projection: budget_reset_at
-                .and_then(parse_date)
-                .and_then(|reset| project(period_spend, start, reset, now)),
+            projection: period_start
+                .and_then(parse_instant)
+                .zip(budget_reset_at.and_then(parse_instant))
+                .and_then(|(start, reset)| project_instants(period_spend, start, reset, now)),
         })
     }
-}
-
-fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()
-}
-
-/// Un point par jour de `start` à `today` (les jours sans dépense valent 0), au plus les 14 derniers.
-fn aggregate_days(summary: &[DaySummary], start: NaiveDate, today: NaiveDate) -> Vec<DayCost> {
-    let mut by_day: HashMap<NaiveDate, f64> = HashMap::new();
-    for d in summary {
-        if let Some(date) = d.start_time.as_deref().and_then(parse_date) {
-            *by_day.entry(date).or_default() += d.spend;
-        }
-    }
-    let first = start.max(today - Duration::days(13));
-    (0..=(today - first).num_days())
-        .map(|i| {
-            let date = first + Duration::days(i);
-            DayCost { date: date.to_string(), spend: by_day.get(&date).copied().unwrap_or(0.0) }
-        })
-        .collect()
-}
-
-/// Extrapole la dépense de la période au rythme moyen observé depuis son début.
-fn project(spend: f64, start: NaiveDate, reset: NaiveDate, now: DateTime<Utc>) -> Option<f64> {
-    let total_days = (reset - start).num_days() as f64;
-    let begin = start.and_hms_opt(0, 0, 0)?.and_utc();
-    // Au moins 6 h écoulées, sinon l'extrapolation n'a pas de sens.
-    let elapsed_days = (now - begin).num_seconds() as f64 / 86_400.0;
-    (total_days > 0.0 && elapsed_days >= 0.25).then(|| spend / elapsed_days * total_days)
-}
-
-pub struct KeyData {
-    pub period_spend: f64,
-    pub max_budget: Option<f64>,
-    pub budget_reset_at: Option<String>,
-    pub period_start: Option<String>,
-}
-
-/// Début de la période de budget : date de reset moins la durée du budget (`7d`, `24h`, `2w`, `1mo`).
-fn period_start(info: &KeyInfoInner) -> Option<String> {
-    let reset = NaiveDate::parse_from_str(info.budget_reset_at.as_deref()?.get(..10)?, "%Y-%m-%d").ok()?;
-    let days = parse_days(info.budget_duration.as_deref().unwrap_or("7d"));
-    Some((reset - Duration::days(days)).to_string())
-}
-
-fn parse_days(duration: &str) -> i64 {
-    let split = duration.find(|c: char| !c.is_ascii_digit()).unwrap_or(duration.len());
-    let n: i64 = duration[..split].parse().unwrap_or(7);
-    match &duration[split..] {
-        "h" | "s" | "m" => 1,
-        "w" => n * 7,
-        "mo" => n * 30,
-        _ => n,
-    }
-    .max(1)
 }
 
 /// Message d'erreur avec la chaîne de causes, sans l'URL.
@@ -181,237 +230,17 @@ fn describe(e: reqwest::Error) -> String {
     msg
 }
 
-#[derive(Deserialize)]
-struct KeyInfo {
-    info: KeyInfoInner,
-}
-
-#[derive(Deserialize)]
-struct KeyInfoInner {
-    spend: f64,
-    max_budget: Option<f64>,
-    budget_reset_at: Option<String>,
-    budget_duration: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DaySummary {
-    #[serde(default)]
-    models: HashMap<String, f64>,
-    #[serde(default)]
-    spend: f64,
-    #[serde(default, rename = "startTime")]
-    start_time: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct LogRow {
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    spend: f64,
-    #[serde(default, rename = "prompt_tokens")]
-    prompt: u64,
-    #[serde(default, rename = "completion_tokens")]
-    completion: u64,
-    #[serde(default, rename = "total_tokens")]
-    total: u64,
-    #[serde(rename = "startTime")]
-    start_time: Option<DateTime<Utc>>,
-    #[serde(default, rename = "endTime")]
-    end_time: Option<DateTime<Utc>>,
-    #[serde(default, rename = "completionStartTime")]
-    completion_start: Option<DateTime<Utc>>,
-    /// `"success"` ou `"failure"`.
-    #[serde(default)]
-    status: Option<String>,
-    /// Booléen ou chaîne (`"True"`, `"False"`, `"None"`) selon la version de LiteLLM.
-    #[serde(default)]
-    cache_hit: Option<serde_json::Value>,
-}
-
-impl LogRow {
-    fn failed(&self) -> bool {
-        self.status.as_deref() == Some("failure")
-    }
-
-    /// `Some(true)` si servie par le cache, `Some(false)` si le cache a été consulté sans succès, `None` s'il n'est pas utilisé.
-    fn cache(&self) -> Option<bool> {
-        use serde_json::Value;
-        match self.cache_hit.as_ref()? {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
-            Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
-            _ => None,
-        }
-    }
-
-    fn latency_ms(&self) -> Option<f64> {
-        let ms = (self.end_time? - self.start_time?).num_milliseconds() as f64;
-        (ms > 0.0).then_some(ms)
-    }
-
-    fn ttft_ms(&self) -> Option<f64> {
-        let ms = (self.completion_start? - self.start_time?).num_milliseconds() as f64;
-        (ms > 0.0).then_some(ms)
-    }
-}
-
-/// `openai/gpt-6-sol` et `gpt-6-sol` sont le même modèle ; `bedrock/invoke/x` → `x`.
-/// Renvoie `None` pour un nom vide.
-pub fn normalize_model(name: &str) -> Option<String> {
-    let short = name.rsplit('/').next().unwrap_or(name).trim();
-    (!short.is_empty()).then(|| short.to_string())
-}
-
-fn aggregate_totals(days: &[DaySummary]) -> Vec<ModelCost> {
-    let mut acc: HashMap<String, f64> = HashMap::new();
-    for (name, spend) in days.iter().flat_map(|d| d.models.iter()) {
-        if let Some(model) = normalize_model(name) {
-            *acc.entry(model).or_default() += spend;
-        }
-    }
-    let mut out: Vec<_> = acc.into_iter().map(|(model, spend)| ModelCost { model, spend }).collect();
-    out.sort_by(|a, b| b.spend.total_cmp(&a.spend).then(a.model.cmp(&b.model)));
-    out
-}
-
-fn aggregate_today(rows: &[LogRow], today: NaiveDate) -> Vec<ModelUsage> {
-    let mut acc: HashMap<String, ModelUsage> = HashMap::new();
-    for row in rows {
-        let Some(start) = row.start_time else { continue };
-        if start.with_timezone(&Local).date_naive() != today {
-            continue;
-        }
-        let Some(model) = normalize_model(&row.model) else { continue };
-        let u = acc.entry(model.clone()).or_insert_with(|| ModelUsage { model, ..Default::default() });
-        u.spend += row.spend;
-        u.requests += 1;
-        u.prompt_tokens += row.prompt;
-        u.completion_tokens += row.completion;
-        u.total_tokens += row.total;
-    }
-    let mut out: Vec<_> = acc.into_values().collect();
-    out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then(a.model.cmp(&b.model)));
-    out
-}
-
-/// Percentile par rang le plus proche ; `None` si la liste est vide.
-fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(f64::total_cmp);
-    let idx = ((p / 100.0) * (values.len() - 1) as f64).round() as usize;
-    Some(values[idx])
-}
-
-fn aggregate_activity(rows: &[LogRow], today: NaiveDate) -> Activity {
-    let rows: Vec<&LogRow> = rows
-        .iter()
-        .filter(|r| r.start_time.is_some_and(|t| t.with_timezone(&Local).date_naive() == today))
-        .collect();
-    let mut hourly = vec![HourBucket::default(); 24];
-    if rows.is_empty() {
-        return Activity { hourly, ..Default::default() };
-    }
-
-    #[derive(Default)]
-    struct Acc {
-        requests: u64,
-        errors: u64,
-        spend: f64,
-        tokens: u64,
-        latencies: Vec<f64>,
-    }
-    let mut per_model: HashMap<String, Acc> = HashMap::new();
-    let (mut errors, mut spend, mut tokens) = (0_u64, 0.0_f64, 0_u64);
-    let (mut hits, mut tracked) = (0_u64, 0_u64);
-    let (mut latencies, mut ttfts) = (Vec::new(), Vec::new());
-
-    for r in &rows {
-        let failed = r.failed();
-        errors += failed as u64;
-        spend += r.spend;
-        tokens += r.total;
-        if let Some(hit) = r.cache() {
-            tracked += 1;
-            hits += hit as u64;
-        }
-        if !failed {
-            latencies.extend(r.latency_ms());
-            ttfts.extend(r.ttft_ms());
-        }
-        if let Some(t) = r.start_time {
-            let b = &mut hourly[t.with_timezone(&Local).hour() as usize];
-            b.requests += 1;
-            b.spend += r.spend;
-        }
-        if let Some(model) = normalize_model(&r.model) {
-            let a = per_model.entry(model).or_default();
-            a.requests += 1;
-            a.errors += failed as u64;
-            a.spend += r.spend;
-            a.tokens += r.total;
-            if !failed {
-                a.latencies.extend(r.latency_ms());
-            }
-        }
-    }
-
-    let ok = (rows.len() as u64 - errors).max(1) as f64;
-    let mut per_model: Vec<ModelActivity> = per_model
-        .into_iter()
-        .map(|(model, mut a)| {
-            let ok = (a.requests - a.errors).max(1) as f64;
-            ModelActivity {
-                model,
-                requests: a.requests,
-                errors: a.errors,
-                spend: a.spend,
-                avg_cost: a.spend / ok,
-                avg_tokens: a.tokens as f64 / ok,
-                latency_p50_ms: percentile(&mut a.latencies, 50.0),
-                latency_p95_ms: percentile(&mut a.latencies, 95.0),
-            }
-        })
-        .collect();
-    per_model.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.model.cmp(&b.model)));
-
-    let top_request = rows
-        .iter()
-        .filter(|r| r.spend > 0.0)
-        .max_by(|a, b| a.spend.total_cmp(&b.spend))
-        .map(|r| TopRequest {
-            model: normalize_model(&r.model).unwrap_or_default(),
-            spend: r.spend,
-            total_tokens: r.total,
-            time: r.start_time.map(|t| t.with_timezone(&Local).format("%H:%M").to_string()).unwrap_or_default(),
-        });
-
-    Activity {
-        requests: rows.len() as u64,
-        errors,
-        avg_cost: spend / ok,
-        avg_tokens: tokens as f64 / ok,
-        cache_rate: (tracked > 0).then(|| hits as f64 / tracked as f64),
-        latency_p50_ms: percentile(&mut latencies, 50.0),
-        latency_p95_ms: percentile(&mut latencies, 95.0),
-        ttft_p50_ms: percentile(&mut ttfts, 50.0),
-        per_model,
-        hourly,
-        top_request,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn client_rejects_blank_endpoints_before_any_request() {
         for url in ["", "   "] {
-            assert!(matches!(Client::new(url, "test-key".into()), Err(e) if e.contains("Endpoint LiteLLM manquant")));
+            assert!(
+                matches!(Client::new(url, "test-key".into()), Err(e) if e.contains("Endpoint LiteLLM manquant"))
+            );
         }
     }
 
@@ -427,10 +256,10 @@ mod tests {
 
     #[test]
     fn percentiles() {
-        let mut v = vec![40.0, 10.0, 30.0, 20.0, 50.0];
-        assert_eq!(percentile(&mut v, 50.0), Some(30.0));
-        assert_eq!(percentile(&mut v, 95.0), Some(50.0));
-        assert_eq!(percentile(&mut [], 50.0), None);
+        let v = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        assert_eq!(percentile_sorted(&v, 50.0), Some(30.0));
+        assert_eq!(percentile_sorted(&v, 95.0), Some(50.0));
+        assert_eq!(percentile_sorted(&[], 50.0), None);
     }
 
     #[test]
@@ -441,19 +270,25 @@ mod tests {
             row(&format!(
                 r#"{{"model":"openai/m","spend":1.0,"total_tokens":100,"status":"success","cache_hit":"False",
                 "startTime":"{}","endTime":"{}","completionStartTime":"{}"}}"#,
-                t(0), t(2000), t(500)
+                t(0),
+                t(2000),
+                t(500)
             )),
             row(&format!(
                 r#"{{"model":"m","spend":3.0,"total_tokens":300,"status":"success","cache_hit":true,
                 "startTime":"{}","endTime":"{}"}}"#,
-                t(0), t(4000)
+                t(0),
+                t(4000)
             )),
-            row(&format!(r#"{{"model":"","spend":0.0,"total_tokens":0,"status":"failure","cache_hit":"None","startTime":"{}"}}"#, t(0))),
+            row(&format!(
+                r#"{{"model":"","spend":0.0,"total_tokens":0,"status":"failure","cache_hit":"None","startTime":"{}"}}"#,
+                t(0)
+            )),
         ];
-        let a = aggregate_activity(&rows, Local::now().date_naive());
+        let a = aggregate_activity(&rows, Local::now().date_naive(), &Local);
         assert_eq!((a.requests, a.errors), (3, 1));
-        assert!((a.avg_cost - 2.0).abs() < 1e-9); // 4 $ sur 2 requêtes réussies
-        assert_eq!(a.avg_tokens, 200.0);
+        assert!((a.avg_cost - 4.0 / 3.0).abs() < 1e-9); // 4 $ sur 2 requêtes réussies
+        assert_eq!(a.avg_tokens, 400.0 / 3.0);
         assert_eq!(a.cache_rate, Some(0.5)); // la valeur "None" n'est pas comptée
         assert_eq!(a.latency_p50_ms, Some(4000.0));
         assert_eq!(a.ttft_p50_ms, Some(500.0));
@@ -478,26 +313,25 @@ mod tests {
         assert_eq!(days[3].spend, 21.0);
 
         let reset = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z").unwrap().with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         // 3,5 jours écoulés sur 7 : 28 $ -> 56 $
         assert!((project(28.0, start, reset, now).unwrap() - 56.0).abs() < 1e-9);
-        let early = DateTime::parse_from_rfc3339("2026-10-05T03:00:00Z").unwrap().with_timezone(&Utc);
+        let early = DateTime::parse_from_rfc3339("2026-10-05T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(project(1.0, start, reset, early), None);
     }
 
     #[test]
-    fn parses_budget_durations() {
-        assert_eq!(parse_days("7d"), 7);
-        assert_eq!(parse_days("2w"), 14);
-        assert_eq!(parse_days("1mo"), 30);
-        assert_eq!(parse_days("24h"), 1);
-    }
-
-    #[test]
     fn normalizes_names() {
-        assert_eq!(normalize_model("openai/gpt-6-sol").as_deref(), Some("gpt-6-sol"));
-        assert_eq!(normalize_model("bedrock/invoke/eu.anthropic.x").as_deref(), Some("eu.anthropic.x"));
-        assert_eq!(normalize_model("gpt-6-sol").as_deref(), Some("gpt-6-sol"));
+        assert_eq!(normalize_model("openai/gpt-6-sol"), Some("gpt-6-sol"));
+        assert_eq!(
+            normalize_model("bedrock/invoke/eu.anthropic.x"),
+            Some("eu.anthropic.x")
+        );
+        assert_eq!(normalize_model("gpt-6-sol"), Some("gpt-6-sol"));
         assert_eq!(normalize_model(""), None);
     }
 
@@ -510,7 +344,13 @@ mod tests {
         .unwrap();
         let totals = aggregate_totals(&days);
         assert_eq!(totals.len(), 2);
-        assert_eq!(totals[0], ModelCost { model: "gpt-6-sol".into(), spend: 3.5 });
+        assert_eq!(
+            totals[0],
+            ModelCost {
+                model: "gpt-6-sol".into(),
+                spend: 3.5
+            }
+        );
     }
 
     #[test]
@@ -523,7 +363,7 @@ mod tests {
                 {{"model":"m","spend":9.0,"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"startTime":"{old}"}}]"#
         ))
         .unwrap();
-        let today = aggregate_today(&rows, Local::now().date_naive());
+        let today = aggregate_today(&rows, Local::now().date_naive(), &Local);
         assert_eq!(today.len(), 1);
         assert_eq!(today[0].requests, 2);
         assert_eq!(today[0].total_tokens, 18);
@@ -539,19 +379,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_days_handles_units_and_garbage() {
-        assert_eq!(parse_days("7d"), 7);
-        assert_eq!(parse_days("2w"), 14);
-        assert_eq!(parse_days("1mo"), 30);
-        assert_eq!(parse_days("30"), 30);
-        // Les durées inférieures à un jour comptent pour un jour.
-        assert_eq!(parse_days("24h"), 1);
-        assert_eq!(parse_days("90m"), 1);
-        assert_eq!(parse_days("0d"), 1);
-        assert_eq!(parse_days(""), 7);
-        assert_eq!(parse_days("abc"), 7);
-        assert_eq!(parse_days("é"), 7);
-        assert_eq!(parse_days("3D"), 3); // unité inconnue : on garde le nombre
+    fn durations_are_exact_and_checked() {
+        for (input, seconds) in [
+            ("48h", 172800),
+            ("90m", 5400),
+            ("2w", 1209600),
+            ("1mo", 2592000),
+        ] {
+            assert_eq!(parse_duration(input).unwrap().num_seconds(), seconds);
+        }
+        for input in ["", "é", "0d", "3D", "9223372036854775807w"] {
+            assert!(parse_duration(input).is_none());
+        }
     }
 
     #[test]
@@ -562,9 +401,18 @@ mod tests {
             budget_reset_at: reset.map(str::to_string),
             budget_duration: dur.map(str::to_string),
         };
-        assert_eq!(period_start(&info(Some("2026-10-12T00:00:00Z"), Some("7d"))).as_deref(), Some("2026-10-05"));
-        assert_eq!(period_start(&info(Some("2026-10-12T00:00:00Z"), None)).as_deref(), Some("2026-10-05"));
-        assert_eq!(period_start(&info(Some("2026-10-31T00:00:00Z"), Some("1mo"))).as_deref(), Some("2026-10-01"));
+        assert_eq!(
+            period_start(&info(Some("2026-10-12T00:00:00Z"), Some("7d"))).as_deref(),
+            Some("2026-10-05T00:00:00+00:00")
+        );
+        assert_eq!(
+            period_start(&info(Some("2026-10-12T00:00:00Z"), None)).as_deref(),
+            Some("2026-10-05T00:00:00+00:00")
+        );
+        assert_eq!(
+            period_start(&info(Some("2026-10-31T00:00:00Z"), Some("1mo"))).as_deref(),
+            Some("2026-10-01T00:00:00+00:00")
+        );
         assert_eq!(period_start(&info(None, Some("7d"))), None);
         assert_eq!(period_start(&info(Some("pas une date"), Some("7d"))), None);
         assert_eq!(period_start(&info(Some("2026"), Some("7d"))), None);
@@ -578,7 +426,10 @@ mod tests {
         let p = project(50.0, start, reset, at("2026-10-06T00:00:00Z")).unwrap();
         assert!((p - 100.0).abs() < 1e-9);
         // Dépense nulle.
-        assert_eq!(project(0.0, start, reset, at("2026-10-06T00:00:00Z")), Some(0.0));
+        assert_eq!(
+            project(0.0, start, reset, at("2026-10-06T00:00:00Z")),
+            Some(0.0)
+        );
         // Moins de 6 h écoulées (frontière incluse à exactement 6 h).
         assert_eq!(project(1.0, start, reset, at("2026-10-01T05:59:59Z")), None);
         assert!(project(1.0, start, reset, at("2026-10-01T06:00:00Z")).is_some());
@@ -604,7 +455,11 @@ mod tests {
             spend,
             start_time: Some(format!("{date}T00:00:00Z")),
         };
-        let summary = [day("2026-10-20", 1.0), day("2026-10-20", 2.0), day("2026-10-21", 0.5)];
+        let summary = [
+            day("2026-10-20", 1.0),
+            day("2026-10-20", 2.0),
+            day("2026-10-21", 0.5),
+        ];
         let days = aggregate_days(&summary, d("2026-09-01"), d("2026-10-21"));
         assert_eq!(days.len(), 14);
         assert_eq!(days[0].date, "2026-10-08");
@@ -614,16 +469,22 @@ mod tests {
         // `start` après `today` : liste vide, sans panique.
         assert!(aggregate_days(&summary, d("2026-10-22"), d("2026-10-21")).is_empty());
         // Entrée sans date ignorée.
-        let nodate = [DaySummary { models: HashMap::new(), spend: 9.0, start_time: None }];
-        assert!(aggregate_days(&nodate, d("2026-10-21"), d("2026-10-21")).iter().all(|x| x.spend == 0.0));
+        let nodate = [DaySummary {
+            models: HashMap::new(),
+            spend: 9.0,
+            start_time: None,
+        }];
+        assert!(aggregate_days(&nodate, d("2026-10-21"), d("2026-10-21"))
+            .iter()
+            .all(|x| x.spend == 0.0));
     }
 
     #[test]
     fn normalize_model_edge_cases() {
-        assert_eq!(normalize_model("a/").as_deref(), None);
-        assert_eq!(normalize_model("   ").as_deref(), None);
-        assert_eq!(normalize_model("").as_deref(), None);
-        assert_eq!(normalize_model(" bedrock/invoke/x ").as_deref(), Some("x"));
+        assert_eq!(normalize_model("a/"), None);
+        assert_eq!(normalize_model("   "), None);
+        assert_eq!(normalize_model(""), None);
+        assert_eq!(normalize_model(" bedrock/invoke/x "), Some("x"));
     }
 
     #[test]
@@ -641,7 +502,12 @@ mod tests {
     #[test]
     fn log_row_tolerates_missing_fields_and_computes_latencies() {
         let r = row("{}");
-        assert!(!r.failed() && r.start_time.is_none() && r.latency_ms().is_none() && r.ttft_ms().is_none());
+        assert!(
+            !r.failed()
+                && r.start_time.is_none()
+                && r.latency_ms().is_none()
+                && r.ttft_ms().is_none()
+        );
         let r = row(
             r#"{"status":"failure","startTime":"2026-10-12T10:00:00Z","completionStartTime":"2026-10-12T10:00:01Z","endTime":"2026-10-12T10:00:03Z"}"#,
         );
@@ -655,11 +521,55 @@ mod tests {
 
     #[test]
     fn totals_ignore_empty_model_names() {
-        let days: Vec<DaySummary> =
-            serde_json::from_str(r#"[{"models":{"":1.0,"a/m":2.0},"spend":3.0,"startTime":"2026-10-12"}]"#).unwrap();
+        let days: Vec<DaySummary> = serde_json::from_str(
+            r#"[{"models":{"":1.0,"a/m":2.0},"spend":3.0,"startTime":"2026-10-12"}]"#,
+        )
+        .unwrap();
         let totals = aggregate_totals(&days);
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].model, "m");
+    }
+
+    #[test]
+    fn paid_failures_count_in_cost_and_token_averages() {
+        let rows = vec![
+            row(
+                r#"{"model":"m","spend":2,"total_tokens":20,"status":"success","startTime":"2026-10-08T12:00:00Z","endTime":"2026-10-08T12:00:01Z"}"#,
+            ),
+            row(
+                r#"{"model":"m","spend":4,"total_tokens":40,"status":"failure","startTime":"2026-10-08T12:00:00Z","endTime":"2026-10-08T12:00:10Z"}"#,
+            ),
+        ];
+        let data = aggregate_activity(&rows, d("2026-10-08"), &Utc);
+        assert_eq!((data.avg_cost, data.avg_tokens), (3.0, 30.0));
+        assert_eq!(data.per_model[0].avg_cost, 3.0);
+        assert_eq!(data.latency_p95_ms, Some(1000.0));
+        let failed = aggregate_activity(&rows[1..], d("2026-10-08"), &Utc);
+        assert_eq!(failed.avg_cost, 4.0);
+        assert_eq!(failed.latency_p50_ms, None);
+        assert_eq!(aggregate_activity(&[], d("2026-10-08"), &Utc).avg_cost, 0.0);
+    }
+    #[test]
+    fn local_day_and_hour_are_explicit_at_midnight_and_dst_offsets() {
+        let rows = vec![row(
+            r#"{"model":"m","spend":1,"startTime":"2026-10-24T22:30:00Z"}"#,
+        )];
+        let east = chrono::FixedOffset::east_opt(7200).unwrap();
+        let west = chrono::FixedOffset::west_opt(7200).unwrap();
+        assert_eq!(
+            aggregate_activity(&rows, d("2026-10-25"), &east).hourly[0].requests,
+            1
+        );
+        assert_eq!(
+            aggregate_activity(&rows, d("2026-10-25"), &west).requests,
+            0
+        );
+        assert_eq!(aggregate_today(&rows, d("2026-10-25"), &east).len(), 1);
+        let reset = at("2026-10-25T04:00:00Z");
+        assert_eq!(
+            reset - parse_duration("48h").unwrap(),
+            at("2026-10-23T04:00:00Z")
+        );
     }
 
     mod http {
@@ -670,6 +580,44 @@ mod tests {
             Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()
         }
 
+        #[tokio::test]
+        async fn concurrent_tabs_share_rows_and_expired_cache_is_reloaded() {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.path("/llm/spend/logs")
+                    .query_param("summarize", "false");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(20))
+                    .json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            let (today, activity) = tokio::join!(client.fetch_today(), client.fetch_activity());
+            assert!(today.is_ok() && activity.is_ok());
+            mock.assert_hits(1);
+            client.rows.lock().await.as_mut().unwrap().fetched -=
+                std::time::Duration::from_secs(61);
+            client.fetch_activity().await.unwrap();
+            mock.assert_hits(2);
+            client.rows.lock().await.as_mut().unwrap().day -= Duration::days(1);
+            client.fetch_today().await.unwrap();
+            mock.assert_hits(3);
+        }
+        #[tokio::test]
+        async fn week_and_models_share_identical_summaries() {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.path("/llm/spend/logs")
+                    .query_param("summarize", "true");
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            let (models, week) = tokio::join!(
+                client.fetch_models(Some("2026-10-01")),
+                client.fetch_week(Some("2026-10-01"), None, 0.0)
+            );
+            assert!(models.is_ok() && week.is_ok());
+            mock.assert_hits(1);
+        }
         #[tokio::test]
         async fn fetch_key_parses_the_response_and_sends_the_bearer_token() {
             let server = MockServer::start();
@@ -684,8 +632,11 @@ mod tests {
             m.assert();
             assert_eq!(k.period_spend, 12.5);
             assert_eq!(k.max_budget, Some(125.0));
-            assert_eq!(k.budget_reset_at.as_deref(), Some("2026-10-12"));
-            assert_eq!(k.period_start.as_deref(), Some("2026-10-05"));
+            assert_eq!(
+                k.budget_reset_at.as_deref(),
+                Some("2026-10-12T00:00:00.000000Z")
+            );
+            assert_eq!(k.period_start.as_deref(), Some("2026-10-05T00:00:00+00:00"));
         }
 
         #[tokio::test]
@@ -693,10 +644,14 @@ mod tests {
             let server = MockServer::start();
             server.mock(|when, then| {
                 when.path("/llm/key/info");
-                then.status(200).json_body(serde_json::json!({"info": {"spend": 1.0, "max_budget": null}}));
+                then.status(200)
+                    .json_body(serde_json::json!({"info": {"spend": 1.0, "max_budget": null}}));
             });
             let k = client(&server).fetch_key().await.unwrap();
-            assert_eq!((k.max_budget, k.budget_reset_at, k.period_start), (None, None, None));
+            assert_eq!(
+                (k.max_budget, k.budget_reset_at, k.period_start),
+                (None, None, None)
+            );
         }
 
         #[tokio::test]
@@ -740,7 +695,10 @@ mod tests {
                     {"startTime": "2026-10-06", "spend": 1.0, "models": {"a": 1.0}}
                 ]));
             });
-            let models = client(&server).fetch_models(Some("2026-10-05")).await.unwrap();
+            let models = client(&server)
+                .fetch_models(Some("2026-10-05T00:00:00+00:00"))
+                .await
+                .unwrap();
             m.assert();
             assert_eq!(models.len(), 2);
             assert_eq!((models[0].model.as_str(), models[0].spend), ("a", 2.0));
@@ -752,10 +710,16 @@ mod tests {
             let server = MockServer::start();
             let start = (Utc::now().date_naive() - Duration::days(2)).to_string();
             let m = server.mock(|when, then| {
-                when.path("/llm/spend/logs").query_param("start_date", start.as_str());
-                then.status(200).json_body(serde_json::json!([{"startTime": start, "spend": 2.0, "models": {}}]));
+                when.path("/llm/spend/logs")
+                    .query_param("start_date", start.as_str());
+                then.status(200).json_body(
+                    serde_json::json!([{"startTime": start, "spend": 2.0, "models": {}}]),
+                );
             });
-            let week = client(&server).fetch_week(Some(&start), None, 2.0).await.unwrap();
+            let week = client(&server)
+                .fetch_week(Some(&start), None, 2.0)
+                .await
+                .unwrap();
             m.assert();
             assert_eq!(week.days.len(), 3);
             assert_eq!(week.days[0].spend, 2.0);
@@ -773,19 +737,32 @@ mod live {
     #[ignore]
     async fn fetch_stats_live() {
         let c = Client::new(
-            &std::env::var("LITELLM_BASE_URL").expect("LITELLM_BASE_URL doit être définie pour le test réseau"),
+            &std::env::var("LITELLM_BASE_URL")
+                .expect("LITELLM_BASE_URL doit être définie pour le test réseau"),
             std::env::var("OPENAI_API_KEY").unwrap(),
         )
         .unwrap();
         let t = std::time::Instant::now();
         let key = c.fetch_key().await.unwrap();
-        println!("période ${:.2} depuis {:?} ({:?})", key.period_spend, key.period_start, t.elapsed());
+        println!(
+            "période ${:.2} depuis {:?} ({:?})",
+            key.period_spend,
+            key.period_start,
+            t.elapsed()
+        );
         let models = c.fetch_models(key.period_start.as_deref()).await.unwrap();
         println!("modèles ({:?})", t.elapsed());
         for m in &models {
             println!("{:<55} ${:.2}", m.model, m.spend);
         }
-        let week = c.fetch_week(key.period_start.as_deref(), key.budget_reset_at.as_deref(), key.period_spend).await.unwrap();
+        let week = c
+            .fetch_week(
+                key.period_start.as_deref(),
+                key.budget_reset_at.as_deref(),
+                key.period_spend,
+            )
+            .await
+            .unwrap();
         println!("--- semaine: projection {:?}", week.projection);
         for d in &week.days {
             println!("{} ${:.2}", d.date, d.spend);
@@ -794,17 +771,33 @@ mod live {
         println!("--- activité ({:?})", t.elapsed());
         println!(
             "req {} err {} avg ${:.4} avg tok {:.0} cache {:?} p50 {:?} p95 {:?} ttft {:?}",
-            act.requests, act.errors, act.avg_cost, act.avg_tokens, act.cache_rate, act.latency_p50_ms, act.latency_p95_ms, act.ttft_p50_ms
+            act.requests,
+            act.errors,
+            act.avg_cost,
+            act.avg_tokens,
+            act.cache_rate,
+            act.latency_p50_ms,
+            act.latency_p95_ms,
+            act.ttft_p50_ms
         );
         for m in &act.per_model {
-            println!("{:<50} {:>4} req {:>3} err ${:.4}/req p50 {:?}", m.model, m.requests, m.errors, m.avg_cost, m.latency_p50_ms);
+            println!(
+                "{:<50} {:>4} req {:>3} err ${:.4}/req p50 {:?}",
+                m.model, m.requests, m.errors, m.avg_cost, m.latency_p50_ms
+            );
         }
-        println!("heures: {:?}", act.hourly.iter().map(|h| h.requests).collect::<Vec<_>>());
+        println!(
+            "heures: {:?}",
+            act.hourly.iter().map(|h| h.requests).collect::<Vec<_>>()
+        );
         println!("top: {:?}", act.top_request);
         let today = c.fetch_today().await.unwrap();
         println!("--- aujourd'hui ({:?})", t.elapsed());
         for u in &today {
-            println!("{:<55} {:>10} tok ${:.2} ({} req)", u.model, u.total_tokens, u.spend, u.requests);
+            println!(
+                "{:<55} {:>10} tok ${:.2} ({} req)",
+                u.model, u.total_tokens, u.spend, u.requests
+            );
         }
     }
 }

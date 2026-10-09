@@ -1,27 +1,26 @@
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::persistence::load_cache;
+#[cfg(test)]
 use chrono::Local;
-use shared::{Activity, SettingsInput, SettingsView, Stats, WeekDetails};
+use shared::{Activity, Detail, SettingsInput, SettingsView, Stats, WeekDetails};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    ActivationPolicy, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    ActivationPolicy, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
-use tokio::sync::Notify;
 
-use crate::{
-    litellm::{Client, KeyData},
-    notify::{self, Notifier},
-    settings::SettingsStore,
-};
+use crate::{notify, service::Service};
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
-
-type SharedStats = Arc<Mutex<Stats>>;
 
 #[tauri::command]
 fn close_window(window: tauri::WebviewWindow) {
@@ -29,59 +28,27 @@ fn close_window(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-fn get_settings(store: State<'_, Arc<SettingsStore>>) -> SettingsView {
-    store.view()
+async fn get_settings(service: State<'_, Service>) -> Result<SettingsView, String> {
+    service.settings().await
 }
-
-/// Enregistre les paramètres. Si l'endpoint ou la clé changent, les données affichées sont réinitialisées
-/// et un rafraîchissement immédiat est demandé.
 #[tauri::command]
-fn save_settings(
+async fn save_settings(
     input: SettingsInput,
-    store: State<'_, Arc<SettingsStore>>,
-    stats: State<'_, SharedStats>,
-    refresh: State<'_, Arc<Notify>>,
-    app: AppHandle,
+    service: State<'_, Service>,
 ) -> Result<SettingsView, String> {
-    let changed = store.save(input)?;
-    if changed {
-        let fresh = Stats::default();
-        *stats.lock().unwrap() = fresh.clone();
-        let _ = app.emit("stats-updated", &fresh);
-    }
-    refresh.notify_one();
-    Ok(store.view())
+    service.save(input).await
 }
-
-fn client_for(store: &SettingsStore) -> Result<Client, String> {
-    let key = store.api_key().ok_or("Aucune clé API : renseignez-la dans les paramètres.")?;
-    Client::new(&store.get().base_url, key)
-}
-
-/// Onglet « Semaine », chargé à la demande.
 #[tauri::command]
-async fn get_week(
-    store: State<'_, Arc<SettingsStore>>,
-    stats: State<'_, SharedStats>,
-) -> Result<WeekDetails, String> {
-    let client = client_for(&store)?;
-    let (start, reset, spend) = {
-        let s = stats.lock().unwrap();
-        (s.period_start.clone(), s.budget_reset_at.clone(), s.period_spend)
-    };
-    client.fetch_week(start.as_deref(), reset.as_deref(), spend).await
+async fn get_week(service: State<'_, Service>) -> Result<Detail<WeekDetails>, String> {
+    service.week().await
 }
-
-/// Onglet « Activité », chargé à la demande.
 #[tauri::command]
-async fn get_activity(store: State<'_, Arc<SettingsStore>>) -> Result<Activity, String> {
-    client_for(&store)?.fetch_activity().await
+async fn get_activity(service: State<'_, Service>) -> Result<Detail<Activity>, String> {
+    service.activity().await
 }
-
-/// Bouton « rafraîchir » du panneau : relance un cycle immédiatement.
 #[tauri::command]
-fn refresh_now(refresh: State<'_, Arc<Notify>>) {
-    refresh.notify_one();
+async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
+    service.refresh_and_wait().await
 }
 
 /// Bouton « Tester » des paramètres.
@@ -91,8 +58,8 @@ fn test_notification(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_stats(state: State<'_, SharedStats>) -> Stats {
-    state.lock().unwrap().clone()
+fn get_stats(service: State<'_, Service>) -> Stats {
+    service.stats()
 }
 
 fn title_for(stats: &Stats) -> String {
@@ -103,49 +70,8 @@ fn title_for(stats: &Stats) -> String {
     }
 }
 
-/// Un cycle : le prix d'abord, puis le détail par modèle et les tokens du jour en parallèle.
-/// Chaque étape met à jour l'état dès qu'elle finit ; en cas d'erreur on garde les dernières valeurs.
-async fn run_cycle(
-    c: &Client,
-    update: &(dyn Fn(&dyn Fn(&mut Stats)) + Sync),
-    notify: &(dyn Fn(&KeyData) + Sync),
-) {
-    let key = match c.fetch_key().await {
-        Ok(k) => k,
-        Err(e) => return update(&|s| s.error = Some(e.clone())),
-    };
-    update(&|s| {
-        s.total_spend = key.period_spend;
-        s.period_spend = key.period_spend;
-        s.max_budget = key.max_budget;
-        s.budget_reset_at = key.budget_reset_at.clone();
-        s.period_start = key.period_start.clone();
-        s.error = None;
-    });
-    notify(&key);
-
-    let models = async {
-        match c.fetch_models(key.period_start.as_deref()).await {
-            Ok(m) => update(&|s| s.models_total = m.clone()),
-            Err(e) => update(&|s| s.error = Some(e.clone())),
-        }
-    };
-    let today = async {
-        match c.fetch_today().await {
-            Ok(t) => update(&|s| {
-                s.today = t.clone();
-                s.today_date = Some(Local::now().format("%Y-%m-%d").to_string());
-                s.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
-            }),
-            Err(e) => update(&|s| s.error = Some(e.clone())),
-        }
-    };
-    tokio::join!(models, today);
-}
-
 fn data_file(app: &AppHandle, name: &str) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
-    std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join(name))
 }
 
@@ -157,32 +83,25 @@ fn settings_path(app: &AppHandle) -> Option<PathBuf> {
     data_file(app, "settings.json")
 }
 
-fn load_cache(path: &Path) -> Option<Stats> {
-    let mut stats: Stats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    // Les tokens d'un autre jour ne doivent pas apparaître comme ceux d'aujourd'hui.
-    if stats.today_date.as_deref() != Some(Local::now().format("%Y-%m-%d").to_string().as_str()) {
-        stats.today.clear();
-    }
-    stats.error = None;
-    Some(stats)
-}
-
+#[cfg(test)]
 fn save_cache(path: &Path, stats: &Stats) {
-    if let Ok(json) = serde_json::to_vec(stats) {
-        let _ = std::fs::write(path, json);
-    }
+    crate::persistence::write(path, stats).unwrap();
 }
 
 pub fn run() {
-    let refresh = Arc::new(Notify::new());
-    let stats: SharedStats = Arc::new(Mutex::new(Stats::default()));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
-        .manage(stats.clone())
-        .manage(refresh.clone())
-        .invoke_handler(tauri::generate_handler![get_stats, close_window, get_settings, save_settings, get_week, get_activity, refresh_now, test_notification])
+        .invoke_handler(tauri::generate_handler![
+            get_stats,
+            close_window,
+            get_settings,
+            save_settings,
+            get_week,
+            get_activity,
+            refresh_now,
+            test_notification
+        ])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
@@ -190,13 +109,12 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&refresh_item, &quit_item])?;
 
-            let notify = refresh.clone();
             let tray = TrayIconBuilder::with_id("main")
                 .title("…")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
-                    "refresh" => notify.notify_one(),
+                    "refresh" => app.state::<Service>().refresh(),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -213,52 +131,22 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Cache disque : le dernier état connu s'affiche tout de suite, avant tout appel réseau.
-            let cache = cache_path(app.handle());
-            let store = Arc::new(SettingsStore::load(settings_path(app.handle())));
-            app.manage(store.clone());
-            if let Some(cached) = cache.as_deref().and_then(load_cache) {
-                let _ = tray.set_title(Some(title_for(&cached)));
-                *stats.lock().unwrap() = cached;
-            }
-
             create_window(app.handle())?;
-
-            let notifier = Notifier::load(data_file(app.handle(), "notifications.json"));
+            let cache = cache_path(app.handle());
+            let settings = settings_path(app.handle());
+            let notifications = data_file(app.handle(), "notifications.json");
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let notify = |k: &KeyData| {
-                    notifier.check(&handle, &store.get(), k.period_spend, k.max_budget, k.budget_reset_at.as_deref())
-                };
-                let update = |f: &dyn Fn(&mut Stats)| {
-                    let snapshot = {
-                        let mut s = stats.lock().unwrap();
-                        f(&mut s);
-                        s.clone()
-                    };
-                    let _ = tray.set_title(Some(title_for(&snapshot)));
-                    let _ = handle.emit("stats-updated", &snapshot);
-                    if let Some(path) = &cache {
-                        save_cache(path, &snapshot);
-                    }
-                };
-                loop {
-                    let settings = store.get();
-                    match store.api_key() {
-                        None => update(&|s| {
-                            s.error = Some("Aucune clé API : renseignez-la dans les paramètres (⚙︎).".into())
-                        }),
-                        Some(key) => match Client::new(&settings.base_url, key) {
-                            Ok(c) => run_cycle(&c, &update, &notify).await,
-                            Err(e) => update(&|s| s.error = Some(e.clone())),
-                        },
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(settings.refresh_secs.into())) => {}
-                        _ = refresh.notified() => {}
-                    }
-                }
-            });
+            let service = Service::start(
+                settings,
+                cache,
+                notifications,
+                handle.clone(),
+                move |snapshot| {
+                    let _ = tray.set_title(Some(title_for(snapshot)));
+                    let _ = handle.emit("stats-updated", snapshot);
+                },
+            );
+            app.manage(service);
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -336,7 +224,8 @@ fn create_window(app: &AppHandle) -> tauri::Result<()> {
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(wait).await;
                 if w.is_visible().unwrap_or(false) && !w.is_focused().unwrap_or(true) {
-                    *BLUR_HIDDEN_AT.lock().unwrap() = Some(Instant::now());
+                    *BLUR_HIDDEN_AT.lock().expect("état de fenêtre empoisonné") =
+                        Some(Instant::now());
                     let _ = w.hide();
                 }
             });
@@ -346,7 +235,9 @@ fn create_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn toggle_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else { return };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
         return;
@@ -356,14 +247,12 @@ fn toggle_window(app: &AppHandle) {
     if since(&BLUR_HIDDEN_AT).is_some_and(|d| d < Duration::from_millis(300)) {
         return;
     }
-    *SHOWN_AT.lock().unwrap() = Some(Instant::now());
+    *SHOWN_AT.lock().expect("état de fenêtre empoisonné") = Some(Instant::now());
     let _ = window.move_window(Position::TrayBottomCenter);
     let _ = window.show();
     let _ = window.set_focus();
     // Rafraîchit le contenu avec l'état courant (la page peut avoir été mise en veille).
-    if let Ok(stats) = app.state::<SharedStats>().lock() {
-        let _ = app.emit("stats-updated", &*stats);
-    }
+    let _ = app.emit("stats-updated", app.state::<Service>().stats());
     // Si le focus n'a pas été pris du premier coup, on réessaie une fois.
     let w = window.clone();
     tauri::async_runtime::spawn(async move {
@@ -390,11 +279,22 @@ mod tests {
 
     #[test]
     fn title_reflects_error_and_freshness() {
-        let ok = Stats { total_spend: 4.256, ..Default::default() };
+        let ok = Stats {
+            total_spend: 4.256,
+            ..Default::default()
+        };
         assert_eq!(title_for(&ok), "$4.26");
-        let err_no_data = Stats { error: Some("x".into()), ..Default::default() };
+        let err_no_data = Stats {
+            error: Some("x".into()),
+            ..Default::default()
+        };
         assert_eq!(title_for(&err_no_data), "⚠︎ LiteLLM");
-        let err_stale = Stats { error: Some("x".into()), updated_at: Some("10:00:00".into()), total_spend: 1.0, ..Default::default() };
+        let err_stale = Stats {
+            error: Some("x".into()),
+            updated_at: Some("10:00:00".into()),
+            total_spend: 1.0,
+            ..Default::default()
+        };
         assert_eq!(title_for(&err_stale), "$1.00 ⚠︎");
     }
 
@@ -402,7 +302,10 @@ mod tests {
     fn cache_roundtrip_keeps_today_and_drops_the_error() {
         let path = tmp("fresh.json");
         let stats = Stats {
-            today: vec![shared::ModelUsage { model: "m".into(), ..Default::default() }],
+            today: vec![shared::ModelUsage {
+                model: "m".into(),
+                ..Default::default()
+            }],
             today_date: Some(today()),
             error: Some("old error".into()),
             total_spend: 7.0,
@@ -419,7 +322,10 @@ mod tests {
     fn stale_cache_drops_todays_tokens_but_keeps_the_rest() {
         let path = tmp("stale.json");
         let stats = Stats {
-            today: vec![shared::ModelUsage { model: "m".into(), ..Default::default() }],
+            today: vec![shared::ModelUsage {
+                model: "m".into(),
+                ..Default::default()
+            }],
             today_date: Some("2000-01-01".into()),
             total_spend: 7.0,
             ..Default::default()
@@ -430,7 +336,13 @@ mod tests {
         assert_eq!(loaded.total_spend, 7.0);
 
         // Sans date du tout, même traitement.
-        save_cache(&path, &Stats { today: stats.today.clone(), ..Default::default() });
+        save_cache(
+            &path,
+            &Stats {
+                today: stats.today.clone(),
+                ..Default::default()
+            },
+        );
         assert!(load_cache(&path).unwrap().today.is_empty());
     }
 
@@ -444,17 +356,28 @@ mod tests {
 
     mod cycle {
         use super::super::*;
+        use crate::{
+            litellm::Client,
+            service::{apply, run_cycle, Event},
+        };
         use httpmock::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Applique les mises à jour sur un `Stats` local, comme le fait le vrai `update`.
         async fn run(server: &MockServer, stats: &Mutex<Stats>, notified: &AtomicUsize) {
             let c = Client::new(&server.base_url(), "k".into()).unwrap();
-            let update = |f: &dyn Fn(&mut Stats)| f(&mut stats.lock().unwrap());
-            let notify = |_: &KeyData| {
-                notified.fetch_add(1, Ordering::SeqCst);
-            };
-            run_cycle(&c, &update, &notify).await;
+            run_cycle(&c, |event| {
+                let mut stats = stats.lock().unwrap();
+                if matches!(event, Event::Key(_)) {
+                    stats.error = None;
+                    notified.fetch_add(1, Ordering::SeqCst);
+                }
+                if matches!(event, Event::Today(..)) {
+                    stats.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
+                }
+                apply(&mut stats, event);
+            })
+            .await;
         }
 
         fn mock_all(server: &MockServer) {
@@ -478,16 +401,22 @@ mod tests {
         async fn successful_cycle_fills_the_state_and_notifies_once() {
             let server = MockServer::start();
             mock_all(&server);
-            let stats = Mutex::new(Stats { error: Some("avant".into()), ..Default::default() });
+            let stats = Mutex::new(Stats {
+                error: Some("avant".into()),
+                ..Default::default()
+            });
             let notified = AtomicUsize::new(0);
             run(&server, &stats, &notified).await;
 
             let s = stats.lock().unwrap();
             assert_eq!(s.period_spend, 10.0);
             assert_eq!(s.max_budget, Some(100.0));
-            assert_eq!(s.period_start.as_deref(), Some("2026-10-05"));
+            assert_eq!(s.period_start.as_deref(), Some("2026-10-05T00:00:00+00:00"));
             assert_eq!(s.models_total.len(), 1);
-            assert_eq!(s.today_date, Some(Local::now().format("%Y-%m-%d").to_string()));
+            assert_eq!(
+                s.today_date,
+                Some(Local::now().format("%Y-%m-%d").to_string())
+            );
             assert!(s.updated_at.is_some());
             assert_eq!(s.error, None);
             assert_eq!(notified.load(Ordering::SeqCst), 1);
@@ -500,7 +429,11 @@ mod tests {
                 when.path("/key/info");
                 then.status(500);
             });
-            let stats = Mutex::new(Stats { total_spend: 3.0, updated_at: Some("09:00:00".into()), ..Default::default() });
+            let stats = Mutex::new(Stats {
+                total_spend: 3.0,
+                updated_at: Some("09:00:00".into()),
+                ..Default::default()
+            });
             let notified = AtomicUsize::new(0);
             run(&server, &stats, &notified).await;
 
@@ -516,7 +449,8 @@ mod tests {
             let server = MockServer::start();
             server.mock(|when, then| {
                 when.path("/key/info");
-                then.status(200).json_body(serde_json::json!({"info": {"spend": 5.0}}));
+                then.status(200)
+                    .json_body(serde_json::json!({"info": {"spend": 5.0}}));
             });
             server.mock(|when, then| {
                 when.path("/spend/logs");

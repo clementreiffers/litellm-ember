@@ -2,7 +2,7 @@
 use std::future::Future;
 
 use leptos::prelude::*;
-use shared::{Activity, WeekDetails};
+use shared::{Activity, Detail, WeekDetails};
 
 use crate::{
     app::{budget_level, fmt_tokens},
@@ -19,52 +19,119 @@ pub struct Remote<T> {
     pub loading: bool,
     pub error: Option<String>,
     fetched_at: f64,
+    request_id: u64,
+    pending: bool,
 }
 
 impl<T> Default for Remote<T> {
     fn default() -> Self {
-        Self { data: None, loading: false, error: None, fetched_at: 0.0 }
+        Self {
+            data: None,
+            loading: false,
+            error: None,
+            fetched_at: 0.0,
+            request_id: 0,
+            pending: false,
+        }
+    }
+}
+
+/// Transitions sans horloge JS, testables sur la cible native.
+impl<T> Remote<T> {
+    fn begin(&mut self, now: f64) -> Option<u64> {
+        if self.loading
+            || (self.data.is_some() && self.fetched_at > 0.0 && now - self.fetched_at < FRESH_MS)
+        {
+            return None;
+        }
+        self.loading = true;
+        self.error = None;
+        self.request_id += 1;
+        Some(self.request_id)
+    }
+    fn complete(
+        &mut self,
+        request_id: u64,
+        generation: u64,
+        current_generation: u64,
+        result: Result<Detail<T>, String>,
+        now: f64,
+    ) -> bool {
+        if self.request_id != request_id {
+            return false;
+        }
+        self.loading = false;
+        let reload = std::mem::take(&mut self.pending);
+        if generation != current_generation {
+            return false;
+        }
+        match result {
+            Ok(detail) if detail.generation == generation => {
+                self.data = Some(detail.data);
+                self.fetched_at = if reload { 0.0 } else { now };
+            }
+            Ok(_) => self.error = Some("La configuration a changé ; rechargez cet onglet".into()),
+            Err(error) => self.error = Some(error),
+        }
+        reload
+    }
+    fn invalidate(&mut self) {
+        self.fetched_at = 0.0;
+        self.pending |= self.loading;
+    }
+    fn reset(&mut self) {
+        *self = Self {
+            request_id: self.request_id + 1,
+            ..Default::default()
+        };
     }
 }
 
 /// Lance `fetch` sauf si un appel est en cours ou si les données sont encore fraîches.
-pub fn load<T, F, Fut>(slot: RwSignal<Remote<T>>, fetch: F)
+pub fn load<T, F, Fut>(slot: RwSignal<Remote<T>>, fetch: F, generation: Signal<u64>)
 where
     T: Send + Sync + 'static,
-    F: FnOnce() -> Fut + 'static,
-    Fut: Future<Output = Result<T, String>> + 'static,
+    F: Fn() -> Fut + Clone + 'static,
+    Fut: Future<Output = Result<Detail<T>, String>> + 'static,
 {
-    let skip = slot.with_untracked(|r| r.loading || (r.data.is_some() && js_sys::Date::now() - r.fetched_at < FRESH_MS));
-    if skip {
+    let Some(Some(request_id)) = slot.try_update(|r| r.begin(js_sys::Date::now())) else {
         return;
-    }
-    slot.update(|r| {
-        r.loading = true;
-        r.error = None;
-    });
+    };
+    let requested_generation = generation.get_untracked();
     leptos::task::spawn_local(async move {
         let result = fetch().await;
-        slot.update(|r| {
-            r.loading = false;
-            match result {
-                Ok(d) => {
-                    r.data = Some(d);
-                    r.fetched_at = js_sys::Date::now();
-                }
-                Err(e) => r.error = Some(e),
+        let mut reload = false;
+        slot.try_update(|r| {
+            if let Some(current) = generation.try_get_untracked() {
+                reload = r.complete(
+                    request_id,
+                    requested_generation,
+                    current,
+                    result,
+                    js_sys::Date::now(),
+                );
             }
         });
+        if reload && slot.try_with_untracked(|_| ()).is_some() {
+            load(slot, fetch, generation);
+        }
     });
 }
 
-/// Marque les données comme périmées : le prochain `load` les rechargera malgré le délai de fraîcheur.
 pub fn invalidate<T: Send + Sync + 'static>(slot: RwSignal<Remote<T>>) {
-    slot.update(|r| r.fetched_at = 0.0);
+    slot.update(Remote::invalidate);
+}
+pub fn reset<T: Send + Sync + 'static>(slot: RwSignal<Remote<T>>) {
+    slot.update(Remote::reset);
 }
 
 /// Bandeau d'état commun : attente (première charge), actualisation (données déjà là) ou erreur.
 #[component]
-fn Status(loading: Signal<bool>, has_data: Signal<bool>, error: Signal<Option<String>>) -> impl IntoView {
+fn Status(
+    loading: Signal<bool>,
+    has_data: Signal<bool>,
+    error: Signal<Option<String>>,
+) -> impl IntoView {
     view! {
         {move || (loading.get() && !has_data.get()).then(|| view! {
             <div class="pending"><span class="spinner"></span>"Récupération des informations en cours…"</div>
@@ -85,7 +152,11 @@ fn fmt_ms(ms: Option<f64>) -> String {
 }
 
 fn fmt_cost(v: f64) -> String {
-    if v >= 1.0 { format!("${v:.2}") } else { format!("${v:.3}") }
+    if v >= 1.0 {
+        format!("${v:.2}")
+    } else {
+        format!("${v:.3}")
+    }
 }
 
 /// « 2026-10-08 » -> « 08/10 ».
@@ -97,16 +168,27 @@ fn short_date(iso: &str) -> String {
 }
 
 #[component]
-pub fn WeekTab(week: RwSignal<Remote<WeekDetails>>, max_budget: Signal<Option<f64>>) -> impl IntoView {
+pub fn WeekTab(
+    week: RwSignal<Remote<WeekDetails>>,
+    max_budget: Signal<Option<f64>>,
+) -> impl IntoView {
     let loading = Signal::derive(move || week.with(|r| r.loading));
     let has_data = Signal::derive(move || week.with(|r| r.data.is_some()));
     let error = Signal::derive(move || week.with(|r| r.error.clone()));
-    let days = Signal::derive(move || week.with(|r| r.data.as_ref().map(|d| d.days.clone()).unwrap_or_default()));
+    let days = Signal::derive(move || {
+        week.with(|r| r.data.as_ref().map(|d| d.days.clone()).unwrap_or_default())
+    });
 
     let cols = Signal::derive(move || {
         days.get()
             .into_iter()
-            .map(|d| (short_date(&d.date), d.spend, format!("{} : ${:.2}", d.date, d.spend)))
+            .map(|d| {
+                (
+                    short_date(&d.date),
+                    d.spend,
+                    format!("{} : ${:.2}", d.date, d.spend),
+                )
+            })
             .collect::<Vec<_>>()
     });
     let today_idx = Signal::derive(move || days.with(|d| d.len().checked_sub(1)));
@@ -175,8 +257,16 @@ pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
                         .iter()
                         .enumerate()
                         .map(|(h, b)| {
-                            let label = if h % 6 == 0 { format!("{h}h") } else { String::new() };
-                            (label, b.requests as f64, format!("{h}h : {} req · ${:.2}", b.requests, b.spend))
+                            let label = if h % 6 == 0 {
+                                format!("{h}h")
+                            } else {
+                                String::new()
+                            };
+                            (
+                                label,
+                                b.requests as f64,
+                                format!("{h}h : {} req · ${:.2}", b.requests, b.spend),
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -242,5 +332,56 @@ pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
                 })}
             }
         })}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn result(value: u32, generation: u64) -> Result<Detail<u32>, String> {
+        Ok(Detail {
+            generation,
+            data: value,
+        })
+    }
+    #[test]
+    fn old_response_cannot_overwrite_a_new_request_after_reset() {
+        let mut remote = Remote::default();
+        let old = remote.begin(100.0).unwrap();
+        remote.reset();
+        let new = remote.begin(200.0).unwrap();
+        assert!(!remote.complete(old, 1, 1, result(10, 1), 300.0));
+        assert!(remote.loading);
+        assert_eq!(remote.data, None);
+        remote.complete(new, 1, 1, result(20, 1), 400.0);
+        assert_eq!(remote.data, Some(20));
+    }
+    #[test]
+    fn invalidations_during_loading_queue_exactly_one_reload() {
+        let mut remote = Remote::default();
+        let request = remote.begin(100.0).unwrap();
+        remote.invalidate();
+        remote.invalidate();
+        assert!(remote.begin(200.0).is_none());
+        assert!(remote.complete(request, 1, 1, result(10, 1), 300.0));
+        let next = remote.begin(300.0).unwrap();
+        assert!(!remote.complete(next, 1, 1, result(20, 1), 400.0));
+        assert!(remote.begin(500.0).is_none());
+        assert!(remote.begin(60_400.0).is_some());
+    }
+    #[test]
+    fn changed_generation_and_failed_requests_leave_existing_data_untouched() {
+        let mut remote = Remote {
+            data: Some(5),
+            ..Default::default()
+        };
+        let request = remote.begin(100.0).unwrap();
+        remote.complete(request, 1, 2, result(9, 1), 200.0);
+        assert_eq!(remote.data, Some(5));
+        let request = remote.begin(300.0).unwrap();
+        remote.complete(request, 2, 2, Err("offline".into()), 400.0);
+        assert_eq!(remote.data, Some(5));
+        assert!(!remote.loading);
+        assert!(remote.error.is_some());
     }
 }

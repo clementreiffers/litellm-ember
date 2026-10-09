@@ -1269,7 +1269,9 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-positioner",
+ "thiserror 2.0.21",
  "tokio",
+ "uuid",
  "window-vibrancy",
 ]
 

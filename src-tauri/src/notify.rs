@@ -18,7 +18,12 @@ pub enum Level {
 /// Décide quelle notification envoyer. Chaque seuil n'est signalé qu'une fois par période ;
 /// si plusieurs seuils sont franchis d'un coup (premier lancement tardif), seul le plus haut est notifié.
 /// Un seuil repasse « non signalé » si la consommation redescend sous lui.
-pub fn decide(pct: f64, info: u32, critical: u32, fired: &mut BTreeSet<u32>) -> Option<(Level, u32)> {
+pub fn decide(
+    pct: f64,
+    info: u32,
+    critical: u32,
+    fired: &mut BTreeSet<u32>,
+) -> Option<(Level, u32)> {
     fired.retain(|t| f64::from(*t) <= pct);
     let crossed: Vec<(Level, u32)> = [(Level::Info, info), (Level::Critical, critical)]
         .into_iter()
@@ -28,8 +33,10 @@ pub fn decide(pct: f64, info: u32, critical: u32, fired: &mut BTreeSet<u32>) -> 
     crossed.last().copied()
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    source_id: String,
     /// Identifie la période de budget (date de reset) : un nouveau reset remet tout à zéro.
     period: Option<String>,
     fired: BTreeSet<u32>,
@@ -48,28 +55,66 @@ impl Notifier {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        Self { path, state: Mutex::new(state) }
+        Self {
+            path,
+            state: Mutex::new(state),
+        }
     }
 
     /// À appeler après chaque lecture de `/key/info`.
-    pub fn check(&self, app: &AppHandle, cfg: &Settings, spend: f64, max_budget: Option<f64>, reset_at: Option<&str>) {
-        let notice = {
-            let mut st = self.state.lock().unwrap();
-            let notice = st.evaluate(cfg, spend, max_budget, reset_at);
-            if let Some(path) = &self.path {
-                if let Ok(json) = serde_json::to_vec(&*st) {
-                    let _ = std::fs::write(path, json);
-                }
-            }
-            notice
-        };
+    pub fn check(
+        &self,
+        app: &AppHandle,
+        cfg: &Settings,
+        spend: f64,
+        max_budget: Option<f64>,
+        reset_at: Option<&str>,
+    ) {
+        if let Err(e) = self.check_with(cfg, spend, max_budget, reset_at, |notice| {
+            let (title, body) = message(
+                notice.level,
+                notice.threshold,
+                notice.pct,
+                spend,
+                notice.max,
+                reset_at,
+            );
+            send(app, notice.level, &title, &body)
+        }) {
+            eprintln!("{e}");
+        }
+    }
 
-        if let Some(Notice { level, threshold, pct, max }) = notice {
-            let (title, body) = message(level, threshold, pct, spend, max, reset_at);
-            if let Err(e) = send(app, level, &title, &body) {
-                eprintln!("{e}");
+    fn check_with(
+        &self,
+        cfg: &Settings,
+        spend: f64,
+        max_budget: Option<f64>,
+        reset_at: Option<&str>,
+        send_notice: impl FnOnce(&Notice) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "État des notifications indisponible")?;
+        let mut next = state.clone();
+        if next.source_id != cfg.source_id {
+            next = State {
+                source_id: cfg.source_id.clone(),
+                ..Default::default()
+            };
+        }
+        if let Some(notice) = next.evaluate(cfg, spend, max_budget, reset_at) {
+            send_notice(&notice)?;
+        }
+        if *state != next {
+            // Ne pas répéter dans cette session un envoi déjà accepté, même si le disque échoue.
+            *state = next;
+            if let Some(path) = &self.path {
+                crate::persistence::write(path, &*state).map_err(|e| e.to_string())?;
             }
         }
+        Ok(())
     }
 }
 
@@ -84,7 +129,13 @@ struct Notice {
 
 impl State {
     /// Partie pure de `Notifier::check` : met à jour l'état et renvoie la notification éventuelle.
-    fn evaluate(&mut self, cfg: &Settings, spend: f64, max_budget: Option<f64>, reset_at: Option<&str>) -> Option<Notice> {
+    fn evaluate(
+        &mut self,
+        cfg: &Settings,
+        spend: f64,
+        max_budget: Option<f64>,
+        reset_at: Option<&str>,
+    ) -> Option<Notice> {
         if !cfg.notifications_enabled {
             return None;
         }
@@ -96,18 +147,40 @@ impl State {
             self.period = period;
             self.fired.clear();
         }
-        decide(pct, cfg.notify_info_percent, cfg.notify_critical_percent, &mut self.fired)
-            .map(|(level, threshold)| Notice { level, threshold, pct, max })
+        decide(
+            pct,
+            cfg.notify_info_percent,
+            cfg.notify_critical_percent,
+            &mut self.fired,
+        )
+        .map(|(level, threshold)| Notice {
+            level,
+            threshold,
+            pct,
+            max,
+        })
     }
 }
 
-fn message(level: Level, threshold: u32, pct: f64, spend: f64, max: f64, reset_at: Option<&str>) -> (String, String) {
+fn message(
+    level: Level,
+    threshold: u32,
+    pct: f64,
+    spend: f64,
+    max: f64,
+    reset_at: Option<&str>,
+) -> (String, String) {
     let remaining = (max - spend).max(0.0);
-    let reset = reset_at.map(|d| format!(" jusqu'au reset du {}", d.get(..10).unwrap_or(d))).unwrap_or_default();
+    let reset = reset_at
+        .map(|d| format!(" jusqu'au reset du {}", d.get(..10).unwrap_or(d)))
+        .unwrap_or_default();
     let body = format!("${spend:.2} dépensés sur ${max:.0} · il reste ${remaining:.2}{reset}.");
     let title = match level {
         Level::Info => format!("💸 Budget LiteLLM : {threshold} % consommé"),
-        Level::Critical => format!("⚠️ Budget LiteLLM : plus que {:.0} % restant", (100.0 - pct).max(0.0)),
+        Level::Critical => format!(
+            "⚠️ Budget LiteLLM : plus que {:.0} % restant",
+            (100.0 - pct).max(0.0)
+        ),
     };
     (title, body)
 }
@@ -117,12 +190,18 @@ fn send(app: &AppHandle, level: Level, title: &str, body: &str) -> Result<(), St
     if level == Level::Critical {
         n = n.sound("Sosumi");
     }
-    n.show().map_err(|e| format!("Envoi de la notification impossible: {e}"))
+    n.show()
+        .map_err(|e| format!("Envoi de la notification impossible: {e}"))
 }
 
 /// Notification d'essai (bouton « Tester » des paramètres) : déclenche aussi la demande d'autorisation macOS.
 pub fn send_test(app: &AppHandle) -> Result<(), String> {
-    send(app, Level::Critical, "⚠️ Budget LiteLLM : notification de test", "Si vous lisez ceci, les notifications fonctionnent.")
+    send(
+        app,
+        Level::Critical,
+        "⚠️ Budget LiteLLM : notification de test",
+        "Si vous lisez ceci, les notifications fonctionnent.",
+    )
 }
 
 #[cfg(test)]
@@ -135,14 +214,20 @@ mod tests {
         assert_eq!(decide(30.0, 50, 75, &mut fired), None);
         assert_eq!(decide(52.0, 50, 75, &mut fired), Some((Level::Info, 50)));
         assert_eq!(decide(60.0, 50, 75, &mut fired), None); // déjà signalé
-        assert_eq!(decide(76.0, 50, 75, &mut fired), Some((Level::Critical, 75)));
+        assert_eq!(
+            decide(76.0, 50, 75, &mut fired),
+            Some((Level::Critical, 75))
+        );
         assert_eq!(decide(99.0, 50, 75, &mut fired), None);
     }
 
     #[test]
     fn notifies_only_the_highest_threshold_when_both_are_crossed() {
         let mut fired = BTreeSet::new();
-        assert_eq!(decide(80.0, 50, 75, &mut fired), Some((Level::Critical, 75)));
+        assert_eq!(
+            decide(80.0, 50, 75, &mut fired),
+            Some((Level::Critical, 75))
+        );
         assert_eq!(decide(81.0, 50, 75, &mut fired), None); // le seuil info n'arrive pas en retard
     }
 
@@ -156,7 +241,14 @@ mod tests {
 
     #[test]
     fn messages_use_the_right_emoji() {
-        let (t, b) = message(Level::Info, 50, 51.0, 63.75, 125.0, Some("2026-10-12T00:00:00+00:00"));
+        let (t, b) = message(
+            Level::Info,
+            50,
+            51.0,
+            63.75,
+            125.0,
+            Some("2026-10-12T00:00:00+00:00"),
+        );
         assert!(t.starts_with("💸") && t.contains("50 %"));
         assert!(b.contains("$63.75") && b.contains("$61.25") && b.contains("2026-10-12"));
         let (t, _) = message(Level::Critical, 75, 76.0, 95.0, 125.0, None);
@@ -164,7 +256,12 @@ mod tests {
     }
 
     fn cfg(enabled: bool) -> Settings {
-        Settings { notifications_enabled: enabled, notify_info_percent: 50, notify_critical_percent: 75, ..Settings::default() }
+        Settings {
+            notifications_enabled: enabled,
+            notify_info_percent: 50,
+            notify_critical_percent: 75,
+            ..Settings::default()
+        }
     }
 
     #[test]
@@ -177,15 +274,24 @@ mod tests {
     fn nan_and_infinite_percentages_do_not_panic() {
         let mut fired = BTreeSet::new();
         assert_eq!(decide(f64::NAN, 50, 75, &mut fired), None);
-        assert_eq!(decide(f64::INFINITY, 50, 75, &mut fired), Some((Level::Critical, 75)));
+        assert_eq!(
+            decide(f64::INFINITY, 50, 75, &mut fired),
+            Some((Level::Critical, 75))
+        );
     }
 
     #[test]
     fn rearms_after_dropping_below_both_thresholds() {
         let mut fired = BTreeSet::new();
-        assert_eq!(decide(80.0, 50, 75, &mut fired), Some((Level::Critical, 75)));
+        assert_eq!(
+            decide(80.0, 50, 75, &mut fired),
+            Some((Level::Critical, 75))
+        );
         assert_eq!(decide(10.0, 50, 75, &mut fired), None);
-        assert_eq!(decide(80.0, 50, 75, &mut fired), Some((Level::Critical, 75)));
+        assert_eq!(
+            decide(80.0, 50, 75, &mut fired),
+            Some((Level::Critical, 75))
+        );
     }
 
     #[test]
@@ -200,7 +306,9 @@ mod tests {
     #[test]
     fn evaluate_computes_percentage_and_fires_once() {
         let mut st = State::default();
-        let n = st.evaluate(&cfg(true), 60.0, Some(100.0), Some("r1")).unwrap();
+        let n = st
+            .evaluate(&cfg(true), 60.0, Some(100.0), Some("r1"))
+            .unwrap();
         assert_eq!((n.level, n.threshold, n.max), (Level::Info, 50, 100.0));
         assert!((n.pct - 60.0).abs() < 1e-9);
         assert_eq!(st.evaluate(&cfg(true), 61.0, Some(100.0), Some("r1")), None);
@@ -209,8 +317,12 @@ mod tests {
     #[test]
     fn evaluate_resets_when_the_period_changes() {
         let mut st = State::default();
-        assert!(st.evaluate(&cfg(true), 60.0, Some(100.0), Some("r1")).is_some());
-        assert!(st.evaluate(&cfg(true), 60.0, Some(100.0), Some("r2")).is_some());
+        assert!(st
+            .evaluate(&cfg(true), 60.0, Some(100.0), Some("r1"))
+            .is_some());
+        assert!(st
+            .evaluate(&cfg(true), 60.0, Some(100.0), Some("r2"))
+            .is_some());
         // Passer de Some à None est aussi un changement de période.
         assert!(st.evaluate(&cfg(true), 60.0, Some(100.0), None).is_some());
     }
@@ -236,5 +348,40 @@ mod tests {
         let corrupt = Notifier::load(Some(bad));
         assert!(corrupt.state.lock().unwrap().period.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn rejected_notification_is_retried_and_success_persists_across_restart() {
+        let path = std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4()));
+        let notifier = Notifier::load(Some(path.clone()));
+        let mut cfg = cfg(true);
+        cfg.source_id = "source-a".into();
+        assert!(notifier
+            .check_with(&cfg, 80.0, Some(100.0), Some("period"), |_| Err(
+                "refusé".into()
+            ))
+            .is_err());
+        assert!(!path.exists());
+        let mut calls = 0;
+        notifier
+            .check_with(&cfg, 80.0, Some(100.0), Some("period"), |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        let restarted = Notifier::load(Some(path.clone()));
+        restarted
+            .check_with(&cfg, 80.0, Some(100.0), Some("period"), |_| {
+                panic!("déjà envoyé")
+            })
+            .unwrap();
+        cfg.source_id = "source-b".into();
+        restarted
+            .check_with(&cfg, 80.0, Some(100.0), Some("period"), |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 2);
+        std::fs::remove_file(path).unwrap();
     }
 }

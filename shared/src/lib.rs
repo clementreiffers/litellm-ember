@@ -22,14 +22,21 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stats {
-    /// Coût de la semaine (période de budget en cours), affiché dans la menu bar.
+    /// Identité persistante de la connexion, sans secret.
+    pub source_id: String,
+    /// Génération en mémoire et ordre des publications, pour rejeter les réponses obsolètes.
+    pub generation: u64,
+    pub revision: u64,
+    pub cycle_id: u64,
+    pub refreshing: bool,
+    /// Coût de la période de budget en cours, affiché dans la menu bar.
     pub total_spend: f64,
     /// Dépense de la période de budget en cours (`/key/info`, remise à zéro périodiquement).
     pub period_spend: f64,
     pub max_budget: Option<f64>,
-    /// Date de la prochaine remise à zéro du budget (YYYY-MM-DD).
+    /// Instant ISO 8601 du prochain reset ; accepte aussi les anciennes dates YYYY-MM-DD.
     pub budget_reset_at: Option<String>,
-    /// Premier jour de la période de budget en cours (YYYY-MM-DD).
+    /// Début ISO 8601 de la période ; accepte aussi les anciennes dates YYYY-MM-DD.
     pub period_start: Option<String>,
     pub models_total: Vec<ModelCost>,
     pub today: Vec<ModelUsage>,
@@ -147,7 +154,11 @@ mod tests {
         let stats = Stats {
             total_spend: 12.5,
             max_budget: Some(125.0),
-            today: vec![ModelUsage { model: "m".into(), requests: 2, ..Default::default() }],
+            today: vec![ModelUsage {
+                model: "m".into(),
+                requests: 2,
+                ..Default::default()
+            }],
             updated_at: Some("10:00:00".into()),
             ..Default::default()
         };
@@ -162,7 +173,10 @@ mod tests {
         assert_eq!(stats.total_spend, 3.0);
         assert_eq!(stats.max_budget, None);
         assert!(stats.today.is_empty());
-        assert_eq!(serde_json::from_str::<Stats>("{}").unwrap(), Stats::default());
+        assert_eq!(
+            serde_json::from_str::<Stats>("{}").unwrap(),
+            Stats::default()
+        );
     }
 
     #[test]
@@ -173,4 +187,11 @@ mod tests {
         let back: Vec<KeySource> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, vec![KeySource::Keychain, KeySource::Missing]);
     }
+}
+
+/// Résultat d'un onglet associé à sa configuration de connexion.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Detail<T> {
+    pub generation: u64,
+    pub data: T,
 }

@@ -52,17 +52,41 @@ pub fn App() -> impl IntoView {
     let week = RwSignal::new(Remote::<WeekDetails>::default());
     let activity = RwSignal::new(Remote::<Activity>::default());
 
-    leptos::task::spawn_local(async move {
-        if let Some(s) = tauri::get_stats().await {
-            stats.set(s);
-        }
-        tauri::on_stats_updated(move |s| stats.set(s)).await;
+    let listener = StoredValue::new_local(None::<tauri::Listener>);
+    on_cleanup(move || {
+        listener.try_update_value(|value| {
+            value.take();
+        });
     });
-
+    let accept = move |incoming: Stats| {
+        stats.try_update(|current| {
+            if incoming.revision >= current.revision {
+                if incoming.generation != current.generation {
+                    details::reset(week);
+                    details::reset(activity);
+                }
+                *current = incoming;
+            }
+        });
+    };
+    leptos::task::spawn_local(async move {
+        match tauri::on_stats_updated(accept).await {
+            Ok(guard) => {
+                let mut guard = Some(guard);
+                listener.try_update_value(|value| *value = guard.take());
+            }
+            Err(error) => {
+                stats.try_update(|s| s.error = Some(error));
+            }
+        }
+        if let Some(s) = tauri::get_stats().await {
+            accept(s);
+        }
+    });
     let close_settings = Callback::new(move |_| {
         // L'endpoint ou la clé ont pu changer : les données à la demande sont à recharger.
-        week.set(Remote::default());
-        activity.set(Remote::default());
+        details::reset(week);
+        details::reset(activity);
         show_settings.set(false);
     });
 
@@ -84,39 +108,37 @@ fn Main(
     week: RwSignal<Remote<WeekDetails>>,
     activity: RwSignal<Remote<Activity>>,
 ) -> impl IntoView {
+    let generation = Signal::from(Memo::new(move |_| stats.with(|s| s.generation)));
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
-    Effect::new(move |_| match tab.get() {
-        Tab::Week => details::load(week, tauri::get_week),
-        Tab::Activity => details::load(activity, tauri::get_activity),
-        Tab::Usage => {}
+    Effect::new(move |_| {
+        generation.track();
+        match tab.get() {
+            Tab::Week => details::load(week, tauri::get_week, generation),
+            Tab::Activity => details::load(activity, tauri::get_activity, generation),
+            Tab::Usage => {}
+        }
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
 
-    // Rafraîchissement forcé : relance le cycle du backend et recharge les onglets à la demande.
-    // L'animation s'arrête quand le cycle a mis à jour les données (ou après 60 s au plus).
-    let refreshing = RwSignal::new(false);
-    let updated_at_click = RwSignal::new(None::<String>);
-    Effect::new(move |_| {
-        let updated = stats.with(|s| s.updated_at.clone());
-        if refreshing.get_untracked() && updated != updated_at_click.get_untracked() {
-            refreshing.set(false);
-        }
-    });
+    // L'état du cycle, y compris son échec, pilote l'animation.
+    let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
         if refreshing.get_untracked() {
             return;
         }
-        updated_at_click.set(stats.with_untracked(|s| s.updated_at.clone()));
-        refreshing.set(true);
-        set_timeout(move || refreshing.set(false), std::time::Duration::from_secs(60));
-        leptos::task::spawn_local(tauri::refresh_now());
-        details::invalidate(week);
-        details::invalidate(activity);
-        match tab.get_untracked() {
-            Tab::Week => details::load(week, tauri::get_week),
-            Tab::Activity => details::load(activity, tauri::get_activity),
-            Tab::Usage => {}
-        }
+        leptos::task::spawn_local(async move {
+            tauri::refresh_now().await;
+            if week.is_disposed() {
+                return;
+            }
+            details::invalidate(week);
+            details::invalidate(activity);
+            match tab.get_untracked() {
+                Tab::Week => details::load(week, tauri::get_week, generation),
+                Tab::Activity => details::load(activity, tauri::get_activity, generation),
+                Tab::Usage => {}
+            }
+        });
     };
 
     let tab_button = move |t: Tab, label: &'static str| {
@@ -128,7 +150,7 @@ fn Main(
     view! {
         <header>
             <div>
-                <div class="caption">"Coût LiteLLM de la semaine"</div>
+                <div class="caption">"Coût LiteLLM de la période"</div>
                 <div class="total">{move || format!("${:.2}", stats.with(|s| s.total_spend))}</div>
             </div>
             <div class="right">
@@ -163,8 +185,8 @@ fn Main(
 fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
     view! {
         {move || stats.with(|s| {
-            let since = s.period_start.clone().map(|d| format!("depuis le {d}")).unwrap_or_default();
-            let reset = s.budget_reset_at.clone().map(|d| format!("reset le {d}")).unwrap_or_default();
+            let since = s.period_start.as_deref().map(|d| format!("depuis le {}", d.get(..10).unwrap_or(d))).unwrap_or_default();
+            let reset = s.budget_reset_at.as_deref().map(|d| format!("reset le {}", d.get(..10).unwrap_or(d))).unwrap_or_default();
             match s.max_budget.filter(|b| *b > 0.0) {
                 Some(max) => {
                     let pct = s.period_spend / max * 100.0;
@@ -192,10 +214,13 @@ fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
 
 #[component]
 fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
-    let today = Signal::derive(move || stats.with(|s| s.today.clone()));
-    let today_spend: Signal<f64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
-    let today_tokens: Signal<u64> = Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
-    let totals_rows = Signal::derive(move || {
+    let today: Signal<Vec<shared::ModelUsage>> =
+        Memo::new(move |_| stats.with(|s| s.today.clone())).into();
+    let today_spend: Signal<f64> =
+        Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
+    let today_tokens: Signal<u64> =
+        Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
+    let totals_rows: Signal<_> = Memo::new(move |_| {
         stats.with(|s| {
             s.models_total
                 .iter()
@@ -203,25 +228,42 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
                 .map(|m| (m.model.clone(), m.spend, format!("${:.2}", m.spend)))
                 .collect::<Vec<_>>()
         })
-    });
-    let token_rows = Signal::derive(move || {
+    })
+    .into();
+    let token_rows: Signal<_> = Memo::new(move |_| {
         today.with(|t| {
             t.iter()
                 .filter(|u| u.total_tokens > 0)
-                .map(|u| (u.model.clone(), u.total_tokens as f64, fmt_tokens(u.total_tokens)))
+                .map(|u| {
+                    (
+                        u.model.clone(),
+                        u.total_tokens as f64,
+                        fmt_tokens(u.total_tokens),
+                    )
+                })
                 .collect::<Vec<_>>()
         })
-    });
-    let spend_rows = Signal::derive(move || {
+    })
+    .into();
+    let spend_rows: Signal<_> = Memo::new(move |_| {
         today.with(|t| {
             let mut v: Vec<_> = t.iter().filter(|u| u.spend > 0.0).collect();
             v.sort_by(|a, b| b.spend.total_cmp(&a.spend));
-            v.into_iter().map(|u| (u.model.clone(), u.spend, format!("${:.2}", u.spend))).collect::<Vec<_>>()
+            v.into_iter()
+                .map(|u| (u.model.clone(), u.spend, format!("${:.2}", u.spend)))
+                .collect::<Vec<_>>()
         })
-    });
-    let donut_tokens = Signal::derive(move || {
-        today.with(|t| t.iter().filter(|u| u.total_tokens > 0).map(|u| u.total_tokens as f64).collect::<Vec<_>>())
-    });
+    })
+    .into();
+    let donut_tokens: Signal<_> = Memo::new(move |_| {
+        today.with(|t| {
+            t.iter()
+                .filter(|u| u.total_tokens > 0)
+                .map(|u| u.total_tokens as f64)
+                .collect::<Vec<_>>()
+        })
+    })
+    .into();
     let donut_label = Signal::derive(move || fmt_tokens(today_tokens.get()));
 
     view! {
@@ -242,7 +284,7 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
         </section>
 
         <section class="card">
-            <h2>"Coût de la semaine par modèle"</h2>
+            <h2>"Coût de la période par modèle"</h2>
             <Bars rows=totals_rows />
             <div class="hint">"Les modèles sans prix dans LiteLLM apparaissent à $0 et sont masqués."</div>
         </section>

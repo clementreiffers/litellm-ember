@@ -13,29 +13,49 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
     let notif_enabled = RwSignal::new(true);
     let notif_info = RwSignal::new(String::new());
     let notif_critical = RwSignal::new(String::new());
+    let saving = RwSignal::new(false);
     let message = RwSignal::new(None::<(bool, String)>); // (succès, texte)
 
     leptos::task::spawn_local(async move {
-        if let Some(s) = tauri::get_settings().await {
-            base_url.set(s.base_url);
-            refresh.set(s.refresh_secs.to_string());
-            key_source.set(s.key_source);
-            notif_enabled.set(s.notifications_enabled);
-            notif_info.set(s.notify_info_percent.to_string());
-            notif_critical.set(s.notify_critical_percent.to_string());
+        let result = tauri::get_settings().await;
+        if base_url.is_disposed() {
+            return;
+        }
+        match result {
+            Ok(s) => {
+                if base_url.is_disposed() {
+                    return;
+                }
+                base_url.set(s.base_url);
+                refresh.set(s.refresh_secs.to_string());
+                key_source.set(s.key_source);
+                notif_enabled.set(s.notifications_enabled);
+                notif_info.set(s.notify_info_percent.to_string());
+                notif_critical.set(s.notify_critical_percent.to_string());
+            }
+            Err(error) => message.set(Some((false, error))),
         }
     });
 
     let save = move |clear_key: bool| {
+        if saving.get_untracked() {
+            return;
+        }
         let Ok(refresh_secs) = refresh.get_untracked().trim().parse::<u32>() else {
-            message.set(Some((false, "La fréquence doit être un nombre entier de secondes".into())));
+            message.set(Some((
+                false,
+                "La fréquence doit être un nombre entier de secondes".into(),
+            )));
             return;
         };
         let (Ok(info), Ok(critical)) = (
             notif_info.get_untracked().trim().parse::<u32>(),
             notif_critical.get_untracked().trim().parse::<u32>(),
         ) else {
-            message.set(Some((false, "Les seuils de notification doivent être des nombres entiers".into())));
+            message.set(Some((
+                false,
+                "Les seuils de notification doivent être des nombres entiers".into(),
+            )));
             return;
         };
         let input = SettingsInput {
@@ -47,8 +67,14 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
             api_key: Some(api_key.get_untracked()),
             clear_key,
         };
+        saving.set(true);
         leptos::task::spawn_local(async move {
-            match tauri::save_settings(&input).await {
+            let result = tauri::save_settings(&input).await;
+            if saving.is_disposed() {
+                return;
+            }
+            saving.set(false);
+            match result {
                 Ok(view) => {
                     api_key.set(String::new());
                     key_source.set(view.key_source);
@@ -61,7 +87,9 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
     };
 
     let key_hint = move || match key_source.get() {
-        KeySource::Keychain => "Clé enregistrée dans le Trousseau macOS. Laissez vide pour la conserver.",
+        KeySource::Keychain => {
+            "Clé enregistrée dans le Trousseau macOS. Laissez vide pour la conserver."
+        }
         KeySource::Missing => "Aucune clé enregistrée : saisissez-la ci-dessus.",
     };
 
@@ -112,7 +140,7 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
                             autorisez l'app (en mode dev : « Terminal ») et vérifiez le mode Concentration.".to_string()),
                         Err(e) => (false, e),
                     };
-                    message.set(Some(msg));
+                    message.try_set(Some(msg));
                 })>
                 "Envoyer une notification de test"
             </button>
@@ -120,10 +148,10 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
                 view! { <div class=if ok { "notice-ok" } else { "error" }>{text}</div> }
             })}
             <div class="actions">
-                <button class="primary" on:click=move |_| save(false)>"Enregistrer"</button>
-                <button on:click=move |_| on_close.run(())>"Annuler"</button>
+                <button disabled=move || saving.get() class="primary" on:click=move |_| save(false)>"Enregistrer"</button>
+                <button disabled=move || saving.get() on:click=move |_| on_close.run(())>"Annuler"</button>
                 <button class="danger" on:click=move |_| save(true)
-                    disabled=move || key_source.get() != KeySource::Keychain>"Supprimer la clé"</button>
+                    disabled=move || saving.get() || key_source.get() != KeySource::Keychain>"Supprimer la clé"</button>
             </div>
         </section>
     }
