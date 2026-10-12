@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Ember",
-  "version": "0.1.0",
   "identifier": "io.github.clementreiffers.ember",
   "build": {
     "beforeDevCommand": "cd ui && trunk serve --port 1420",
@@ -16,6 +15,13 @@
       "csp": null
     },
     "macOSPrivateApi": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "requireSignedVersion": true,
+      "endpoints": ["https://github.com/clementreiffers/litellm-ember/releases/latest/download/latest.json"]
+    }
   },
   "bundle": {
     "active": true,

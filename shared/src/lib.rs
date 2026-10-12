@@ -1,5 +1,40 @@
 use serde::{Deserialize, Serialize};
 
+/// État non secret de la mise à jour ; les chemins et artefacts restent dans le backend.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    pub revision: u64,
+    pub current_version: String,
+    pub available_version: Option<String>,
+    pub phase: UpdatePhase,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Downloading,
+    Installing,
+    Restarting,
+    Failed,
+    Disabled,
+}
+
+impl UpdatePhase {
+    pub fn busy(self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Downloading | Self::Installing | Self::Restarting
+        )
+    }
+}
+
 /// Coût cumulé d'un modèle (toutes dates confondues).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelCost {
@@ -148,6 +183,25 @@ pub struct Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_progress_roundtrips_and_marks_only_active_operations_busy() {
+        let status = UpdateStatus {
+            current_version: "1.0.0".into(),
+            available_version: Some("1.1.0".into()),
+            phase: UpdatePhase::Downloading,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            revision: 7,
+            error: None,
+        };
+        let back: UpdateStatus =
+            serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
+        assert_eq!(back, status);
+        assert!(back.phase.busy());
+        assert!(!UpdatePhase::Failed.busy());
+        assert!(!UpdatePhase::Available.busy());
+    }
 
     #[test]
     fn stats_roundtrip() {

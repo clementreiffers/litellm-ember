@@ -47,6 +47,46 @@ enum Tab {
 pub fn App() -> impl IntoView {
     let stats = RwSignal::new(Stats::default());
     let show_settings = RwSignal::new(false);
+    let scroller = NodeRef::<leptos::html::Div>::new();
+    let updates = RwSignal::new(shared::UpdateStatus::default());
+    let update_listeners = StoredValue::new_local(Vec::<tauri::Listener>::new());
+    on_cleanup(move || {
+        update_listeners.try_update_value(Vec::clear);
+    });
+    leptos::task::spawn_local(async move {
+        let accept_update = move |incoming: shared::UpdateStatus| {
+            crate::updater::accept(updates, incoming);
+        };
+        match tauri::on_event("update-status-changed", accept_update).await {
+            Ok(guard) => {
+                update_listeners.try_update_value(|listeners| listeners.push(guard));
+            }
+            Err(error) => {
+                updates.try_update(|s| s.error = Some(error));
+            }
+        }
+        match tauri::on_event("show-updates", move |_: ()| {
+            show_settings.try_set(true);
+            if let Some(element) = scroller.get_untracked() {
+                element.set_scroll_top(0);
+            }
+        })
+        .await
+        {
+            Ok(guard) => {
+                update_listeners.try_update_value(|listeners| listeners.push(guard));
+            }
+            Err(error) => {
+                updates.try_update(|s| s.error = Some(error));
+            }
+        }
+        match tauri::get_update_status().await {
+            Ok(status) => accept_update(status),
+            Err(error) => {
+                updates.try_update(|s| s.error = Some(error));
+            }
+        }
+    });
     let tab = RwSignal::new(Tab::Usage);
     // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
     let week = RwSignal::new(Remote::<WeekDetails>::default());
@@ -91,10 +131,10 @@ pub fn App() -> impl IntoView {
     });
 
     view! {
-      <div class="scroller">
+      <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week activity /> }>
-            <Settings on_close=close_settings />
+            fallback=move || view! { <Main stats show_settings tab week activity updates /> }>
+            <Settings on_close=close_settings updates />
         </Show>
       </div>
     }
@@ -107,6 +147,7 @@ fn Main(
     tab: RwSignal<Tab>,
     week: RwSignal<Remote<WeekDetails>>,
     activity: RwSignal<Remote<Activity>>,
+    updates: RwSignal<shared::UpdateStatus>,
 ) -> impl IntoView {
     let generation = Signal::from(Memo::new(move |_| stats.with(|s| s.generation)));
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
@@ -150,6 +191,13 @@ fn Main(
     view! {
         <header>
             <div>
+                <div class="app-version" title="Version d’Ember en cours d’exécution">
+                    {move || updates.with(|s| if s.current_version.is_empty() {
+                        "Ember".to_owned()
+                    } else {
+                        format!("Ember v{}", s.current_version)
+                    })}
+                </div>
                 <div class="caption">"Coût LiteLLM de la période"</div>
                 <div class="total">{move || format!("${:.2}", stats.with(|s| s.total_spend))}</div>
             </div>

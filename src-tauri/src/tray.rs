@@ -17,7 +17,30 @@ use tauri::{
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 
-use crate::{notify, service::Service};
+use crate::{notify, service::Service, updater};
+
+#[tauri::command]
+fn get_update_status(service: State<'_, updater::Service>) -> shared::UpdateStatus {
+    service.status()
+}
+
+#[tauri::command]
+async fn check_for_updates(
+    service: State<'_, updater::Service>,
+) -> Result<shared::UpdateStatus, String> {
+    service.check(false).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn install_update(
+    expected_version: String,
+    service: State<'_, updater::Service>,
+) -> Result<(), String> {
+    service
+        .install(&expected_version)
+        .await
+        .map_err(|e| e.to_string())
+}
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
@@ -92,6 +115,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_stats,
             close_window,
@@ -100,7 +124,10 @@ pub fn run() {
             get_week,
             get_activity,
             refresh_now,
-            test_notification
+            test_notification,
+            get_update_status,
+            check_for_updates,
+            install_update
         ])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);
@@ -147,6 +174,10 @@ pub fn run() {
                 },
             );
             app.manage(service);
+            updater::start(
+                app.handle(),
+                data_file(app.handle(), "update-notifications.json"),
+            )?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -261,6 +292,20 @@ fn toggle_window(app: &AppHandle) {
             let _ = w.set_focus();
         }
     });
+}
+
+/// Un clic de notification doit ouvrir le panneau, même s'il était déjà visible.
+pub fn show_updates(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Ok(mut shown) = SHOWN_AT.lock() {
+        *shown = Some(Instant::now());
+    }
+    let _ = window.move_window(Position::TrayBottomCenter);
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit("show-updates", ());
 }
 
 #[cfg(test)]

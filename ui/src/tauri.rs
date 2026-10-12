@@ -101,3 +101,50 @@ pub async fn test_notification() -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| e.as_string().unwrap_or_else(|| "Échec de l'envoi".into()))
 }
+
+pub async fn get_update_status() -> Result<shared::UpdateStatus, String> {
+    invoke_as("get_update_status").await
+}
+
+pub async fn check_for_updates() -> Result<shared::UpdateStatus, String> {
+    invoke_as("check_for_updates").await
+}
+
+pub async fn install_update(expected_version: String) -> Result<(), String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args {
+        expected_version: String,
+    }
+    let args =
+        serde_wasm_bindgen::to_value(&Args { expected_version }).map_err(|e| e.to_string())?;
+    invoke_with("install_update", args)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            e.as_string()
+                .unwrap_or_else(|| "Installation impossible".into())
+        })
+}
+
+pub async fn on_event<T: serde::de::DeserializeOwned + 'static>(
+    name: &str,
+    on_update: impl Fn(T) + 'static,
+) -> Result<Listener, String> {
+    let handler = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+        let payload =
+            js_sys::Reflect::get(&event, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
+        if let Ok(value) = serde_wasm_bindgen::from_value(payload) {
+            on_update(value);
+        }
+    });
+    let unlisten = listen(name, &handler)
+        .await
+        .map_err(|_| "Abonnement aux mises à jour impossible")?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| "Réponse d'abonnement invalide")?;
+    Ok(Listener {
+        unlisten,
+        _handler: handler,
+    })
+}

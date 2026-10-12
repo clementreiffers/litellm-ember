@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFile } from "node:fs/promises";
 import { analyzeCommits } from "@semantic-release/commit-analyzer";
 import { generateNotes } from "@semantic-release/release-notes-generator";
 import config from "../release.config.mjs";
@@ -54,4 +55,50 @@ for (const [name, messages, expected] of [
 test("only main releases, with unprefixed stable version tags", () => {
   assert.deepEqual(config.branches, ["main"]);
   assert.equal(config.tagFormat.replace("${version}", "1.2.3"), "1.2.3");
+});
+
+const { releaseConfig, manifest } = await import("./updater-release.mjs");
+const testPublicKey = Buffer.from(`untrusted comment: test key\n${Buffer.alloc(42).toString("base64")}\n`).toString("base64");
+const testSignature = version => Buffer.from(`untrusted comment: test signature\ntest\ntrusted comment: timestamp:1\tfile:Ember.app.tar.gz\tversion:${version}\ntest\n`).toString("base64");
+
+test("displayed version uses the GitHub release override with Cargo as the local fallback", async () => {
+  const base = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  // Tauri falls back to CARGO_PKG_VERSION when config.version is absent.
+  assert.equal(Object.hasOwn(base, "version"), false);
+  const release = { ...base, ...releaseConfig("3.2.1", testPublicKey) };
+  assert.equal(release.version, "3.2.1");
+});
+
+test("release config requires a public key and enables version-bound signatures", () => {
+  const config = releaseConfig("1.2.3", testPublicKey);
+  assert.equal(config.version, "1.2.3");
+  assert.equal(config.bundle.createUpdaterArtifacts, true);
+  assert.equal(config.plugins.updater.requireSignedVersion, true);
+  assert.equal(config.plugins.updater.pubkey, testPublicKey);
+  for (const key of [undefined, "", "not a key"]) assert.throws(() => releaseConfig("1.2.3", key));
+});
+
+test("universal updater manifest targets both architectures with immutable release URLs", () => {
+  const result = manifest("1.2.3", testSignature("1.2.3"));
+  assert.deepEqual(Object.keys(result.platforms).sort(), ["darwin-aarch64", "darwin-x86_64"]);
+  assert.deepEqual(result.platforms["darwin-aarch64"], result.platforms["darwin-x86_64"]);
+  assert.equal(result.platforms["darwin-aarch64"].url,
+    "https://github.com/clementreiffers/litellm-ember/releases/download/1.2.3/Ember-1.2.3-macos-universal.app.tar.gz");
+  assert.equal(result.platforms["darwin-aarch64"].signature, testSignature("1.2.3"));
+});
+
+test("release metadata rejects prereleases, malformed versions and mismatched signatures", () => {
+  for (const version of ["", "v1.2.3", "1.2", "01.2.3", "1.2.3-beta.1", "1.2.3\n", undefined]) {
+    assert.throws(() => manifest(version, testSignature("1.2.3")));
+    assert.throws(() => releaseConfig(version, testPublicKey));
+  }
+  assert.throws(() => manifest("1.2.3", ""));
+  assert.throws(() => manifest("1.2.3", testSignature("1.2.2")));
+});
+
+test("release publishes updater artifacts alongside the manual download", () => {
+  const [, github] = config.plugins.find(([name]) => name === "@semantic-release/github");
+  for (const artifact of ["release/latest.json", "release/Ember-*-macos-universal.app.tar.gz", "release/Ember-*-macos-universal.app.tar.gz.sig", "release/Ember-*-macos-universal.zip"]) {
+    assert.ok(github.assets.includes(artifact));
+  }
 });

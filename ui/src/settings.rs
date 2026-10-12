@@ -5,7 +5,7 @@ use crate::tauri;
 
 /// Formulaire des paramètres. La clé API n'est jamais relue : le champ est vide et sert uniquement à la remplacer.
 #[component]
-pub fn Settings(on_close: Callback<()>) -> impl IntoView {
+pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>) -> impl IntoView {
     let base_url = RwSignal::new(String::new());
     let refresh = RwSignal::new(String::new());
     let api_key = RwSignal::new(String::new());
@@ -97,6 +97,7 @@ pub fn Settings(on_close: Callback<()>) -> impl IntoView {
         <header>
             <div class="caption">"Paramètres"</div>
         </header>
+        <crate::updater::Updates status=updates />
         <section class="card form">
             <label>"Endpoint LiteLLM"
                 <input type="url" prop:value=move || base_url.get()
