@@ -25,7 +25,7 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Niveau de la jauge de budget : vert sous 60 %, orange sous 85 %, rouge au-delà.
+/// Niveau de la projection de budget : vert sous 60 %, orange sous 85 %, rouge au-delà.
 pub fn budget_level(pct: f64) -> &'static str {
     if pct < 60.0 {
         "ok"
@@ -34,6 +34,21 @@ pub fn budget_level(pct: f64) -> &'static str {
     } else {
         "crit"
     }
+}
+
+/// Couleur RGB de la jauge : vert à 0 %, orange à 50 %, rouge dès 100 %.
+fn budget_color(pct: f64) -> [u8; 3] {
+    let pct = pct.clamp(0.0, 100.0);
+    let (start, end, progress) = if pct <= 50.0 {
+        ([48.0, 209.0, 88.0], [255.0, 159.0, 10.0], pct / 50.0)
+    } else {
+        (
+            [255.0, 159.0, 10.0],
+            [255.0, 69.0, 58.0],
+            (pct - 50.0) / 50.0,
+        )
+    };
+    std::array::from_fn(|i| (start[i] + (end[i] - start[i]) * progress).round() as u8)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -238,15 +253,15 @@ fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
             match s.max_budget.filter(|b| *b > 0.0) {
                 Some(max) => {
                     let pct = s.period_spend / max * 100.0;
-                    let level = budget_level(pct);
+                    let [red, green, blue] = budget_color(pct);
                     view! {
-                        <div class="budget">
+                        <div class="budget" style=format!("--budget-color:{red}, {green}, {blue}")>
                             <div class="budget-head">
                                 <span>{format!("${:.2} / ${max:.0}", s.period_spend)}</span>
-                                <span class=format!("lvl-text lvl-{level}")>{format!("{pct:.0} %")}</span>
+                                <span class="budget-percentage">{format!("{pct:.0} %")}</span>
                             </div>
                             <div class="track tall">
-                                <div class=format!("fill lvl-{level}") style=format!("width:{:.1}%", pct.clamp(0.0, 100.0))></div>
+                                <div class="fill budget-fill" style=format!("width:{:.1}%", pct.clamp(0.0, 100.0))></div>
                             </div>
                             <div class="budget-foot"><span>{since}</span><span>{reset}</span></div>
                         </div>
@@ -257,6 +272,30 @@ fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
                 }.into_any(),
             }
         })}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::budget_color;
+
+    #[test]
+    fn budget_color_interpolates_through_green_orange_and_red() {
+        for (pct, expected) in [
+            (0.0, [48, 209, 88]),
+            (25.0, [152, 184, 49]),
+            (50.0, [255, 159, 10]),
+            (75.0, [255, 114, 34]),
+            (100.0, [255, 69, 58]),
+        ] {
+            assert_eq!(budget_color(pct), expected, "budget consommé : {pct} %");
+        }
+    }
+
+    #[test]
+    fn budget_color_clamps_negative_spending_and_overruns() {
+        assert_eq!(budget_color(-25.0), budget_color(0.0));
+        assert_eq!(budget_color(120.0), budget_color(100.0));
     }
 }
 
