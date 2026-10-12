@@ -110,7 +110,7 @@ pub async fn check_for_updates() -> Result<shared::UpdateStatus, String> {
     invoke_as("check_for_updates").await
 }
 
-pub async fn install_update(expected_version: String) -> Result<(), String> {
+pub async fn open_update_release(expected_version: String) -> Result<(), String> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Args {
@@ -118,12 +118,12 @@ pub async fn install_update(expected_version: String) -> Result<(), String> {
     }
     let args =
         serde_wasm_bindgen::to_value(&Args { expected_version }).map_err(|e| e.to_string())?;
-    invoke_with("install_update", args)
+    invoke_with("open_update_release", args)
         .await
         .map(|_| ())
         .map_err(|e| {
             e.as_string()
-                .unwrap_or_else(|| "Installation impossible".into())
+                .unwrap_or_else(|| "Ouverture de la release impossible".into())
         })
 }
 

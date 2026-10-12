@@ -57,48 +57,42 @@ test("only main releases, with unprefixed stable version tags", () => {
   assert.equal(config.tagFormat.replace("${version}", "1.2.3"), "1.2.3");
 });
 
-const { releaseConfig, manifest } = await import("./updater-release.mjs");
-const testPublicKey = Buffer.from(`untrusted comment: test key\n${Buffer.alloc(42).toString("base64")}\n`).toString("base64");
-const testSignature = version => Buffer.from(`untrusted comment: test signature\ntest\ntrusted comment: timestamp:1\tfile:Ember.app.tar.gz\tversion:${version}\ntest\n`).toString("base64");
-
-test("displayed version uses the GitHub release override with Cargo as the local fallback", async () => {
+const { releaseConfig } = await import("./updater-release.mjs");
+test("release embeds its version without any signing configuration", async () => {
   const base = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
-  // Tauri falls back to CARGO_PKG_VERSION when config.version is absent.
   assert.equal(Object.hasOwn(base, "version"), false);
-  const release = { ...base, ...releaseConfig("3.2.1", testPublicKey) };
-  assert.equal(release.version, "3.2.1");
-});
-
-test("release config requires a public key and enables version-bound signatures", () => {
-  const config = releaseConfig("1.2.3", testPublicKey);
-  assert.equal(config.version, "1.2.3");
-  assert.equal(config.bundle.createUpdaterArtifacts, true);
-  assert.equal(config.plugins.updater.requireSignedVersion, true);
-  assert.equal(config.plugins.updater.pubkey, testPublicKey);
-  for (const key of [undefined, "", "not a key"]) assert.throws(() => releaseConfig("1.2.3", key));
-});
-
-test("universal updater manifest targets both architectures with immutable release URLs", () => {
-  const result = manifest("1.2.3", testSignature("1.2.3"));
-  assert.deepEqual(Object.keys(result.platforms).sort(), ["darwin-aarch64", "darwin-x86_64"]);
-  assert.deepEqual(result.platforms["darwin-aarch64"], result.platforms["darwin-x86_64"]);
-  assert.equal(result.platforms["darwin-aarch64"].url,
-    "https://github.com/clementreiffers/litellm-ember/releases/download/1.2.3/Ember-1.2.3-macos-universal.app.tar.gz");
-  assert.equal(result.platforms["darwin-aarch64"].signature, testSignature("1.2.3"));
-});
-
-test("release metadata rejects prereleases, malformed versions and mismatched signatures", () => {
+  assert.deepEqual(releaseConfig("3.2.1"), { version: "3.2.1" });
   for (const version of ["", "v1.2.3", "1.2", "01.2.3", "1.2.3-beta.1", "1.2.3\n", undefined]) {
-    assert.throws(() => manifest(version, testSignature("1.2.3")));
-    assert.throws(() => releaseConfig(version, testPublicKey));
+    assert.throws(() => releaseConfig(version));
   }
-  assert.throws(() => manifest("1.2.3", ""));
-  assert.throws(() => manifest("1.2.3", testSignature("1.2.2")));
+});
+test("release publishes the universal ZIP and its checksum", () => {
+  const [, github] = config.plugins.find(([name]) => name === "@semantic-release/github");
+  assert.deepEqual(github.assets, ["release/Ember-*-macos-universal.zip", "release/SHA256SUMS.txt"]);
 });
 
-test("release publishes updater artifacts alongside the manual download", () => {
-  const [, github] = config.plugins.find(([name]) => name === "@semantic-release/github");
-  for (const artifact of ["release/latest.json", "release/Ember-*-macos-universal.app.tar.gz", "release/Ember-*-macos-universal.app.tar.gz.sig", "release/Ember-*-macos-universal.zip"]) {
-    assert.ok(github.assets.includes(artifact));
+test("release tooling generates config and checksum without signing keys", async () => {
+  const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const { execFileSync } = await import("node:child_process");
+  const { createHash } = await import("node:crypto");
+  const directory = await mkdtemp(join(tmpdir(), "ember-release-"));
+  const script = fileURLToPath(new URL("./updater-release.mjs", import.meta.url));
+  try {
+    const options = { cwd: directory, env: {}, stdio: "pipe" };
+    execFileSync(process.execPath, [script, "config", "1.2.3"], options);
+    assert.deepEqual(JSON.parse(await readFile(join(directory, "release-config.json"))), { version: "1.2.3" });
+    await mkdir(join(directory, "release"));
+    const archive = "Ember-1.2.3-macos-universal.zip";
+    await writeFile(join(directory, "release", archive), "fixture");
+    execFileSync(process.execPath, [script, "checksums", "1.2.3"], options);
+    assert.equal(await readFile(join(directory, "release/SHA256SUMS.txt"), "utf8"),
+      `${createHash("sha256").update("fixture").digest("hex")}  ${archive}\n`);
+    await writeFile(join(directory, "release", archive), "");
+    assert.throws(() => execFileSync(process.execPath, [script, "checksums", "1.2.3"], options));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

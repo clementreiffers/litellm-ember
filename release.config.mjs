@@ -10,9 +10,6 @@ export default {
     ["@semantic-release/github", {
       assets: [
         "release/Ember-*-macos-universal.zip",
-        "release/Ember-*-macos-universal.app.tar.gz",
-        "release/Ember-*-macos-universal.app.tar.gz.sig",
-        "release/latest.json",
         "release/SHA256SUMS.txt",
       ],
       successComment: false,

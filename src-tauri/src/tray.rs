@@ -32,14 +32,8 @@ async fn check_for_updates(
 }
 
 #[tauri::command]
-async fn install_update(
-    expected_version: String,
-    service: State<'_, updater::Service>,
-) -> Result<(), String> {
-    service
-        .install(&expected_version)
-        .await
-        .map_err(|e| e.to_string())
+async fn open_update_release(expected_version: String) -> Result<(), String> {
+    updater::open_release(&expected_version).await
 }
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
@@ -115,7 +109,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_stats,
             close_window,
@@ -127,7 +120,7 @@ pub fn run() {
             test_notification,
             get_update_status,
             check_for_updates,
-            install_update
+            open_update_release
         ])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);

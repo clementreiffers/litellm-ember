@@ -16,13 +16,6 @@
     },
     "macOSPrivateApi": true
   },
-  "plugins": {
-    "updater": {
-      "pubkey": "",
-      "requireSignedVersion": true,
-      "endpoints": ["https://github.com/clementreiffers/litellm-ember/releases/latest/download/latest.json"]
-    }
-  },
   "bundle": {
     "active": true,
     "targets": "app",

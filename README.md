@@ -16,7 +16,7 @@ Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it runni
 - **The Week tab**: daily spending, a comparison with yesterday, and an end-of-period projection.
 - **The Activity tab**: requests, errors, cache hits, latency, and hourly activity, with a breakdown by model.
 - **macOS notifications**: two configurable thresholds, set to 50% and 75% of the budget consumed by default.
-- **In-app updates**: checks GitHub at startup and every 10 minutes. Click the update notification to install and restart, or check manually in Settings.
+- **Update notifications**: checks public GitHub releases at startup and every 24 hours. Open the release from the notification or check manually in Settings.
 
 The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The Week and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
 
@@ -96,53 +96,17 @@ Official builds check the latest stable GitHub release independently of your Lit
 connection. Ember sends one notification per available version, remembering it across
 restarts. Budget notification preferences do not disable update notifications.
 
-Click the notification to download, verify the update signature, replace the running
-`.app` at its current location, and restart. The settings panel displays progress;
-macOS asks for administrator authorization if required. You can also open **Paramètres
-→ Mises à jour → Vérifier les mises à jour**, then choose **Installer et redémarrer**.
-This manual path also works when macOS notifications are disabled.
+Click the notification or **Paramètres → Mises à jour → Voir la release GitHub**
+to open the release page. Download the universal ZIP, quit Ember, and replace the
+application. Settings, cached statistics, and the Keychain entry are preserved.
 
-The updater preserves your settings, cached statistics, and Keychain entry. Network or
-signature failures do not trigger installation or restart. If authorization is refused,
-retry from Settings. Read-only volumes and App Translocation cannot be updated: move
-Ember to a permanent writable location and relaunch it. An installation error is shown
-in the panel; if the updater could not restore a previous bundle, its error identifies
-the recovery copy. Automatic checks retry on the next 10-minute interval.
+Checks run at startup and every 24 hours while Ember is running, without a GitHub
+token or signing keys. Network errors and GitHub rate limits are shown in Settings;
+the app keeps working and retries on the next daily check or a manual check.
 
-The first release with this feature must be installed manually. Development builds and
-local builds without an updater public key disable updating. The updater signature is
-separate from Apple Developer ID signing and notarization.
-
-### Release signing setup
-
-Before publishing the first updater-enabled release, create and securely back up a
-dedicated key pair with `cargo tauri signer generate -w /secure/path/ember-updater.key`.
-Do not put the private key in the repository. Configure the GitHub repository with:
-
-| GitHub configuration | Value |
-|---|---|
-| Secret `TAURI_SIGNING_PRIVATE_KEY` | Contents of the generated private-key file |
-| Secret `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Its password (empty for an unencrypted key) |
-| Variable `EMBER_UPDATER_PUBLIC_KEY` | Contents of the generated `.pub` file |
-
-The release build embeds the public key and emits a universal `.app.tar.gz`, its `.sig`,
-and `latest.json` with entries for both Mac architectures. The existing ZIP remains
-available for manual installation. The pinned Tauri CLI binds the release version into
-the signature. Before publication, `verify-update` verifies both the archive signature
-and its authenticated version against the embedded public key; missing keys, artifacts,
-or mismatches fail the release. Checksums cover all published update artifacts.
-
-Keep the private key and password: future releases must use the same signing identity
-for installed clients to accept them. A key rotation requires a migration release
-signed with the previously trusted key; simply replacing the GitHub key breaks updates
-for existing installations.
-
-For a release acceptance test, use two isolated test bundles and a disposable signing
-key. Verify the native notification click, download progress, restart/version change,
-and settings/Keychain continuity on Apple Silicon and Intel. Test a custom path with
-spaces, administrator authorization accepted/refused, and a read-only or translocated
-bundle. Automated tests exercise signed downloads and replacement of a minimal fixture
-bundle in a temporary directory; they never update or launch your installed Ember.
+Releases publish the universal macOS ZIP and SHA256SUMS.txt. Only the automatically
+provided GITHUB_TOKEN is needed in CI to publish releases. No Tauri updater keys
+or updater manifest are required.
 
 ## Build from source
 

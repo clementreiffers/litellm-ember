@@ -7,8 +7,6 @@ pub struct UpdateStatus {
     pub current_version: String,
     pub available_version: Option<String>,
     pub phase: UpdatePhase,
-    pub downloaded_bytes: u64,
-    pub total_bytes: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -19,19 +17,12 @@ pub enum UpdatePhase {
     Checking,
     UpToDate,
     Available,
-    Downloading,
-    Installing,
-    Restarting,
     Failed,
-    Disabled,
 }
 
 impl UpdatePhase {
     pub fn busy(self) -> bool {
-        matches!(
-            self,
-            Self::Checking | Self::Downloading | Self::Installing | Self::Restarting
-        )
+        matches!(self, Self::Checking)
     }
 }
 
@@ -185,13 +176,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_progress_roundtrips_and_marks_only_active_operations_busy() {
+    fn update_status_roundtrips_and_marks_only_active_operations_busy() {
         let status = UpdateStatus {
             current_version: "1.0.0".into(),
             available_version: Some("1.1.0".into()),
-            phase: UpdatePhase::Downloading,
-            downloaded_bytes: 42,
-            total_bytes: Some(100),
+            phase: UpdatePhase::Checking,
             revision: 7,
             error: None,
         };
