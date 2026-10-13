@@ -1,7 +1,9 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(test, not(target_os = "macos")))]
 use std::sync::Mutex;
+#[cfg(not(target_os = "macos"))]
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -9,12 +11,14 @@ use crate::persistence::load_cache;
 #[cfg(test)]
 use chrono::Local;
 use shared::{Activity, Detail, SettingsInput, SettingsView, Stats, WeekDetails};
+#[cfg(not(target_os = "macos"))]
+use tauri::WindowEvent;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     ActivationPolicy, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
-    WindowEvent,
 };
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_positioner::{Position, WindowExt};
 
 use crate::{notify, service::Service, updater};
@@ -53,10 +57,14 @@ async fn restart_after_update(service: State<'_, updater::Service>) -> Result<()
 }
 
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
+#[cfg(not(target_os = "macos"))]
 const GRACE: Duration = Duration::from_millis(600);
 
 #[tauri::command]
 fn close_window(window: tauri::WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    crate::panel::close(&window);
+    #[cfg(not(target_os = "macos"))]
     let _ = window.hide();
 }
 
@@ -167,14 +175,22 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
+                    #[cfg(not(target_os = "macos"))]
                     tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
-                        toggle_window(tray.app_handle());
+                        #[cfg(target_os = "macos")]
+                        crate::panel::toggle_window(tray.app_handle(), rect);
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = rect;
+                            toggle_window(tray.app_handle());
+                        }
                     }
                 })
                 .build(app)?;
@@ -215,9 +231,12 @@ pub fn run() {
 }
 
 /// Dernier instant d'affichage / de masquage par perte de focus (état partagé entre les handlers).
+#[cfg(not(target_os = "macos"))]
 static SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+#[cfg(not(target_os = "macos"))]
 static BLUR_HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
+#[cfg(not(target_os = "macos"))]
 fn since(slot: &Mutex<Option<Instant>>) -> Option<Duration> {
     slot.lock().ok().and_then(|g| g.map(|t| t.elapsed()))
 }
@@ -268,24 +287,30 @@ fn create_window(app: &AppHandle) -> tauri::Result<()> {
 
     // Masque le panneau au clic ailleurs. La perte de focus pendant l'ouverture est normale
     // (le clic sur le tray vole le focus un instant) : on revérifie à la fin du délai.
-    let w = window.clone();
-    window.on_window_event(move |e| {
-        if let WindowEvent::Focused(false) = e {
-            let w = w.clone();
-            let wait = GRACE.saturating_sub(since(&SHOWN_AT).unwrap_or(GRACE));
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(wait).await;
-                if w.is_visible().unwrap_or(false) && !w.is_focused().unwrap_or(true) {
-                    *BLUR_HIDDEN_AT.lock().expect("état de fenêtre empoisonné") =
-                        Some(Instant::now());
-                    let _ = w.hide();
-                }
-            });
-        }
-    });
+    #[cfg(target_os = "macos")]
+    crate::panel::install(&window);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let w = window.clone();
+        window.on_window_event(move |e| {
+            if let WindowEvent::Focused(false) = e {
+                let w = w.clone();
+                let wait = GRACE.saturating_sub(since(&SHOWN_AT).unwrap_or(GRACE));
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    if w.is_visible().unwrap_or(false) && !w.is_focused().unwrap_or(true) {
+                        *BLUR_HIDDEN_AT.lock().expect("état de fenêtre empoisonné") =
+                            Some(Instant::now());
+                        let _ = w.hide();
+                    }
+                });
+            }
+        });
+    }
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn toggle_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -317,16 +342,21 @@ fn toggle_window(app: &AppHandle) {
 
 /// Un clic de notification doit ouvrir le panneau, même s'il était déjà visible.
 pub fn show_updates(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    if let Ok(mut shown) = SHOWN_AT.lock() {
-        *shown = Some(Instant::now());
+    #[cfg(target_os = "macos")]
+    crate::panel::show_updates(app);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+        if let Ok(mut shown) = SHOWN_AT.lock() {
+            *shown = Some(Instant::now());
+        }
+        let _ = window.move_window(Position::TrayBottomCenter);
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = app.emit("show-updates", ());
     }
-    let _ = window.move_window(Position::TrayBottomCenter);
-    let _ = window.show();
-    let _ = window.set_focus();
-    let _ = app.emit("show-updates", ());
 }
 
 #[cfg(test)]
