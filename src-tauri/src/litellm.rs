@@ -288,6 +288,94 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_metadata_is_optional_and_validated() {
+        use serde_json::json;
+        let valid = json!({"usage_object":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":20}}});
+        for metadata in [valid.clone(), json!(valid.to_string())] {
+            assert_eq!(
+                row(&json!({"metadata":metadata}).to_string()).prompt_cache,
+                Some((100, 80))
+            );
+        }
+        for metadata in [
+            json!(null),
+            json!("invalid"),
+            json!([]),
+            json!({}),
+            json!({"usage_object":{}}),
+        ] {
+            assert_eq!(
+                row(&json!({"metadata":metadata}).to_string()).prompt_cache,
+                None
+            );
+        }
+        for cached in [
+            json!(-1),
+            json!(101),
+            json!(1.5),
+            json!("80"),
+            json!(null),
+            json!(true),
+        ] {
+            let mut metadata = valid.clone();
+            metadata["usage_object"]["prompt_tokens_details"]["cached_tokens"] = cached;
+            assert_eq!(
+                row(&json!({"metadata":metadata}).to_string()).prompt_cache,
+                None
+            );
+        }
+        assert_eq!(row("{}").prompt_cache, None);
+        let zero = json!({"metadata":{"usage_object":{"prompt_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}});
+        assert_eq!(row(&zero.to_string()).prompt_cache, Some((0, 0)));
+    }
+
+    #[test]
+    fn prompt_cache_weights_tokens_and_tracks_partial_coverage_on_local_day() {
+        use serde_json::json;
+        let make = |model: &str, input, cached, status, hit, time| {
+            row(&json!({
+            "model":model, "startTime":time, "status":status, "cache_hit":hit,
+            "metadata":{"usage_object":{"prompt_tokens":input,"prompt_tokens_details":{"cached_tokens":cached}}}
+        }).to_string())
+        };
+        let time = "2026-10-12T23:30:00Z";
+        let rows = vec![
+            make("openai/a", 100, Some(100), "success", false, time),
+            make("a", 900, Some(0), "success", false, time),
+            make("b", 200, None, "success", false, time),
+            make("a", 500, Some(500), "failure", false, time),
+            make("a", 500, Some(500), "success", true, time),
+            make(
+                "a",
+                500,
+                Some(500),
+                "success",
+                false,
+                "2026-10-12T20:00:00Z",
+            ),
+        ];
+        let timezone = chrono::FixedOffset::east_opt(7200).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let activity = aggregate_activity(&rows, day, &timezone);
+        assert_eq!(
+            activity.prompt_cache,
+            shared::PromptCacheUsage {
+                input_tokens: 1000,
+                cached_tokens: 100,
+                reported_requests: 2,
+                eligible_requests: 3,
+            }
+        );
+        assert_eq!(activity.prompt_cache.rate(), Some(0.1));
+        let a = activity.per_model.iter().find(|m| m.model == "a").unwrap();
+        assert_eq!(a.prompt_cache.reported_requests, 2);
+        assert_eq!(a.prompt_cache.eligible_requests, 2);
+        let b = activity.per_model.iter().find(|m| m.model == "b").unwrap();
+        assert_eq!(b.prompt_cache.reported_requests, 0);
+        assert_eq!(b.prompt_cache.eligible_requests, 1);
+    }
+
+    #[test]
     fn activity_stats() {
         let now = Utc::now();
         let t = |ms: i64| (now + Duration::milliseconds(ms)).to_rfc3339();
@@ -603,6 +691,26 @@ mod tests {
 
         fn client(server: &MockServer) -> Client {
             Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn activity_reads_prompt_cache_without_extra_requests() {
+            let server = MockServer::start();
+            let request = server.mock(|when, then| {
+                when.method(GET).path("/llm/spend/logs")
+                    .header("authorization", "Bearer sk-test")
+                    .query_param("summarize", "false");
+                then.status(200).json_body(serde_json::json!([{
+                    "model":"test-model", "startTime":Utc::now().to_rfc3339(),
+                    "metadata":{"usage_object":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":75}}}
+                }]));
+            });
+            let client = client(&server);
+            let activity = client.fetch_activity().await.unwrap();
+            assert_eq!(activity.prompt_cache.rate(), Some(0.75));
+            assert_eq!(activity.per_model[0].prompt_cache.cached_tokens, 75);
+            client.fetch_activity().await.unwrap();
+            request.assert_hits(1);
         }
 
         #[tokio::test]

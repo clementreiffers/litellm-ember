@@ -15,6 +15,7 @@ Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it runni
 - **A budget gauge**: spending, budget limit, and reset date.
 - **The History tab**: a GitHub-style calendar of daily spending over the last 30 days, including today, with an offline cache. It also shows daily spending, a comparison with yesterday, and an end-of-period projection.
 - **The Activity tab**: requests, errors, cache hits, latency, and hourly activity, with a breakdown by model.
+- **Prompt cache usage**: reused input tokens, their share of reported input tokens, and data coverage, with a daily breakdown by model in Activity.
 - **Unusual spending alerts**: a daily rolling comparison of the last completed week against the previous two weeks, with configurable percentage and dollar thresholds.
 - **macOS notifications**: two configurable thresholds, set to 50% and 75% of the budget consumed by default.
 - **Integrated updates**: checks at startup and every 24 hours. Install a signed update from Settings, then restart when ready.
@@ -234,6 +235,20 @@ Ember uses LiteLLM's daily summaries immediately, independently of budget resets
 Only one notification is sent per episode, including across restarts or disabling and re-enabling the option. A successful daily comparison below either threshold rearms the alert. Changing the thresholds triggers a new comparison without forgetting an already reported episode; changing the endpoint or key starts fresh. Network and notification failures are retried on the first refresh after 15 minutes, without rearming the alert. When the option is disabled, no background history request is made for these alerts; the calendar can still refresh on demand.
 
 ### Understanding the numbers
+
+The **Cache de prompts** card in Activity tracks input tokens reused by providers,
+separately from LiteLLM's response cache. It uses normalized
+`metadata.usage_object.prompt_tokens` and
+`metadata.usage_object.prompt_tokens_details.cached_tokens` from the existing spend
+logs. Availability depends on your LiteLLM version and logging configuration.
+
+The percentage is the sum of reused tokens divided by the sum of input tokens
+for requests with valid counters, rather than an average of request percentages.
+The card shows how many eligible requests have these counters. Missing data is
+unavailable, not zero; an explicitly reported zero is included. Failed requests
+and explicit LiteLLM response-cache hits are excluded. Figures cover the current
+local day and reuse Activity's existing refresh behavior. Cache writes and dollar
+savings are not included.
 
 The displayed amount covers the **key's current budget period**, rather than its lifetime spending. Figures depend on the data and permissions provided by LiteLLM: a model without configured pricing may report a cost of $0. The projection is an estimate based on your current spending pace.
 

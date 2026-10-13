@@ -178,11 +178,30 @@ pub struct WeekDetails {
     pub projection: Option<f64>,
 }
 
+/// Cache de prompts fournisseur, agrégé sur les requêtes éligibles du jour.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptCacheUsage {
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub reported_requests: u64,
+    pub eligible_requests: u64,
+}
+
+impl PromptCacheUsage {
+    /// Part des tokens réutilisés, uniquement sur les requêtes renseignées.
+    pub fn rate(&self) -> Option<f64> {
+        (self.reported_requests > 0 && self.input_tokens > 0)
+            .then(|| self.cached_tokens as f64 / self.input_tokens as f64)
+    }
+}
+
 /// Activité d'un modèle sur la journée.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelActivity {
     pub model: String,
     pub requests: u64,
+    #[serde(default)]
+    pub prompt_cache: PromptCacheUsage,
     pub errors: u64,
     pub spend: f64,
     pub avg_cost: f64,
@@ -213,8 +232,10 @@ pub struct Activity {
     pub errors: u64,
     pub avg_cost: f64,
     pub avg_tokens: f64,
-    /// Part de requêtes servies par le cache, si le cache est utilisé (`None` sinon).
+    /// Part des hits parmi les requêtes dont le statut de cache LiteLLM est renseigné.
     pub cache_rate: Option<f64>,
+    #[serde(default)]
+    pub prompt_cache: PromptCacheUsage,
     pub latency_p50_ms: Option<f64>,
     pub latency_p95_ms: Option<f64>,
     /// Délai médian avant le premier token (requêtes en streaming).
@@ -228,6 +249,38 @@ pub struct Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_activity_without_prompt_cache_still_loads() {
+        let activity = Activity {
+            per_model: vec![ModelActivity::default()],
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(activity).unwrap();
+        value.as_object_mut().unwrap().remove("prompt_cache");
+        value["per_model"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("prompt_cache");
+        let restored: Activity = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.prompt_cache, PromptCacheUsage::default());
+        assert_eq!(
+            restored.per_model[0].prompt_cache,
+            PromptCacheUsage::default()
+        );
+    }
+
+    #[test]
+    fn prompt_cache_distinguishes_missing_zero_and_zero_input() {
+        let mut usage = PromptCacheUsage::default();
+        assert_eq!(usage.rate(), None);
+        usage.reported_requests = 1;
+        assert_eq!(usage.rate(), None);
+        usage.input_tokens = 100;
+        assert_eq!(usage.rate(), Some(0.0));
+        usage.cached_tokens = 75;
+        assert_eq!(usage.rate(), Some(0.75));
+    }
 
     #[test]
     fn update_status_roundtrips_and_marks_only_active_operations_busy() {

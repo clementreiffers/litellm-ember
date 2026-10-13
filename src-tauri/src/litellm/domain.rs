@@ -1,7 +1,10 @@
 //! Calculs déterministes : aucune entrée/sortie ni lecture de l'horloge.
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
-use shared::{Activity, DayCost, HourBucket, ModelActivity, ModelCost, ModelUsage, TopRequest};
+use shared::{
+    Activity, DayCost, HourBucket, ModelActivity, ModelCost, ModelUsage, PromptCacheUsage,
+    TopRequest,
+};
 use std::collections::HashMap;
 
 pub(super) fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -146,6 +149,50 @@ pub(super) struct LogRow {
     /// Booléen ou chaîne (`"True"`, `"False"`, `"None"`) selon la version de LiteLLM.
     #[serde(default)]
     pub(super) cache_hit: Option<serde_json::Value>,
+    /// Ne conserve que les compteurs normalisés, jamais les métadonnées brutes.
+    #[serde(
+        default,
+        rename = "metadata",
+        deserialize_with = "deserialize_prompt_cache"
+    )]
+    pub(super) prompt_cache: Option<(u64, u64)>,
+}
+
+fn deserialize_prompt_cache<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<(u64, u64)>, D::Error> {
+    let mut metadata = serde_json::Value::deserialize(deserializer)?;
+    if let Some(encoded) = metadata.as_str() {
+        metadata = serde_json::from_str(encoded).unwrap_or_default();
+    }
+    let counts = (|| {
+        let usage = metadata.get("usage_object")?;
+        let input = usage.get("prompt_tokens")?.as_u64()?;
+        let cached = usage
+            .get("prompt_tokens_details")?
+            .get("cached_tokens")?
+            .as_u64()?;
+        (cached <= input).then_some((input, cached))
+    })();
+    Ok(counts)
+}
+
+fn record_prompt_cache(summary: &mut PromptCacheUsage, row: &LogRow) {
+    if row.failed() || row.cache() == Some(true) {
+        return;
+    }
+    summary.eligible_requests += 1;
+    if let Some((input, cached)) = row.prompt_cache {
+        // Un débordement rend cette ligne inexploitable, sans casser l'onglet.
+        if let (Some(input), Some(cached)) = (
+            summary.input_tokens.checked_add(input),
+            summary.cached_tokens.checked_add(cached),
+        ) {
+            summary.reported_requests += 1;
+            summary.input_tokens = input;
+            summary.cached_tokens = cached;
+        }
+    }
 }
 
 impl LogRow {
@@ -153,7 +200,7 @@ impl LogRow {
         self.status.as_deref() == Some("failure")
     }
 
-    /// `Some(true)` si servie par le cache, `Some(false)` si le cache a été consulté sans succès, `None` s'il n'est pas utilisé.
+    /// Statut du cache de réponses LiteLLM ; `None` signifie non renseigné.
     pub(super) fn cache(&self) -> Option<bool> {
         use serde_json::Value;
         match self.cache_hit.as_ref()? {
@@ -260,10 +307,12 @@ pub(super) fn aggregate_activity(
         spend: f64,
         tokens: u64,
         latencies: Vec<f64>,
+        prompt_cache: PromptCacheUsage,
     }
     let mut per_model: HashMap<&str, Acc> = HashMap::new();
     let (mut errors, mut spend, mut tokens) = (0_u64, 0.0_f64, 0_u64);
     let (mut hits, mut tracked) = (0_u64, 0_u64);
+    let mut prompt_cache = PromptCacheUsage::default();
     let (mut latencies, mut ttfts) = (Vec::new(), Vec::new());
 
     for r in rows {
@@ -278,6 +327,7 @@ pub(super) fn aggregate_activity(
             top = Some(r);
         }
         let failed = r.failed();
+        record_prompt_cache(&mut prompt_cache, r);
         errors += failed as u64;
         spend += r.spend;
         tokens += r.total;
@@ -295,6 +345,7 @@ pub(super) fn aggregate_activity(
         if let Some(model) = normalize_model(&r.model) {
             let a = per_model.entry(model).or_default();
             a.requests += 1;
+            record_prompt_cache(&mut a.prompt_cache, r);
             a.errors += failed as u64;
             a.spend += r.spend;
             a.tokens += r.total;
@@ -315,6 +366,7 @@ pub(super) fn aggregate_activity(
             ModelActivity {
                 model: model.to_owned(),
                 requests: a.requests,
+                prompt_cache: a.prompt_cache,
                 errors: a.errors,
                 spend: a.spend,
                 avg_cost: a.spend / requests,
@@ -347,6 +399,7 @@ pub(super) fn aggregate_activity(
         avg_cost: spend / requests,
         avg_tokens: tokens as f64 / requests,
         cache_rate: (tracked > 0).then(|| hits as f64 / tracked as f64),
+        prompt_cache,
         latency_p50_ms: percentile_sorted(&latencies, 50.0),
         latency_p95_ms: percentile_sorted(&latencies, 95.0),
         ttft_p50_ms: percentile_sorted(&ttfts, 50.0),

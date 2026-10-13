@@ -326,7 +326,7 @@ pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
         <Status loading has_data error />
         {move || activity.with(|r| r.data.clone()).map(|a| {
             let error_pct = if a.requests > 0 { a.errors as f64 / a.requests as f64 * 100.0 } else { 0.0 };
-            let cache = a.cache_rate.map(|c| format!("{:.0} %", c * 100.0)).unwrap_or("non utilisé".into());
+            let cache = a.cache_rate.map(|c| format!("{:.0} %", c * 100.0)).unwrap_or("Indisponible".into());
             view! {
                 <section class="card">
                     <h2>"Aujourd'hui en un coup d'œil"</h2>
@@ -340,13 +340,14 @@ pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
                             </div>
                             <div class="caption">{format!("{} échec(s)", a.errors)}</div>
                         </div>
-                        <div class="kpi"><div class="caption">"Cache"</div><div class="kpi-val">{cache}</div></div>
+                        <div class="kpi"><div class="caption">"Cache de réponses LiteLLM"</div><div class="kpi-val">{cache}</div></div>
                         <div class="kpi"><div class="caption">"Latence p50 / p95"</div>
                             <div class="kpi-val">{fmt_ms(a.latency_p50_ms)}</div>
                             <div class="caption">{format!("p95 {} · 1er token {}", fmt_ms(a.latency_p95_ms), fmt_ms(a.ttft_p50_ms))}</div>
                         </div>
                     </div>
                 </section>
+                <PromptCacheCard summary=a.prompt_cache.clone() models=a.per_model.clone() />
                 <section class="card">
                     <h2>"Par modèle"</h2>
                     <table class="models">
@@ -382,9 +383,99 @@ pub fn ActivityTab(activity: RwSignal<Remote<Activity>>) -> impl IntoView {
     }
 }
 
+fn prompt_cache_rate(usage: &shared::PromptCacheUsage) -> String {
+    usage
+        .rate()
+        .map(|rate| format!("{:.1} %", rate * 100.0))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn prompt_cache_message(usage: &shared::PromptCacheUsage) -> &'static str {
+    if usage.eligible_requests == 0 {
+        "Aucune requête éligible aujourd’hui"
+    } else if usage.reported_requests == 0 {
+        "Données de cache de prompts indisponibles"
+    } else {
+        "Sur les requêtes renseignées"
+    }
+}
+
+#[component]
+fn PromptCacheCard(
+    summary: shared::PromptCacheUsage,
+    mut models: Vec<shared::ModelActivity>,
+) -> impl IntoView {
+    models.retain(|model| model.prompt_cache.eligible_requests > 0);
+    models.sort_by(|a, b| {
+        b.prompt_cache
+            .cached_tokens
+            .cmp(&a.prompt_cache.cached_tokens)
+            .then(a.model.cmp(&b.model))
+    });
+    let reported = summary.reported_requests > 0;
+    let rate = summary.rate();
+    view! {
+        <section class="card prompt-cache">
+            <h2>"Cache de prompts · Aujourd’hui"</h2>
+            <p class="caption">{prompt_cache_message(&summary)}</p>
+            {reported.then(|| view! {
+                <div class="prompt-cache-totals">
+                    <div><div class="kpi-val">{fmt_tokens(summary.cached_tokens)}</div><div class="caption">"Tokens réutilisés"</div></div>
+                    <div><div class="kpi-val">{prompt_cache_rate(&summary)}</div><div class="caption">"Des tokens d’entrée réutilisés"</div></div>
+                </div>
+            })}
+            {rate.map(|rate| view! {
+                <progress class="prompt-cache-progress" max="1" value=rate aria-label="Part des tokens d’entrée réutilisés" />
+            })}
+            <p class="caption">{format!("Données disponibles pour {} requêtes sur {}", summary.reported_requests, summary.eligible_requests)}</p>
+            {(!models.is_empty()).then(|| view! {
+                <table class="models">
+                    <thead><tr class="th"><th>"Modèle"</th><th class="num">"Réutilisés"</th><th class="num">"Part"</th><th class="num">"Requêtes renseignées"</th></tr></thead>
+                    <tbody>{models.into_iter().map(|model| {
+                        let usage = model.prompt_cache;
+                        let title = model.model.clone();
+                        let tokens = if usage.reported_requests > 0 { fmt_tokens(usage.cached_tokens) } else { "—".into() };
+                        view! {
+                            <tr>
+                                <td class="name" title=title>{model.model}</td>
+                                <td class="num">{tokens}</td>
+                                <td class="num">{prompt_cache_rate(&usage)}</td>
+                                <td class="num">{format!("{} / {}", usage.reported_requests, usage.eligible_requests)}</td>
+                            </tr>
+                        }
+                    }).collect_view()}</tbody>
+                </table>
+            })}
+            <p class="hint">"Tokens d’entrée relus depuis le cache des fournisseurs. Échecs et réponses servies par le cache LiteLLM exclus. Les données absentes ne comptent pas comme zéro."</p>
+        </section>
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_cache_labels_distinguish_missing_data_from_zero_usage() {
+        let mut usage = shared::PromptCacheUsage::default();
+        assert_eq!(
+            prompt_cache_message(&usage),
+            "Aucune requête éligible aujourd’hui"
+        );
+        usage.eligible_requests = 2;
+        assert_eq!(
+            prompt_cache_message(&usage),
+            "Données de cache de prompts indisponibles"
+        );
+        assert_eq!(prompt_cache_rate(&usage), "—");
+        usage.reported_requests = 1;
+        assert_eq!(prompt_cache_message(&usage), "Sur les requêtes renseignées");
+        assert_eq!(prompt_cache_rate(&usage), "—");
+        usage.input_tokens = 100;
+        assert_eq!(prompt_cache_rate(&usage), "0.0 %");
+        usage.cached_tokens = 75;
+        assert_eq!(prompt_cache_rate(&usage), "75.0 %");
+    }
+
     fn result(value: u32, generation: u64) -> Result<Detail<u32>, String> {
         Ok(Detail {
             generation,
