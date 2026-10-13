@@ -17,18 +17,15 @@ function publicKeyBytes(publicKey) {
   return bytes;
 }
 
-export function releaseConfig(version, publicKey, signingIdentity) {
+export function releaseConfig(version, publicKey) {
   validateVersion(version);
   publicKeyBytes(publicKey);
-  if (!signingIdentity?.startsWith("Developer ID Application:")) {
-    throw new Error("APPLE_SIGNING_IDENTITY must be a Developer ID Application identity");
-  }
   return {
     version,
     bundle: {
       targets: ["app", "dmg"],
       createUpdaterArtifacts: true,
-      macOS: { signingIdentity, hardenedRuntime: true },
+      macOS: { signingIdentity: "-", hardenedRuntime: false },
     },
     plugins: { updater: { pubkey: publicKey.trim(), requireSignedVersion: true } },
   };
@@ -73,11 +70,11 @@ async function main() {
   if (command === "notes") {
     console.log(`### Installing and updating Ember
 
-For a first installation, or an older Ember version without integrated updates, download [the universal macOS DMG](https://github.com/clementreiffers/litellm-ember/releases/download/${version}/Ember-${version}-macos-universal.dmg), quit Ember, and drag Ember.app to Applications. Settings and the existing Keychain entry are preserved; macOS may ask for Keychain authorization once when moving from an unsigned build.
+For a first installation, or an older Ember version without integrated updates, download [the universal macOS DMG](https://github.com/clementreiffers/litellm-ember/releases/download/${version}/Ember-${version}-macos-universal.dmg), quit Ember, and drag Ember.app to Applications. Settings and the existing Keychain entry are preserved; macOS may ask for Keychain authorization again after replacing the application.
 
-For versions with integrated updates, choose **Mettre à jour** in Settings, then **Redémarrer** when ready. The other release assets are managed automatically by Ember. Official builds are signed and notarized; no manual quarantine removal is required.`);
+For versions with integrated updates, choose **Mettre à jour** in Settings, then **Redémarrer** when ready. The other release assets are managed automatically by Ember. Ember uses a local ad hoc signature and is not notarized by Apple. If macOS blocks the first launch, open System Settings → Privacy & Security and choose **Open Anyway** for Ember, then confirm. Update archives are authenticated separately with a Tauri signature; this does not grant Apple approval. Ember does not automatically remove quarantine.`);
   } else if (command === "config") {
-    const config = releaseConfig(version, process.env.TAURI_SIGNING_PUBLIC_KEY, process.env.APPLE_SIGNING_IDENTITY);
+    const config = releaseConfig(version, process.env.TAURI_SIGNING_PUBLIC_KEY);
     await writeFile("release-config.json", JSON.stringify(config, null, 2) + "\n");
   } else if (command === "artifacts") {
     const base = `Ember-${version}-macos-universal`;

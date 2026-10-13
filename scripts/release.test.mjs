@@ -63,7 +63,6 @@ const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 const keyId = Buffer.from("0102030405060708", "hex");
 const publicBytes = publicKey.export({ format: "der", type: "spki" }).subarray(-32);
 const updaterKey = Buffer.from(`untrusted comment: test key\n${Buffer.concat([Buffer.from("Ed"), keyId, publicBytes]).toString("base64")}\n`).toString("base64");
-const identity = "Developer ID Application: Ember Test (TESTTEAM)";
 function signatureFor(bytes, version = "1.2.3") {
   const signature = sign(null, createHash("blake2b512").update(bytes).digest(), privateKey);
   const trusted = `timestamp:123\tfile:Ember.app.tar.gz\tversion:${version}`;
@@ -72,22 +71,22 @@ function signatureFor(bytes, version = "1.2.3") {
   return Buffer.from(`untrusted comment: test signature\n${record.toString("base64")}\ntrusted comment: ${trusted}\n${global.toString("base64")}\n`).toString("base64");
 }
 
-test("official config requires signing and notarizable identity; local config needs no secrets", async () => {
+test("official config uses ad hoc signing and requires a Tauri key; local config needs no secrets", async () => {
   const base = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   assert.equal(Object.hasOwn(base, "version"), false);
   assert.equal(base.plugins.updater.pubkey, "");
-  const release = releaseConfig("3.2.1", updaterKey, identity);
+  const release = releaseConfig("3.2.1", updaterKey);
   assert.equal(release.version, "3.2.1");
   assert.equal(release.bundle.createUpdaterArtifacts, true);
   assert.deepEqual(release.bundle.targets, ["app", "dmg"]);
-  assert.equal(release.bundle.macOS.hardenedRuntime, true);
+  assert.deepEqual(release.bundle.macOS, { signingIdentity: "-", hardenedRuntime: false });
   assert.equal(release.plugins.updater.requireSignedVersion, true);
   assert.equal(release.plugins.updater.pubkey, updaterKey);
   for (const version of ["", "v1.2.3", "1.2", "01.2.3", "1.2.3-beta.1", "1.2.3\n", undefined]) {
-    assert.throws(() => releaseConfig(version, updaterKey, identity));
+    assert.throws(() => releaseConfig(version, updaterKey));
   }
-  assert.throws(() => releaseConfig("1.2.3", "", identity));
-  assert.throws(() => releaseConfig("1.2.3", updaterKey, "-"));
+  assert.throws(() => releaseConfig("1.2.3", ""));
+  assert.throws(() => releaseConfig("1.2.3", "invalid"), /TAURI_SIGNING_PUBLIC_KEY/);
 });
 
 test("release publishes DMG, signed update, manifest and checksums", () => {
@@ -132,13 +131,17 @@ test("release tooling refuses missing credentials and validates all publication 
   const directory = await mkdtemp(join(tmpdir(), "ember-release-"));
   const script = fileURLToPath(new URL("./updater-release.mjs", import.meta.url));
   try {
-    const options = { cwd: directory, env: { TAURI_SIGNING_PUBLIC_KEY: updaterKey, APPLE_SIGNING_IDENTITY: identity }, stdio: "pipe" };
+    const options = { cwd: directory, env: { TAURI_SIGNING_PUBLIC_KEY: updaterKey }, stdio: "pipe" };
     const notes = execFileSync(process.execPath, [script, "notes", "1.2.3"], { ...options, env: {} }).toString();
     assert.ok(notes.includes("/1.2.3/Ember-1.2.3-macos-universal.dmg"));
     assert.ok(notes.includes("older Ember version without integrated updates"));
+    assert.ok(notes.includes("not notarized by Apple"));
+    assert.ok(notes.includes("Open Anyway"));
+    assert.ok(notes.includes("Tauri signature"));
+    assert.ok(!notes.includes("Official builds are signed and notarized"));
     assert.throws(() => execFileSync(process.execPath, [script, "config", "1.2.3"], { ...options, env: {} }));
     execFileSync(process.execPath, [script, "config", "1.2.3"], options);
-    assert.deepEqual(JSON.parse(await readFile(join(directory, "release-config.json"))), releaseConfig("1.2.3", updaterKey, identity));
+    assert.deepEqual(JSON.parse(await readFile(join(directory, "release-config.json"))), releaseConfig("1.2.3", updaterKey));
     await mkdir(join(directory, "release"));
     const base = "Ember-1.2.3-macos-universal";
     const bytes = Buffer.from("fixture");
@@ -167,4 +170,50 @@ test("release verification accepts a real Tauri CLI signature", async () => {
     await readFile(new URL("public-key.txt", base), "utf8"),
     "2.0.0",
   );
+});
+
+test("release preflight requires only Tauri credentials and fails before installing tools", async () => {
+  const { mkdtemp, mkdir, writeFile, rm, access, copyFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const directory = await mkdtemp(join(tmpdir(), "ember-preflight-"));
+  try {
+    await mkdir(join(directory, "scripts"));
+    await mkdir(join(directory, "bin"));
+    for (const file of ["prepare-release.sh", "updater-release.mjs"]) {
+      await copyFile(new URL(file, import.meta.url), join(directory, "scripts", file));
+    }
+    // Arrêter le scénario valide avant toute installation réelle.
+    await writeFile(join(directory, "bin/cargo"), '#!/bin/sh\ntouch tools-started\nexit 73\n', { mode: 0o700 });
+    const env = {
+      PATH: `${join(directory, "bin")}:${process.env.PATH}`,
+      TAURI_SIGNING_PRIVATE_KEY: "test-only-placeholder",
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "test-only-password",
+      TAURI_SIGNING_PUBLIC_KEY: updaterKey,
+    };
+    for (const name of ["TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "TAURI_SIGNING_PUBLIC_KEY"]) {
+      const result = spawnSync("/bin/bash", ["scripts/prepare-release.sh", "1.2.3"], {
+        cwd: directory, env: { ...env, [name]: "" }, encoding: "utf8",
+      });
+      assert.equal(result.status, 1);
+      assert.ok(result.stderr.includes(`Missing release configuration: ${name}`));
+      await assert.rejects(access(join(directory, "tools-started")));
+    }
+    const invalid = spawnSync("/bin/bash", ["scripts/prepare-release.sh", "1.2.3"], {
+      cwd: directory, env: { ...env, TAURI_SIGNING_PUBLIC_KEY: "invalid" }, encoding: "utf8",
+    });
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /TAURI_SIGNING_PUBLIC_KEY/);
+    await assert.rejects(access(join(directory, "tools-started")));
+    const valid = spawnSync("/bin/bash", ["scripts/prepare-release.sh", "1.2.3"], {
+      cwd: directory, env, encoding: "utf8",
+    });
+    assert.equal(valid.status, 73, valid.stderr);
+    await access(join(directory, "tools-started"));
+    const generated = JSON.parse(await readFile(join(directory, "release-config.json"), "utf8"));
+    assert.deepEqual(generated, releaseConfig("1.2.3", updaterKey));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

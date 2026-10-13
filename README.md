@@ -85,7 +85,12 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) for commits mer
 
 The highest required bump wins when multiple commits are pushed. Existing reachable `X.Y.Z` tags are used as the release baseline; without a previous release, the first releasable change creates `1.0.0`. Node.js 24 and `npm ci` install the release tooling; `npm test` verifies the versioning rules without publishing.
 
-Official releases use an Apple Developer ID signature and Apple notarization. macOS may display its normal first-open confirmation; removing `com.apple.quarantine` with `xattr` is not part of installation. Older unsigned releases retain their previous macOS restrictions.
+Official releases use a local **ad hoc** macOS signature and are **not notarized by Apple**.
+No Apple Developer subscription is required. Gatekeeper may block the first launch:
+after moving Ember to Applications and attempting to open it, go to **System Settings →
+Privacy & Security → Open Anyway** for Ember and confirm. Follow this procedure only for
+the release you intended to install. Ember does not automatically remove quarantine.
+The separate Tauri signature authenticates update archives; it does not grant Apple approval.
 
 ### Updating Ember
 
@@ -113,44 +118,52 @@ the current application. No automatic quarantine removal is performed.
 
 **Transition from older versions:** install the first release with this updater manually
 from its DMG, replacing the previous app after quitting it. Existing versions cannot
-install their own updater. Subsequent updates use the integrated flow. The transition
-from an unsigned app to Developer ID may require a one-time Keychain authorization;
+install their own updater. Subsequent updates use the integrated flow. Replacing an ad hoc signed app may require macOS Keychain authorization again;
 Ember does not delete or migrate the existing key.
 
 ### Release signing setup (maintainers)
 
-A paid Apple Developer membership is required for official releases. Configure these
-GitHub Actions repository secrets before the first signed release:
+Only the Tauri updater keys are required. No Apple certificate, account, or notarization
+credentials are used. Generate the production key **once**, outside this repository:
 
-| Secret | Value |
-|---|---|
-| `APPLE_CERTIFICATE` | Base64-encoded `.p12` export of the Developer ID Application certificate **and its private key** |
-| `APPLE_CERTIFICATE_PASSWORD` | Password protecting the `.p12` |
-| `APPLE_SIGNING_IDENTITY` | Full `Developer ID Application: Name (TEAMID)` identity |
-| `APPLE_API_KEY` | App Store Connect team API key ID authorized for notarization |
-| `APPLE_API_ISSUER` | API key issuer ID |
-| `APPLE_API_PRIVATE_KEY` | Contents of the corresponding `.p8` file |
-| `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key generated below |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Nonempty password protecting that updater key |
+```sh
+mkdir -p "$HOME/.config/ember-signing"
+chmod 700 "$HOME/.config/ember-signing"
+umask 077
+cargo tauri signer generate --write-keys "$HOME/.config/ember-signing/ember.key"
+```
 
-Generate the updater key once with `cargo tauri signer generate --write-keys /secure/path/ember.key`
-and choose a password. Store the generated private key securely outside the repository,
-with an offline backup. Set the repository **variable** `TAURI_SIGNING_PUBLIC_KEY` to the
-contents of `ember.key.pub` (already base64 encoded by Tauri). This public key is embedded
-in official builds. Keep the same updater key and Apple signing identity across releases;
-replacing the updater key without a transition would strand existing installations.
+Choose a nonempty password at the prompt. Do not use `--force` to overwrite an existing
+key. Keep an offline backup of the private key and its password. Never commit them or
+paste them into an issue, chat, or build log. The `.pub` file already contains the
+base64-encoded public key expected by Tauri; do not encode it again.
 
-The Apple certificate signs the application for macOS; the separate Tauri key authenticates
-updates. Neither private key is shipped in the app. Pull requests and local development
-need no signing secrets. Local builds have no updater trust key and cannot install official
-updates; use the signed release to exercise the full flow.
+With `gh` authenticated to the repository, configure GitHub Actions:
 
-The release job builds an Intel/Apple Silicon universal app, signs and notarizes it, and
-staples its ticket before producing the updater archive. It also notarizes and staples
-the DMG. Before publication it checks the signatures, Gatekeeper assessment, stapled tickets,
-universal architecture, embedded version, and updater signature against the public key.
-A missing secret or failed validation stops publication. A checksum alone is never used
-as proof of updater authenticity.
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo clementreiffers/litellm-ember < "$HOME/.config/ember-signing/ember.key"
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo clementreiffers/litellm-ember
+gh variable set TAURI_SIGNING_PUBLIC_KEY --repo clementreiffers/litellm-ember < "$HOME/.config/ember-signing/ember.key.pub"
+```
+
+The second command prompts for the same password; do not put it in a command argument.
+The private key and password are **secrets**; the public key is a repository **variable**
+embedded in official builds. Keep the same pair across releases: replacing it without a
+migration prevents existing installations from verifying future updates. Never use the
+repository's test fixtures or temporary build-validation keys for production.
+
+Pull requests and local development need no signing secrets. Local builds have no updater
+trust key and cannot install official updates. The first release with your production
+public key must be installed manually from its DMG.
+
+The release job builds a universal Intel/Apple Silicon app with `signingIdentity: "-"`
+and no hardened runtime. It verifies the app's ad hoc signature, embedded version,
+universal architecture, DMG integrity, and the extracted updater app. It authenticates
+the update archive and its signed version using the Tauri public key before publishing
+`latest.json` and checksums. No Gatekeeper acceptance or notarization is claimed.
+A missing Tauri setting or failed validation stops publication. Do not pass `--no-sign`
+to a release build: Tauri 2.12.1 also skips updater signatures with that option.
+A checksum alone is never used as proof of updater authenticity.
 
 Each release contains the DMG, `.app.tar.gz`, `.app.tar.gz.sig`, `latest.json`, and
 `SHA256SUMS.txt`. Both macOS architectures in the manifest point to the same universal
@@ -158,7 +171,7 @@ archive at a version-specific URL. The archive and its signature are technical a
 users only download the DMG for initial installation. A temporarily missing manifest or
 asset during publication is reported as an error and can be retried.
 
-Before shipping the first signed release, follow [the macOS update validation checklist](docs/macos-updates.md).
+Before shipping the first release with integrated updates, follow [the macOS update validation checklist](docs/macos-updates.md).
 
 ## Build from source
 

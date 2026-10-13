@@ -3,24 +3,26 @@
 Automated tests exercise the service state machine, real HTTP manifest/download handling,
 Tauri signature compatibility, corrupted payload rejection, signed-version binding,
 UI labels and progress, and release artifact validation. They do not establish that
-Apple has accepted a particular production certificate or that a real app restarts.
+Gatekeeper will permit a first launch or that a real app restarts.
 
 Run `npm test`, `cargo test -p ember -p shared -p ui --locked`,
 `cargo clippy -p ember -p shared --all-targets --all-features --locked -- -D warnings`,
 `cargo clippy -p ui --target wasm32-unknown-unknown --all-targets --all-features --locked -- -D warnings`,
 and `cargo fmt --all -- --check` before release.
 
-## Signed app acceptance
+## Ad hoc app and authenticated update acceptance
 
-Use two signed, notarized test builds N and N+1 on a disposable macOS account or machine.
+Use two ad hoc signed, non-notarized test builds N and N+1 on a disposable macOS account or machine.
 For a pre-release rehearsal, override only the updater endpoint in a local build config
-to an HTTPS test manifest; sign both builds with the same production-compatible identity
-and updater key. Do not publish a fake version to the stable GitHub channel.
+to an HTTPS test manifest; use `signingIdentity: "-"` for both builds and the same temporary Tauri
+updater key (never replace the production public key with a test key). Do not publish a
+fake version to the stable GitHub channel.
 
 1. On Apple Silicon and Intel, download N's DMG through a browser, keeping quarantine.
-   Move Ember to Applications, eject the DMG, and launch normally. Do not run `xattr`.
-   Verify `codesign --verify --deep --strict Ember.app`,
-   `spctl --assess --type execute Ember.app` and `xcrun stapler validate Ember.app`.
+   Move Ember to Applications, eject the DMG, and attempt to launch. If Gatekeeper blocks
+   it, use System Settings → Privacy & Security → Open Anyway for Ember and confirm.
+   Verify `codesign --verify --deep --strict Ember.app`. Gatekeeper acceptance and
+   stapled notarization tickets are not expected; do not disable Gatekeeper globally.
 2. Save a LiteLLM endpoint and API key, load statistics, and record preferences/cache state.
    Make N+1 available at the test endpoint. Check manually and through a notification.
    Notification clicks must open Ember's update panel, not GitHub.
@@ -28,12 +30,13 @@ and updater key. Do not publish a fake version to the stable GitHub channel.
    reopening Settings shows the same operation. Repeated clicks must not duplicate work.
 4. Once **Redémarrer** appears, disable networking. Click it and confirm N+1 launches,
    exactly one tray icon remains, and the displayed version is N+1. Confirm preferences,
-   cached statistics and Keychain access survive. Repeat with quitting and reopening later.
+   cached statistics and Keychain access survive, including any renewed authorization
+   prompt. Repeat with quitting and reopening later.
 5. Test `/Applications` and `~/Applications`. In a disposable installation owned by another
    account, check the administrator prompt, cancellation, and retry. Check running from
    the mounted DMG is refused with relocation instructions.
 6. Repeat the initial manual replacement from an existing unsigned Ember build. Confirm
-   the old Keychain item remains accessible, allowing a one-time macOS authorization.
+   the old Keychain item remains accessible, allowing macOS authorization again after replacement.
 
 ## Failure cases
 
