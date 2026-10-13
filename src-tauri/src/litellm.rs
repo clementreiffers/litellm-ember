@@ -190,6 +190,31 @@ impl Client {
         Ok(aggregate_activity(&rows, today, &Local))
     }
 
+    /// Agrégats légers : ne désérialise ni les modèles ni les messages.
+    pub async fn fetch_history(
+        &self,
+        today: NaiveDate,
+        start: NaiveDate,
+    ) -> Result<[Option<f64>; crate::history::DAYS], String> {
+        #[derive(Deserialize)]
+        struct DailySpend {
+            #[serde(rename = "startTime")]
+            date: Option<String>,
+            spend: f64,
+        }
+        let end = today + Duration::days(1);
+        let rows: Vec<DailySpend> = self
+            .get(&format!(
+                "/spend/logs?summarize=true&start_date={start}&end_date={end}"
+            ))
+            .await?;
+        crate::history::aggregate(
+            today,
+            start,
+            rows.iter().map(|row| (row.date.as_deref(), row.spend)),
+        )
+    }
+
     /// Onglet « Semaine », appelé à la demande : coût par jour depuis le début de la période + projection.
     pub async fn fetch_week(
         &self,
@@ -578,6 +603,43 @@ mod tests {
 
         fn client(server: &MockServer) -> Client {
             Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn history_requests_30_days_and_rejects_invalid_history() {
+            let server = MockServer::start();
+            let day = NaiveDate::from_ymd_opt(2026, 1, 8).unwrap();
+            let mut history = server.mock(|when, then| {
+                when.path("/llm/spend/logs")
+                    .header("authorization", "Bearer sk-test")
+                    .query_param("summarize", "true")
+                    .query_param("start_date", "2025-12-10")
+                    .query_param("end_date", "2026-01-09");
+                then.status(200).json_body(serde_json::json!([
+                    {"startTime":"2025-12-18", "spend":20.0},
+                    {"startTime":"2026-01-01", "spend":16.0},
+                    {"startTime":"2026-01-08", "spend":500.0}
+                ]));
+            });
+            let amounts = client(&server)
+                .fetch_history(day, day - Duration::days(29))
+                .await
+                .unwrap();
+            assert_eq!(amounts[8], Some(20.0));
+            assert_eq!(amounts[22], Some(16.0));
+            assert_eq!(amounts[29], Some(500.0));
+            history.assert_hits(1);
+            history.delete();
+            server.mock(|when, then| {
+                when.path("/llm/spend/logs");
+                then.status(200)
+                    .json_body(serde_json::json!([{ "spend": 3.0 }]));
+            });
+            assert!(client(&server)
+                .fetch_history(day, day - Duration::days(29))
+                .await
+                .unwrap_err()
+                .contains("date invalide"));
         }
 
         #[tokio::test]

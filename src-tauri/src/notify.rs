@@ -1,4 +1,4 @@
-//! Notifications macOS natives quand le budget de la période atteint un seuil.
+//! Notifications macOS natives : seuils de budget et hausse des dépenses.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -36,8 +36,10 @@ pub fn decide(
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct State {
     #[serde(default)]
+    increase: crate::increase::State,
+    #[serde(default)]
     source_id: String,
-    /// Identifie la période de budget (date de reset) : un nouveau reset remet tout à zéro.
+    /// Identifie la période de budget (date de reset) : un nouveau reset réarme les seuils de budget.
     period: Option<String>,
     fired: BTreeSet<u32>,
 }
@@ -59,6 +61,74 @@ impl Notifier {
             path,
             state: Mutex::new(state),
         }
+    }
+
+    pub fn increase_due(&self, cfg: &Settings, day: chrono::NaiveDate) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "État des notifications indisponible")?;
+        let empty = crate::increase::State::default();
+        let increase = if state.source_id == cfg.source_id {
+            &state.increase
+        } else {
+            &empty
+        };
+        Ok(increase.due(day, cfg.spend_increase))
+    }
+
+    pub fn check_increase(
+        &self,
+        app: &AppHandle,
+        cfg: &Settings,
+        day: chrono::NaiveDate,
+        comparison: crate::increase::Comparison,
+    ) -> Result<(), String> {
+        self.check_increase_with(cfg, day, comparison, || {
+            send(
+                app,
+                Level::Critical,
+                "⚠️ Hausse inhabituelle des dépenses LiteLLM",
+                &comparison.message(),
+            )
+        })
+    }
+
+    fn check_increase_with(
+        &self,
+        cfg: &Settings,
+        day: chrono::NaiveDate,
+        comparison: crate::increase::Comparison,
+        send_notice: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !cfg.spend_increase.enabled {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "État des notifications indisponible")?;
+        let mut next = if state.source_id == cfg.source_id {
+            state.clone()
+        } else {
+            State {
+                source_id: cfg.source_id.clone(),
+                ..Default::default()
+            }
+        };
+        let (increase, should_send) = next.increase.evaluate(day, cfg.spend_increase, comparison);
+        if should_send {
+            send_notice()?;
+        }
+        next.increase = increase;
+        if *state != next {
+            // Un envoi accepté reste mémorisé en mémoire même si l'écriture échoue.
+            *state = next;
+            if let Some(path) = &self.path {
+                crate::persistence::write(path, &*state).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// À appeler après chaque lecture de `/key/info`.
@@ -207,6 +277,73 @@ pub fn send_test(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn increase_retries_failed_send_and_survives_restart_disable_and_budget_reset() {
+        let path = std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4()));
+        let notifier = Notifier::load(Some(path.clone()));
+        let mut cfg = cfg(false);
+        cfg.source_id = "increase-source".into();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let high = crate::increase::Comparison {
+            recent: 16.0,
+            reference: 10.0,
+        };
+        assert!(notifier.increase_due(&cfg, day).unwrap());
+        assert!(notifier
+            .check_increase_with(&cfg, day, high, || Err("refusé".into()))
+            .is_err());
+        assert!(notifier.increase_due(&cfg, day).unwrap());
+        notifier
+            .check_increase_with(&cfg, day, high, || Ok(()))
+            .unwrap();
+        let restarted = Notifier::load(Some(path.clone()));
+        assert!(!restarted.increase_due(&cfg, day).unwrap());
+        cfg.spend_increase.enabled = false;
+        restarted
+            .check_increase_with(&cfg, day, high, || panic!("désactivé"))
+            .unwrap();
+        cfg.spend_increase.enabled = true;
+        cfg.notifications_enabled = true;
+        restarted
+            .check_with(&cfg, 0.0, Some(100.0), Some("nouvelle période"), |_| Ok(()))
+            .unwrap();
+        restarted
+            .check_increase_with(&cfg, day + chrono::Duration::days(1), high, || {
+                panic!("déjà signalé")
+            })
+            .unwrap();
+        cfg.source_id = "autre-source".into();
+        assert!(restarted.increase_due(&cfg, day).unwrap());
+        restarted
+            .check_increase_with(&cfg, day, high, || Ok(()))
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_notification_state_and_disk_failure_do_not_repeat_accepted_increase() {
+        let old: State =
+            serde_json::from_str(r#"{"source_id":"a","period":null,"fired":[50]}"#).unwrap();
+        assert_eq!(old.increase, crate::increase::State::default());
+        let path = std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap(); // Une destination non remplaçable.
+        let notifier = Notifier::load(Some(path.clone()));
+        let cfg = cfg(false);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let high = crate::increase::Comparison {
+            recent: 16.0,
+            reference: 10.0,
+        };
+        assert!(notifier
+            .check_increase_with(&cfg, day, high, || Ok(()))
+            .is_err());
+        assert!(!notifier.increase_due(&cfg, day).unwrap());
+        notifier
+            .check_increase_with(&cfg, day, high, || panic!("déjà accepté"))
+            .unwrap();
+        std::fs::remove_dir(path).unwrap();
+    }
 
     #[test]
     fn fires_each_threshold_once() {

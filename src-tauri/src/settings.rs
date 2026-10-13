@@ -13,6 +13,8 @@ const KEYCHAIN_ACCOUNT: &str = "litellm-api-key";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(flatten)]
+    pub spend_increase: shared::SpendIncreaseSettings,
     pub base_url: String,
     pub refresh_secs: u32,
     pub notifications_enabled: bool,
@@ -24,6 +26,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            spend_increase: Default::default(),
             base_url: String::new(),
             refresh_secs: DEFAULT_REFRESH_SECS,
             notifications_enabled: true,
@@ -86,6 +89,7 @@ pub fn validate_url(value: &str) -> Result<String, String> {
 }
 fn validate(input: &SettingsInput) -> Result<String, String> {
     let url = validate_url(&input.base_url)?;
+    input.spend_increase.validate()?;
     if !(MIN_REFRESH_SECS..=MAX_REFRESH_SECS).contains(&input.refresh_secs) {
         return Err(format!(
             "La fréquence doit être entre {MIN_REFRESH_SECS} et {MAX_REFRESH_SECS} secondes"
@@ -142,6 +146,7 @@ impl SettingsStore {
         let mut settings = loaded.unwrap_or_default();
         if !settings.base_url.is_empty() {
             let input = SettingsInput {
+                spend_increase: settings.spend_increase,
                 base_url: settings.base_url.clone(),
                 refresh_secs: settings.refresh_secs,
                 notifications_enabled: settings.notifications_enabled,
@@ -207,6 +212,7 @@ impl SettingsStore {
     pub fn view(&self) -> SettingsView {
         let s = self.get();
         SettingsView {
+            spend_increase: s.spend_increase,
             base_url: s.base_url,
             refresh_secs: s.refresh_secs,
             notifications_enabled: s.notifications_enabled,
@@ -245,6 +251,7 @@ impl SettingsStore {
         let changed =
             previous.base_url != base_url || old_key != next_key || previous.source_id.is_empty();
         let new = Settings {
+            spend_increase: input.spend_increase,
             base_url,
             refresh_secs: input.refresh_secs,
             notifications_enabled: input.notifications_enabled,
@@ -336,6 +343,7 @@ mod tests {
 
     pub(super) fn input(url: &str, secs: u32) -> SettingsInput {
         SettingsInput {
+            spend_increase: Default::default(),
             base_url: url.into(),
             refresh_secs: secs,
             api_key: None,
@@ -344,6 +352,32 @@ mod tests {
             notify_info_percent: 50,
             notify_critical_percent: 75,
         }
+    }
+
+    #[test]
+    fn increase_preferences_survive_save_and_reload_independently_of_budget_alerts() {
+        let path = std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4()));
+        let store = SettingsStore::load_with(Some(path.clone()), Box::new(MemoryKeys::default()));
+        let mut preferences = input("https://x", 3600);
+        preferences.notifications_enabled = false;
+        preferences.spend_increase = shared::SpendIncreaseSettings {
+            enabled: true,
+            percent: 75,
+            min_usd: 8.5,
+        };
+        store.save(preferences.clone()).unwrap();
+        let loaded = SettingsStore::load_with(Some(path.clone()), Box::new(MemoryKeys::default()));
+        assert_eq!(loaded.view().spend_increase, preferences.spend_increase);
+        assert!(!loaded.view().notifications_enabled);
+        assert_eq!(loaded.view().refresh_secs, 3600);
+        preferences.spend_increase.min_usd = f64::NAN;
+        assert!(loaded.save(preferences).is_err());
+        assert_eq!(loaded.view().spend_increase.min_usd, 8.5);
+        let old: Settings =
+            serde_json::from_str(r#"{"base_url":"https://x","refresh_secs":3600}"#).unwrap();
+        assert_eq!(old.spend_increase, shared::SpendIncreaseSettings::default());
+        assert_eq!(old.refresh_secs, 3600);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

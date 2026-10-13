@@ -56,6 +56,14 @@ async fn save_settings(
     service.save(input).await
 }
 #[tauri::command]
+async fn get_history(
+    service: State<'_, Service>,
+    mode: shared::HistoryMode,
+) -> Result<shared::Detail<shared::HistoryDetails>, String> {
+    service.history(mode).await
+}
+
+#[tauri::command]
 async fn get_week(service: State<'_, Service>) -> Result<Detail<WeekDetails>, String> {
     service.week().await
 }
@@ -115,6 +123,7 @@ pub fn run() {
             get_settings,
             save_settings,
             get_week,
+            get_history,
             get_activity,
             refresh_now,
             test_notification,

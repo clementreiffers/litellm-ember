@@ -65,7 +65,10 @@ struct SaveArgs<'a> {
 
 /// Enregistre les paramètres ; renvoie le message d'erreur du backend en cas de refus.
 pub async fn save_settings(input: &SettingsInput) -> Result<SettingsView, String> {
-    let args = serde_wasm_bindgen::to_value(&SaveArgs { input }).map_err(|e| e.to_string())?;
+    // Les champs Serde aplatis doivent rester des objets JSON, pas des Map JavaScript.
+    let args = SaveArgs { input }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| e.to_string())?;
     match invoke_with("save_settings", args).await {
         Ok(v) => serde_wasm_bindgen::from_value(v).map_err(|e| e.to_string()),
         Err(e) => Err(e
@@ -147,4 +150,20 @@ pub async fn on_event<T: serde::de::DeserializeOwned + 'static>(
         unlisten,
         _handler: handler,
     })
+}
+
+/// Lecture locale, actualisation légère ou synchronisation manuelle complète.
+pub async fn get_history(
+    mode: shared::HistoryMode,
+) -> Result<Detail<shared::HistoryDetails>, String> {
+    #[derive(Serialize)]
+    struct Args {
+        mode: shared::HistoryMode,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { mode }).map_err(|e| e.to_string())?;
+    let value = invoke_with("get_history", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Historique indisponible".into())
+    })?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }

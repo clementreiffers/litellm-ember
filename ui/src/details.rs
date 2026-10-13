@@ -118,6 +118,53 @@ where
     });
 }
 
+/// Publie d'abord le cache local, puis actualise sans masquer les cases déjà connues.
+pub fn load_history(
+    slot: RwSignal<Remote<shared::HistoryDetails>>,
+    generation: Signal<u64>,
+    mode: shared::HistoryMode,
+) {
+    let Some(Some(id)) = slot.try_update(|r| {
+        if mode == shared::HistoryMode::Force {
+            r.invalidate();
+        }
+        // La fraîcheur est centralisée dans le backend, y compris au changement de jour UTC.
+        r.fetched_at = 0.0;
+        r.begin(js_sys::Date::now())
+    }) else {
+        return;
+    };
+    let requested_generation = generation.get_untracked();
+    leptos::task::spawn_local(async move {
+        if let Ok(cached) = crate::tauri::get_history(shared::HistoryMode::Cached).await {
+            slot.try_update(|r| {
+                if r.request_id == id
+                    && generation.try_get_untracked() == Some(requested_generation)
+                    && cached.generation == requested_generation
+                {
+                    r.data = Some(cached.data);
+                }
+            });
+        }
+        let result = crate::tauri::get_history(mode).await;
+        let mut reload = false;
+        slot.try_update(|r| {
+            if let Some(current) = generation.try_get_untracked() {
+                reload = r.complete(
+                    id,
+                    requested_generation,
+                    current,
+                    result,
+                    js_sys::Date::now(),
+                );
+            }
+        });
+        if reload && slot.try_with_untracked(|_| ()).is_some() {
+            load_history(slot, generation, shared::HistoryMode::Force);
+        }
+    });
+}
+
 pub fn invalidate<T: Send + Sync + 'static>(slot: RwSignal<Remote<T>>) {
     slot.update(Remote::invalidate);
 }

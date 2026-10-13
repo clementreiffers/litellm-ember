@@ -13,6 +13,9 @@ pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>)
     let notif_enabled = RwSignal::new(true);
     let notif_info = RwSignal::new(String::new());
     let notif_critical = RwSignal::new(String::new());
+    let increase_enabled = RwSignal::new(true);
+    let increase_percent = RwSignal::new("50".to_string());
+    let increase_min = RwSignal::new("3".to_string());
     let saving = RwSignal::new(false);
     let message = RwSignal::new(None::<(bool, String)>); // (succès, texte)
 
@@ -30,6 +33,9 @@ pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>)
                 refresh.set(s.refresh_secs.to_string());
                 key_source.set(s.key_source);
                 notif_enabled.set(s.notifications_enabled);
+                increase_enabled.set(s.spend_increase.enabled);
+                increase_percent.set(s.spend_increase.percent.to_string());
+                increase_min.set(s.spend_increase.min_usd.to_string());
                 notif_info.set(s.notify_info_percent.to_string());
                 notif_critical.set(s.notify_critical_percent.to_string());
             }
@@ -58,7 +64,19 @@ pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>)
             )));
             return;
         };
+        let spend_increase = match parse_increase_settings(
+            increase_enabled.get_untracked(),
+            &increase_percent.get_untracked(),
+            &increase_min.get_untracked(),
+        ) {
+            Ok(settings) => settings,
+            Err(error) => {
+                message.set(Some((false, error.into())));
+                return;
+            }
+        };
         let input = SettingsInput {
+            spend_increase,
             notifications_enabled: notif_enabled.get_untracked(),
             notify_info_percent: info,
             notify_critical_percent: critical,
@@ -135,6 +153,27 @@ pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>)
             <div class="hint">
                 "Par défaut : 💸 à 50 % (moitié consommée) et ⚠️ à 75 % (il reste 1/4). Une seule notification par seuil et par période de budget."
             </div>
+            <h3>"Hausse inhabituelle des dépenses"</h3>
+            <label class="check">
+                <input type="checkbox" prop:checked=move || increase_enabled.get()
+                    on:change=move |e| increase_enabled.set(event_target_checked(&e)) />
+                "Prévenir en cas de hausse inhabituelle des dépenses"
+            </label>
+            <div class="row">
+                <label>"Hausse minimum (%)"
+                    <input type="number" min="1" max="1000" step="1" prop:value=move || increase_percent.get()
+                        prop:disabled=move || !increase_enabled.get()
+                        on:input=move |e| increase_percent.set(event_target_value(&e)) />
+                </label>
+                <label>"Surcoût minimum ($)"
+                    <input type="number" min="0.01" max="1000000" step="0.01" prop:value=move || increase_min.get()
+                        prop:disabled=move || !increase_enabled.get()
+                        on:input=move |e| increase_min.set(event_target_value(&e)) />
+                </label>
+            </div>
+            <div class="hint">
+                "Compare chaque jour les 7 derniers jours terminés à la moyenne hebdomadaire des 14 jours précédents (UTC). Les deux seuils doivent être atteints. Une seule alerte jusqu’au retour sous les seuils, indépendamment des alertes de budget. Nécessite 21 jours d’historique LiteLLM complet."
+            </div>
             <button class="test" on:click=move |_| leptos::task::spawn_local(async move {
                     let msg = match tauri::test_notification().await {
                         Ok(()) => (true, "Notification envoyée. Si rien n'apparaît : Réglages Système > Notifications, \
@@ -155,5 +194,49 @@ pub fn Settings(on_close: Callback<()>, updates: RwSignal<shared::UpdateStatus>)
                     disabled=move || saving.get() || key_source.get() != KeySource::Keychain>"Supprimer la clé"</button>
             </div>
         </section>
+    }
+}
+
+/// Même validation métier que le backend, après conversion des champs du formulaire.
+fn parse_increase_settings(
+    enabled: bool,
+    percent: &str,
+    min_usd: &str,
+) -> Result<shared::SpendIncreaseSettings, &'static str> {
+    let settings = shared::SpendIncreaseSettings {
+        enabled,
+        percent: percent
+            .trim()
+            .parse()
+            .map_err(|_| "La hausse doit être un pourcentage entier")?,
+        min_usd: min_usd
+            .trim()
+            .parse()
+            .map_err(|_| "Le surcoût minimum doit être un montant en dollars")?,
+    };
+    settings.validate()?;
+    Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn increase_form_parses_and_validates_values_before_saving() {
+        assert_eq!(
+            parse_increase_settings(true, " 50 ", "3.00").unwrap(),
+            shared::SpendIncreaseSettings::default()
+        );
+        for (percent, minimum) in [
+            ("", "3"),
+            ("1.5", "3"),
+            ("0", "3"),
+            ("50", "NaN"),
+            ("50", "0"),
+            ("50", "abc"),
+        ] {
+            assert!(parse_increase_settings(true, percent, minimum).is_err());
+        }
+        assert!(!parse_increase_settings(false, "50", "3").unwrap().enabled);
     }
 }

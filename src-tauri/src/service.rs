@@ -7,7 +7,8 @@ use crate::{
 };
 use chrono::Local;
 use shared::{
-    Activity, Detail, ModelCost, ModelUsage, SettingsInput, SettingsView, Stats, WeekDetails,
+    Activity, Detail, HistoryDetails, HistoryMode, ModelCost, ModelUsage, SettingsInput,
+    SettingsView, Stats, WeekDetails,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -20,12 +21,37 @@ pub enum Error {
     Obsolete,
 }
 
-type NotifyBudget = Arc<dyn Fn(Settings, KeyData) + Send + Sync>;
+enum NotificationRequest {
+    Budget(KeyData),
+    IncreaseDue(chrono::NaiveDate),
+    Increase(chrono::NaiveDate, crate::increase::Comparison),
+}
+
+type Notify = Arc<dyn Fn(Settings, NotificationRequest) -> Result<bool, String> + Send + Sync>;
+
+/// Temporisation monotone, distincte des journées UTC comparées.
+#[derive(Default)]
+struct IncreaseRetry(Option<tokio::time::Instant>);
+impl IncreaseRetry {
+    fn ready(&self, now: tokio::time::Instant) -> bool {
+        self.0.is_none_or(|deadline| now >= deadline)
+    }
+    fn failed(&mut self, now: tokio::time::Instant) {
+        self.0 = Some(now + Duration::from_secs(15 * 60));
+    }
+}
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 enum Command {
     Save(SettingsInput, Reply<SettingsView>),
     Settings(Reply<SettingsView>),
+    History(HistoryMode, Reply<Detail<HistoryDetails>>),
+    HistoryFetched(
+        u64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::NaiveDate,
+        Result<Box<[Option<f64>; crate::history::DAYS]>, String>,
+    ),
     Context(Reply<(Client, Stats)>),
     Refresh(Option<Reply<()>>),
     Event(u64, Event),
@@ -36,6 +62,10 @@ pub enum Event {
     Models(Vec<ModelCost>),
     Today(String, Vec<ModelUsage>),
     Failed(String),
+    Increase(
+        chrono::NaiveDate,
+        Result<crate::increase::Comparison, String>,
+    ),
     Finished,
 }
 
@@ -56,6 +86,7 @@ pub fn apply(stats: &mut Stats, event: Event) {
         }
         Event::Failed(error) => stats.error = Some(error),
         Event::Finished => stats.refreshing = false,
+        Event::Increase(..) => {}
     }
 }
 
@@ -99,6 +130,9 @@ impl Service {
         app: tauri::AppHandle,
         publish: impl Fn(&Stats) + Send + 'static,
     ) -> Self {
+        let history_path = settings_path
+            .as_ref()
+            .map(|path| path.with_file_name("history.json"));
         let (commands, receiver) = mpsc::unbounded_channel();
         let (snapshots, updates) = watch::channel(Stats::default());
         let service = Self {
@@ -115,16 +149,37 @@ impl Service {
             .await;
             match loaded {
                 Ok((store, notifier)) => {
-                    let notify: NotifyBudget = Arc::new(move |cfg, key| {
-                        notifier.check(
-                            &app,
-                            &cfg,
-                            key.period_spend,
-                            key.max_budget,
-                            key.budget_reset_at.as_deref(),
-                        )
+                    let notify: Notify = Arc::new(move |cfg, request| {
+                        match request {
+                            NotificationRequest::Budget(key) => notifier.check(
+                                &app,
+                                &cfg,
+                                key.period_spend,
+                                key.max_budget,
+                                key.budget_reset_at.as_deref(),
+                            ),
+                            NotificationRequest::IncreaseDue(day) => {
+                                return notifier.increase_due(&cfg, day)
+                            }
+                            NotificationRequest::Increase(day, comparison) => {
+                                notifier.check_increase(&app, &cfg, day, comparison)?
+                            }
+                        }
+                        Ok(false)
                     });
-                    coordinate(store, cache, notify, publish, commands, receiver, snapshots).await
+                    coordinate(
+                        store,
+                        StoragePaths {
+                            stats: cache,
+                            history: history_path,
+                        },
+                        notify,
+                        publish,
+                        commands,
+                        receiver,
+                        snapshots,
+                    )
+                    .await
                 }
                 Err(_) => {
                     let state = Stats {
@@ -161,6 +216,10 @@ impl Service {
     pub async fn save(&self, input: SettingsInput) -> Result<SettingsView, String> {
         self.request(|reply| Command::Save(input, reply)).await
     }
+    pub async fn history(&self, mode: HistoryMode) -> Result<Detail<HistoryDetails>, String> {
+        self.request(|reply| Command::History(mode, reply)).await
+    }
+
     pub async fn week(&self) -> Result<Detail<WeekDetails>, String> {
         let (client, state) = self.request(Command::Context).await?;
         let mut updates = self.snapshots.clone();
@@ -198,10 +257,16 @@ fn connection(
     Client::with_http(&store.get().base_url, key, http.clone()?)
 }
 
+#[derive(Default)]
+struct StoragePaths {
+    stats: Option<PathBuf>,
+    history: Option<PathBuf>,
+}
+
 async fn coordinate(
     store: Arc<SettingsStore>,
-    cache: Option<PathBuf>,
-    notify: NotifyBudget,
+    paths: StoragePaths,
+    notify: Notify,
     publish: impl Fn(&Stats) + Send + 'static,
     commands: mpsc::UnboundedSender<Command>,
     mut receiver: mpsc::UnboundedReceiver<Command>,
@@ -210,6 +275,26 @@ async fn coordinate(
     let http = Client::http();
     let mut client = connection(&store, &http);
     let source = store.get().source_id;
+    let cache = paths.stats;
+    let history_path = paths.history;
+    let load_path = history_path.clone();
+    let history_source = source.clone();
+    let mut history = tauri::async_runtime::spawn_blocking(move || {
+        crate::history::History::load(
+            load_path.as_deref(),
+            history_source,
+            chrono::Utc::now().date_naive(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        crate::history::History::empty(source.clone(), chrono::Utc::now().date_naive())
+    });
+    let mut history_worker: Option<(chrono::NaiveDate, tauri::async_runtime::JoinHandle<()>)> =
+        None;
+    let mut history_waiters: Vec<Reply<Detail<HistoryDetails>>> = Vec::new();
+    let mut history_force_followup = false;
+    let mut history_error: Option<String> = None;
     let cache_read = cache.clone();
     let mut stats = tauri::async_runtime::spawn_blocking(move || {
         cache_read
@@ -225,6 +310,7 @@ async fn coordinate(
     stats.revision = 0;
     stats.refreshing = false;
     let mut worker: Option<tauri::async_runtime::JoinHandle<()>> = None;
+    let mut increase_retry = IncreaseRetry::default();
     let mut pending = true;
     let mut next = tokio::time::Instant::now();
     loop {
@@ -241,13 +327,56 @@ async fn coordinate(
             stats.refreshing = true;
             match client.clone() {
                 Ok(client) => {
+                    let cfg = store.get();
+                    let day = chrono::Utc::now().date_naive();
+                    let check_increase = if cfg.spend_increase.enabled
+                        && increase_retry.ready(tokio::time::Instant::now())
+                    {
+                        let notify = notify.clone();
+                        match tauri::async_runtime::spawn_blocking(move || {
+                            notify(cfg, NotificationRequest::IncreaseDue(day))
+                        })
+                        .await
+                        {
+                            Ok(Ok(due)) => due,
+                            result => {
+                                eprintln!("Détection de hausse indisponible : {result:?}");
+                                increase_retry.failed(tokio::time::Instant::now());
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     let commands = commands.clone();
                     let cycle = stats.cycle_id;
                     worker = Some(tauri::async_runtime::spawn(async move {
                         run_cycle(&client, |event| {
-                            let _ = commands.send(Command::Event(cycle, event));
+                            if !matches!(event, Event::Finished) {
+                                let _ = commands.send(Command::Event(cycle, event));
+                            }
                         })
                         .await;
+                        if check_increase {
+                            let (reply, response) = oneshot::channel();
+                            let result = if commands
+                                .send(Command::History(HistoryMode::Refresh, reply))
+                                .is_ok()
+                            {
+                                response
+                                    .await
+                                    .map_err(|_| Error::Closed.to_string())
+                                    .and_then(|r| r)
+                                    .and_then(|detail| {
+                                        crate::history::comparison(day, &detail.data)
+                                    })
+                            } else {
+                                Err(Error::Closed.to_string())
+                            };
+                            let _ =
+                                commands.send(Command::Event(cycle, Event::Increase(day, result)));
+                        }
+                        let _ = commands.send(Command::Event(cycle, Event::Finished));
                     }));
                 }
                 Err(error) => {
@@ -266,6 +395,93 @@ async fn coordinate(
             _ = tokio::time::sleep_until(next), if worker.is_none() => { client = connection(&store, &http); pending = true; continue; }
         };
         match command {
+            Command::History(mode, reply) => {
+                let now = chrono::Utc::now();
+                history.roll(now.date_naive());
+                if mode == HistoryMode::Cached {
+                    let _ = reply.send(Ok(Detail {
+                        generation: stats.generation,
+                        data: history.view(history_error.clone()),
+                    }));
+                    continue;
+                }
+                if let Some((start, _)) = &history_worker {
+                    history_force_followup |=
+                        mode == HistoryMode::Force && *start == now.date_naive();
+                    history_waiters.push(reply);
+                    continue;
+                }
+                if let Some(start) = history.range(now, mode) {
+                    match client.clone() {
+                        Ok(client) => {
+                            history_waiters.push(reply);
+                            let commands = commands.clone();
+                            let generation = stats.generation;
+                            history_worker = Some((
+                                start,
+                                tauri::async_runtime::spawn(async move {
+                                    let result = client
+                                        .fetch_history(now.date_naive(), start)
+                                        .await
+                                        .map(Box::new);
+                                    let _ = commands.send(Command::HistoryFetched(
+                                        generation, now, start, result,
+                                    ));
+                                }),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Ok(Detail {
+                                generation: stats.generation,
+                                data: history.view(Some(error)),
+                            }));
+                        }
+                    }
+                } else {
+                    let _ = reply.send(Ok(Detail {
+                        generation: stats.generation,
+                        data: history.view(history_error.clone()),
+                    }));
+                }
+            }
+            Command::HistoryFetched(generation, now, start, result) => {
+                if generation != stats.generation {
+                    continue;
+                }
+                history_worker = None;
+                match result {
+                    Ok(amounts) => {
+                        let previous = history.clone();
+                        history.merge(now, start, *amounts);
+                        history_error = None;
+                        if history != previous {
+                            if let Some(path) = history_path.clone() {
+                                let snapshot = history.clone();
+                                history_error = tauri::async_runtime::spawn_blocking(move || {
+                                    crate::persistence::write(&path, &snapshot)
+                                })
+                                .await
+                                .map_err(|_| "Sauvegarde de l'historique interrompue".to_string())
+                                .and_then(|r| r.map_err(|e| e.to_string()))
+                                .err();
+                            }
+                        }
+                    }
+                    Err(error) => history_error = Some(error),
+                }
+                history.roll(chrono::Utc::now().date_naive());
+                let followup = std::mem::take(&mut history_force_followup);
+                for reply in history_waiters.drain(..) {
+                    if followup {
+                        let _ = commands.send(Command::History(HistoryMode::Force, reply));
+                    } else {
+                        let _ = reply.send(Ok(Detail {
+                            generation: stats.generation,
+                            data: history.view(history_error.clone()),
+                        }));
+                    }
+                }
+            }
             Command::Settings(reply) => {
                 let _ = reply.send(Ok(store.view()));
             }
@@ -280,6 +496,13 @@ async fn coordinate(
                 }
             }
             Command::Save(input, reply) => {
+                if let Some((_, worker)) = history_worker.take() {
+                    worker.abort();
+                }
+                for waiter in history_waiters.drain(..) {
+                    let _ = waiter.send(Err(Error::Obsolete.to_string()));
+                }
+                history_force_followup = false;
                 if let Some(worker) = worker.take() {
                     worker.abort();
                 }
@@ -290,12 +513,24 @@ async fn coordinate(
                 stats.revision += 1;
                 snapshots.send_replace(stats.clone());
                 publish(&stats);
+                let previous = store.get();
                 let saved_store = store.clone();
                 let saved = tauri::async_runtime::spawn_blocking(move || saved_store.save(input))
                     .await
                     .map_err(|_| "La sauvegarde a été interrompue".to_string())
                     .and_then(|r| r);
+                if saved.is_ok()
+                    && (previous.source_id != store.get().source_id
+                        || previous.spend_increase != store.get().spend_increase)
+                {
+                    increase_retry = IncreaseRetry::default();
+                }
                 if matches!(saved, Ok(true)) {
+                    history = crate::history::History::empty(
+                        store.get().source_id,
+                        chrono::Utc::now().date_naive(),
+                    );
+                    history_error = None;
                     stats = Stats {
                         generation: stats.generation,
                         cycle_id: stats.cycle_id,
@@ -324,7 +559,33 @@ async fn coordinate(
                         budget_reset_at: key.budget_reset_at.clone(),
                         period_start: key.period_start.clone(),
                     };
-                    let _ = tauri::async_runtime::spawn_blocking(move || notify(cfg, key)).await;
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        notify(cfg, NotificationRequest::Budget(key))
+                    })
+                    .await;
+                }
+                if let Event::Increase(day, result) = &event {
+                    let result = match result {
+                        Ok(comparison) => {
+                            let notify = notify.clone();
+                            let cfg = store.get();
+                            let (day, comparison) = (*day, *comparison);
+                            tauri::async_runtime::spawn_blocking(move || {
+                                notify(cfg, NotificationRequest::Increase(day, comparison))
+                            })
+                            .await
+                            .map_err(|_| "Analyse hebdomadaire interrompue".to_string())
+                            .and_then(|r| r)
+                            .map(|_| ())
+                        }
+                        Err(error) => Err(error.clone()),
+                    };
+                    if let Err(error) = result {
+                        increase_retry.failed(tokio::time::Instant::now());
+                        stats.error = Some(format!("Détection de hausse : {error}"));
+                    } else {
+                        increase_retry = IncreaseRetry::default();
+                    }
                 }
                 if matches!(event, Event::Today(..)) {
                     stats.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
@@ -354,6 +615,9 @@ async fn coordinate(
     if let Some(worker) = worker {
         worker.abort();
     }
+    if let Some((_, worker)) = history_worker {
+        worker.abort();
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +643,38 @@ mod tests {
         calls: Arc<AtomicUsize>,
         cache: Option<PathBuf>,
     ) -> (Service, tokio::task::JoinHandle<()>) {
+        start_with_notify(
+            store,
+            cache,
+            Arc::new(move |_, request| {
+                if matches!(request, NotificationRequest::Budget(_)) {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(false)
+            }),
+        )
+    }
+
+    fn start_with_notify(
+        store: Arc<SettingsStore>,
+        cache: Option<PathBuf>,
+        notify: Notify,
+    ) -> (Service, tokio::task::JoinHandle<()>) {
+        start_with_storage(
+            store,
+            StoragePaths {
+                stats: cache,
+                ..Default::default()
+            },
+            notify,
+        )
+    }
+
+    fn start_with_storage(
+        store: Arc<SettingsStore>,
+        paths: StoragePaths,
+        notify: Notify,
+    ) -> (Service, tokio::task::JoinHandle<()>) {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (snapshots, updates) = watch::channel(Stats::default());
         let service = Service {
@@ -387,10 +683,8 @@ mod tests {
         };
         let task = tokio::spawn(coordinate(
             store,
-            cache,
-            Arc::new(move |_, _| {
-                calls.fetch_add(1, Ordering::SeqCst);
-            }),
+            paths,
+            notify,
             |_| {},
             commands,
             receiver,
@@ -413,6 +707,297 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn history_survives_restart_and_disk_failure_keeps_the_in_memory_snapshot() {
+        let server = MockServer::start();
+        let today = chrono::Utc::now().date_naive();
+        let first = (today - chrono::Duration::days(29)).to_string();
+        server.mock(|when, then| {
+            when.path("/spend/logs").query_param("start_date", first);
+            then.status(200)
+                .json_body(serde_json::json!([{ "startTime":today.to_string(), "spend":7.0 }]));
+        });
+        mocks(&server, 1.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let path = std::env::temp_dir().join(format!("history-{}.json", uuid::Uuid::new_v4()));
+        let paths = || StoragePaths {
+            stats: None,
+            history: Some(path.clone()),
+        };
+        let (service, task) =
+            start_with_storage(store.clone(), paths(), Arc::new(|_, _| Ok(false)));
+        let fresh = service.history(HistoryMode::Refresh).await.unwrap().data;
+        assert!(fresh.error.is_none());
+        assert!(path.is_file());
+        task.abort();
+        let (service, task) =
+            start_with_storage(store.clone(), paths(), Arc::new(|_, _| Ok(false)));
+        let cached = service.history(HistoryMode::Cached).await.unwrap().data;
+        assert_eq!(cached, fresh);
+        task.abort();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (service, task) = start_with_storage(store, paths(), Arc::new(|_, _| Ok(false)));
+        let unavailable = service.history(HistoryMode::Refresh).await.unwrap().data;
+        assert_eq!(unavailable.days[29].spend, Some(7.0));
+        assert!(unavailable.error.is_some());
+        assert_eq!(
+            service
+                .history(HistoryMode::Cached)
+                .await
+                .unwrap()
+                .data
+                .days,
+            unavailable.days
+        );
+        task.abort();
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn calendar_shares_inflight_requests_preserves_cache_on_failure_and_forces_corrections() {
+        let server = MockServer::start();
+        let today = chrono::Utc::now().date_naive();
+        let first = (today - chrono::Duration::days(29)).to_string();
+        let mut full = server.mock(|when, then| {
+            when.path("/spend/logs")
+                .query_param("start_date", first.clone());
+            then.status(200)
+                .delay(Duration::from_millis(30))
+                .json_body(serde_json::json!([
+                    {"startTime":today.to_string(),"spend":5.0}
+                ]));
+        });
+        server.mock(|when, then| {
+            when.path("/key/info");
+            then.status(200)
+                .json_body(serde_json::json!({"info":{"spend":1.0}}));
+        });
+        let mut fallback = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200).json_body(serde_json::json!([]));
+        });
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
+        finished(&service, 1).await;
+        assert!(service
+            .history(HistoryMode::Cached)
+            .await
+            .unwrap()
+            .data
+            .days
+            .iter()
+            .all(|d| d.spend.is_none()));
+        full.assert_hits(0);
+        let (a, b) = tokio::join!(
+            service.history(HistoryMode::Refresh),
+            service.history(HistoryMode::Refresh)
+        );
+        assert_eq!(a.unwrap().data.days[29].spend, Some(5.0));
+        assert_eq!(b.unwrap().data.days[29].spend, Some(5.0));
+        service.history(HistoryMode::Refresh).await.unwrap();
+        full.assert_hits(1);
+        full.delete();
+        fallback.delete();
+        let mut failed = server.mock(|when, then| {
+            when.path("/spend/logs")
+                .query_param("start_date", first.clone());
+            then.status(503);
+        });
+        let stale = service.history(HistoryMode::Force).await.unwrap().data;
+        assert_eq!(stale.days[29].spend, Some(5.0));
+        assert!(stale.error.unwrap().contains("503"));
+        failed.assert_hits(1);
+        failed.delete();
+        let corrected = server.mock(|when, then| {
+            when.path("/spend/logs").query_param("start_date", first);
+            then.status(200).json_body(serde_json::json!([
+                {"startTime":today.to_string(),"spend":2.0}
+            ]));
+        });
+        let result = service.history(HistoryMode::Force).await.unwrap().data;
+        assert_eq!(result.days[29].spend, Some(2.0));
+        assert!(result.error.is_none());
+        corrected.assert_hits(1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn saving_a_connection_cancels_history_waiters_and_rejects_old_results() {
+        let old = MockServer::start();
+        let new = MockServer::start();
+        mocks(&old, 1.0, 100);
+        mocks(&new, 2.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&old.base_url()));
+        store.save(preferences(&old, false)).unwrap();
+        let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
+        let previous = finished(&service, 1).await;
+        let (reply, response) = oneshot::channel();
+        service
+            .commands
+            .send(Command::History(HistoryMode::Refresh, reply))
+            .unwrap();
+        service.save(preferences(&new, false)).await.unwrap();
+        assert!(response.await.unwrap().is_err());
+        let now = chrono::Utc::now();
+        service
+            .commands
+            .send(Command::HistoryFetched(
+                previous.generation,
+                now,
+                now.date_naive() - chrono::Duration::days(29),
+                Ok(Box::new([Some(999.0); 30])),
+            ))
+            .unwrap();
+        let snapshot = service.history(HistoryMode::Cached).await.unwrap();
+        assert!(snapshot.data.days.iter().all(|d| d.spend.is_none()));
+        task.abort();
+    }
+
+    #[test]
+    fn increase_retry_waits_fifteen_minutes_without_sleeping() {
+        let now = tokio::time::Instant::now();
+        let mut retry = IncreaseRetry::default();
+        assert!(retry.ready(now));
+        retry.failed(now);
+        assert!(!retry.ready(now + Duration::from_secs(899)));
+        assert!(retry.ready(now + Duration::from_secs(900)));
+    }
+
+    fn preferences(server: &MockServer, enabled: bool) -> SettingsInput {
+        SettingsInput {
+            base_url: server.base_url(),
+            refresh_secs: 30,
+            notifications_enabled: true,
+            notify_info_percent: 50,
+            notify_critical_percent: 75,
+            spend_increase: shared::SpendIncreaseSettings {
+                enabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn history_is_disabled_or_checked_once_and_obsolete_events_are_ignored() {
+        let server = MockServer::start();
+        let date = chrono::Utc::now().date_naive();
+        let historical_start = (date - chrono::Duration::days(29)).to_string();
+        let history = server.mock(|when, then| {
+            when.path("/spend/logs")
+                .query_param("start_date", historical_start);
+            then.status(200).json_body(serde_json::json!([
+                {"startTime": (date - chrono::Duration::days(1)).to_string(), "spend": 10.0}
+            ]));
+        });
+        mocks(&server, 1.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(crate::increase::State::default()));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let state_for_notify = state.clone();
+        let sent_for_notify = sent.clone();
+        let (service, task) = start_with_notify(
+            store,
+            None,
+            Arc::new(move |cfg, request| {
+                let mut state = state_for_notify.lock().unwrap();
+                match request {
+                    NotificationRequest::Budget(_) => {}
+                    NotificationRequest::IncreaseDue(day) => {
+                        return Ok(state.due(day, cfg.spend_increase))
+                    }
+                    NotificationRequest::Increase(day, comparison) => {
+                        let (next, send) = state.evaluate(day, cfg.spend_increase, comparison);
+                        *state = next;
+                        if send {
+                            sent_for_notify.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Ok(false)
+            }),
+        );
+        let disabled = finished(&service, 1).await;
+        history.assert_hits(0);
+        service.save(preferences(&server, true)).await.unwrap();
+        let active = finished(&service, disabled.cycle_id + 2).await;
+        history.assert_hits(1);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        service.refresh_and_wait().await.unwrap();
+        let repeated = finished(&service, active.cycle_id + 1).await;
+        history.assert_hits(1);
+        // Un résultat ancien ne doit pas réarmer l'épisode en cours.
+        service
+            .commands
+            .send(Command::Event(
+                disabled.cycle_id,
+                Event::Increase(
+                    date,
+                    Ok(crate::increase::Comparison {
+                        recent: 0.0,
+                        reference: 0.0,
+                    }),
+                ),
+            ))
+            .unwrap();
+        service.refresh_and_wait().await.unwrap();
+        finished(&service, repeated.cycle_id + 1).await;
+        assert!(state.lock().unwrap().fired);
+        let mut changed = preferences(&server, true);
+        changed.spend_increase.min_usd = 4.0;
+        let previous_cycle = service.stats().cycle_id;
+        service.save(changed).await.unwrap();
+        finished(&service, previous_cycle + 2).await;
+        history.assert_hits(1); // Un nouveau seuil réutilise l'historique déjà synchronisé.
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_history_preserves_budget_updates_and_manual_refresh_respects_backoff() {
+        let server = MockServer::start();
+        let historical_start =
+            (chrono::Utc::now().date_naive() - chrono::Duration::days(29)).to_string();
+        let history = server.mock(|when, then| {
+            when.path("/spend/logs")
+                .query_param("start_date", historical_start);
+            then.status(503);
+        });
+        mocks(&server, 42.0, 0);
+        let budget_calls = Arc::new(AtomicUsize::new(0));
+        let calls = budget_calls.clone();
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        let (service, task) = start_with_notify(
+            store,
+            None,
+            Arc::new(move |_, request| {
+                match request {
+                    NotificationRequest::Budget(_) => {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    NotificationRequest::IncreaseDue(_) => return Ok(true),
+                    NotificationRequest::Increase(..) => {
+                        panic!("Une erreur réseau ne doit pas modifier l'épisode")
+                    }
+                }
+                Ok(false)
+            }),
+        );
+        let failed = finished(&service, 1).await;
+        assert_eq!(failed.period_spend, 42.0);
+        assert!(failed.error.unwrap().contains("503"));
+        history.assert_hits(1);
+        service.refresh_and_wait().await.unwrap();
+        finished(&service, failed.cycle_id + 1).await;
+        history.assert_hits(1);
+        assert_eq!(budget_calls.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn saved_connection_rejects_old_queued_results_and_old_tab_responses() {
         let old = MockServer::start();

@@ -13,12 +13,13 @@ Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it runni
 - **Spending in the menu bar**: the amount spent during the current budget period, updated every 30 seconds by default.
 - **Usage by model**: costs, today's tokens, and the split between input and output tokens.
 - **A budget gauge**: spending, budget limit, and reset date.
-- **The Week tab**: daily spending, a comparison with yesterday, and an end-of-period projection.
+- **The History tab**: a GitHub-style calendar of daily spending over the last 30 days, including today, with an offline cache. It also shows daily spending, a comparison with yesterday, and an end-of-period projection.
 - **The Activity tab**: requests, errors, cache hits, latency, and hourly activity, with a breakdown by model.
+- **Unusual spending alerts**: a daily rolling comparison of the last completed week against the previous two weeks, with configurable percentage and dollar thresholds.
 - **macOS notifications**: two configurable thresholds, set to 50% and 75% of the budget consumed by default.
 - **Update notifications**: checks public GitHub releases at startup and every 24 hours. Open the release from the notification or check manually in Settings.
 
-The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The Week and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
+The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The History and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
 
 ## Preview
 
@@ -41,9 +42,9 @@ Your spending at a glance, with the panel open to show costs and tokens by model
 
 Daily spending and a projection based on your current pace.
 
-> 📸 Screenshot coming soon: the Week tab.
+> 📸 Screenshot coming soon: the History tab.
 
-<!-- ![Week tab showing spending trends and the budget projection](assets/screenshots/semaine.png) -->
+<!-- ![History tab showing daily spending and the budget projection](assets/screenshots/semaine.png) -->
 
 ### Activity details
 
@@ -131,7 +132,7 @@ The application is generated at `target/release/bundle/macos/Ember.app`. Copy it
 
 ## Getting started
 
-The application interface is currently in French. The tab names used above correspond to **Consommation** (Usage), **Semaine** (Week), and **Activité** (Activity).
+The application interface is currently in French. The tab names used above correspond to **Consommation** (Usage), **Historique** (History), and **Activité** (Activity).
 
 1. Click the amount in the menu bar, then **⚙︎**.
 2. The endpoint is initially empty. Enter your LiteLLM instance URL, including any path prefix, such as `https://litellm.example.com/llm`.
@@ -147,6 +148,26 @@ After upgrading from a build with the previous application identity, enter your 
 Your API key is stored in the **macOS Keychain** and is never sent back to the interface. Preferences, the latest statistics, and alert state are stored locally in the application's data directory. The cache restores your latest figures as soon as the app starts.
 
 Alerts remember which thresholds have already been reported. They reset when a new budget period starts or when spending drops below the relevant threshold.
+
+### Daily spending calendar
+
+Open **Historique** for a GitHub-style calendar: weeks run left to right and Monday through Sunday run top to bottom. The 30-day rolling window includes today, which is marked **en cours**. All dates are UTC. Hover, focus with the keyboard, or select a square to read its date and cost.
+
+Purple intensity represents spending relative to the largest known amount in the visible window: a neutral square for zero and four levels for positive spending. Hatched squares mean unknown data, not zero. The total is marked incomplete while any day is unknown. Existing projections, yesterday comparisons and spending charts remain below the calendar.
+
+Ember loads a small, versioned `history.json` cache once and keeps at most 30 daily totals in memory. At first synchronization and on a new UTC day, it fetches all 30 days of LiteLLM summaries to incorporate corrections. Later visits update only today, at most once per minute; **Rafraîchir tout** requests the full window. No extra polling loop or detailed request logs are needed for the calendar. Network failures preserve the cached figures and show an error. Changing the endpoint or key clears the displayed history.
+
+This history is shared with unusual-spending detection, which still compares 21 completed days and ignores today. With those alerts disabled, calendar data is fetched only on demand. Days missing from a successful server response count as zero; server retention limits can still make an apparently complete window underestimate actual spending.
+
+### Unusual spending alerts
+
+In **Paramètres → Hausse inhabituelle des dépenses**, enable or disable this alert independently of budget notifications. It is enabled by default, including for existing installations, with two adjustable thresholds: **50% above normal** and **at least $3 extra**. Both conditions must hold. Your refresh interval is unchanged.
+
+Once per UTC day, Ember compares the spending of the **7 most recent completed days** with half the spending of the **14 preceding days**. The windows do not overlap and exclude today. For example, a $10 weekly reference and $16 spent in the recent week trigger an alert. When the reference is zero, only the minimum dollar increase applies.
+
+Ember uses LiteLLM's daily summaries immediately, independently of budget resets. This requires **21 days of complete server history**: missing days in a successful response count as zero, and LiteLLM's response does not establish its retention coverage. Truncated history can therefore underestimate the reference. This detects a weekly increase, not a runaway request loop in real time.
+
+Only one notification is sent per episode, including across restarts or disabling and re-enabling the option. A successful daily comparison below either threshold rearms the alert. Changing the thresholds triggers a new comparison without forgetting an already reported episode; changing the endpoint or key starts fresh. Network and notification failures are retried on the first refresh after 15 minutes, without rearming the alert. When the option is disabled, no background history request is made for these alerts; the calendar can still refresh on demand.
 
 ### Understanding the numbers
 

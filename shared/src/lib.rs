@@ -82,9 +82,45 @@ pub enum KeySource {
     Missing,
 }
 
+/// Préférences de détection hebdomadaire, indépendantes des alertes de budget.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpendIncreaseSettings {
+    #[serde(rename = "spend_increase_enabled")]
+    pub enabled: bool,
+    #[serde(rename = "spend_increase_percent")]
+    pub percent: u32,
+    #[serde(rename = "spend_increase_min_usd")]
+    pub min_usd: f64,
+}
+
+impl Default for SpendIncreaseSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            percent: 50,
+            min_usd: 3.0,
+        }
+    }
+}
+
+impl SpendIncreaseSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=1_000).contains(&self.percent) {
+            return Err("La hausse doit être comprise entre 1 et 1 000 %");
+        }
+        if !self.min_usd.is_finite() || !(0.01..=1_000_000.0).contains(&self.min_usd) {
+            return Err("Le surcoût minimum doit être compris entre 0,01 et 1 000 000 $");
+        }
+        Ok(())
+    }
+}
+
 /// Paramètres tels que vus par le front. La clé API n'y figure jamais.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SettingsView {
+    #[serde(default, flatten)]
+    pub spend_increase: SpendIncreaseSettings,
     pub base_url: String,
     pub refresh_secs: u32,
     pub key_source: KeySource,
@@ -98,6 +134,8 @@ pub struct SettingsView {
 /// Paramètres envoyés par le front à l'enregistrement.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SettingsInput {
+    #[serde(default, flatten)]
+    pub spend_increase: SpendIncreaseSettings,
     pub base_url: String,
     pub refresh_secs: u32,
     /// `None` ou vide : on conserve la clé actuelle.
@@ -237,4 +275,80 @@ mod tests {
 pub struct Detail<T> {
     pub generation: u64,
     pub data: T,
+}
+
+#[cfg(test)]
+mod increase_settings_tests {
+    use super::*;
+    #[test]
+    fn defaults_and_flat_serialization_remain_compatible() {
+        let old: SettingsInput = serde_json::from_str(r#"{"base_url":"https://x","refresh_secs":30,"api_key":null,"clear_key":false,"notifications_enabled":false,"notify_info_percent":50,"notify_critical_percent":75}"#).unwrap();
+        assert_eq!(old.spend_increase, SpendIncreaseSettings::default());
+        let mut input = old;
+        input.spend_increase = SpendIncreaseSettings {
+            enabled: false,
+            percent: 75,
+            min_usd: 4.5,
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["spend_increase_enabled"], false);
+        assert_eq!(value["spend_increase_percent"], 75);
+        assert_eq!(value["spend_increase_min_usd"], 4.5);
+        assert_eq!(
+            serde_json::from_value::<SettingsInput>(value).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_non_finite_preferences() {
+        for percent in [0, 1001] {
+            assert!(SpendIncreaseSettings {
+                percent,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for min_usd in [0.0, -1.0, 1_000_001.0, f64::NAN, f64::INFINITY] {
+            assert!(SpendIncreaseSettings {
+                min_usd,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for (percent, min_usd) in [(1, 0.01), (1000, 1_000_000.0)] {
+            assert!(SpendIncreaseSettings {
+                percent,
+                min_usd,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+    }
+}
+
+/// Mode de lecture de l'historique ; Force recalcule toute la fenêtre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryMode {
+    Cached,
+    Refresh,
+    Force,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoryDay {
+    pub date: String,
+    pub spend: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HistoryDetails {
+    pub days: Vec<HistoryDay>,
+    /// Lundi = 0 ; calculé côté backend sans dépendance calendrier dans le Wasm.
+    pub first_weekday: u8,
+    pub updated_at: Option<String>,
+    pub error: Option<String>,
 }

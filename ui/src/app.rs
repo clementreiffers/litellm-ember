@@ -54,7 +54,7 @@ fn budget_color(pct: f64) -> [u8; 3] {
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Usage,
-    Week,
+    History,
     Activity,
 }
 
@@ -105,6 +105,7 @@ pub fn App() -> impl IntoView {
     let tab = RwSignal::new(Tab::Usage);
     // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
     let week = RwSignal::new(Remote::<WeekDetails>::default());
+    let history = RwSignal::new(Remote::<shared::HistoryDetails>::default());
     let activity = RwSignal::new(Remote::<Activity>::default());
 
     let listener = StoredValue::new_local(None::<tauri::Listener>);
@@ -118,6 +119,7 @@ pub fn App() -> impl IntoView {
             if incoming.revision >= current.revision {
                 if incoming.generation != current.generation {
                     details::reset(week);
+                    details::reset(history);
                     details::reset(activity);
                 }
                 *current = incoming;
@@ -141,6 +143,7 @@ pub fn App() -> impl IntoView {
     let close_settings = Callback::new(move |_| {
         // L'endpoint ou la clé ont pu changer : les données à la demande sont à recharger.
         details::reset(week);
+        details::reset(history);
         details::reset(activity);
         show_settings.set(false);
     });
@@ -148,7 +151,7 @@ pub fn App() -> impl IntoView {
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week activity updates /> }>
+            fallback=move || view! { <Main stats show_settings tab week history activity updates /> }>
             <Settings on_close=close_settings updates />
         </Show>
       </div>
@@ -161,6 +164,7 @@ fn Main(
     show_settings: RwSignal<bool>,
     tab: RwSignal<Tab>,
     week: RwSignal<Remote<WeekDetails>>,
+    history: RwSignal<Remote<shared::HistoryDetails>>,
     activity: RwSignal<Remote<Activity>>,
     updates: RwSignal<shared::UpdateStatus>,
 ) -> impl IntoView {
@@ -169,7 +173,10 @@ fn Main(
     Effect::new(move |_| {
         generation.track();
         match tab.get() {
-            Tab::Week => details::load(week, tauri::get_week, generation),
+            Tab::History => {
+                details::load(week, tauri::get_week, generation);
+                details::load_history(history, generation, shared::HistoryMode::Refresh);
+            }
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
             Tab::Usage => {}
         }
@@ -190,7 +197,10 @@ fn Main(
             details::invalidate(week);
             details::invalidate(activity);
             match tab.get_untracked() {
-                Tab::Week => details::load(week, tauri::get_week, generation),
+                Tab::History => {
+                    details::load(week, tauri::get_week, generation);
+                    details::load_history(history, generation, shared::HistoryMode::Force);
+                }
                 Tab::Activity => details::load(activity, tauri::get_activity, generation),
                 Tab::Usage => {}
             }
@@ -231,13 +241,13 @@ fn Main(
 
         <nav class="tabs">
             {tab_button(Tab::Usage, "Consommation")}
-            {tab_button(Tab::Week, "Semaine")}
+            {tab_button(Tab::History, "Historique")}
             {tab_button(Tab::Activity, "Activité")}
         </nav>
 
         {move || match tab.get() {
             Tab::Usage => view! { <UsageTab stats /> }.into_any(),
-            Tab::Week => view! { <WeekTab week max_budget /> }.into_any(),
+            Tab::History => view! { <crate::history::HistoryCalendar history /><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
     }

@@ -1,3 +1,5 @@
+mod history;
+mod increase;
 mod litellm;
 mod notify;
 mod persistence;
