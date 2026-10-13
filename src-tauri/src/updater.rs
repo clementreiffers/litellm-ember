@@ -6,17 +6,25 @@ use serde::{Deserialize, Serialize};
 use shared::{UpdatePhase, UpdateStatus};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{watch, Mutex};
 
 const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const NOTICE_ID: i32 = 100_001;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Vérification de mise à jour impossible : {0}")]
     Check(String),
+    #[error("Mise à jour impossible : {0}")]
+    Install(String),
+    #[error("Redémarrage impossible : {0}")]
+    Restart(String),
 }
+
+type Progress = Arc<dyn Fn(UpdatePhase, u64, Option<u64>) + Send + Sync>;
 
 type Publish = Arc<dyn Fn(&UpdateStatus) + Send + Sync>;
 
@@ -26,6 +34,12 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn version(release: &Self::Release) -> &str;
     fn check(&self) -> impl Future<Output = Result<Option<Self::Release>, Error>> + Send;
     fn notify(&self, version: &str) -> Result<(), String>;
+    fn install(
+        &self,
+        release: Self::Release,
+        progress: Progress,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+    fn restart(&self) -> Result<(), Error>;
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -34,18 +48,19 @@ struct Notices {
     versions: BTreeSet<String>,
 }
 
-struct Inner<B> {
+struct Inner<B: Backend> {
     backend: B,
     operation: Mutex<()>,
     notices: Mutex<Notices>,
+    release: Mutex<Option<B::Release>>,
     path: Option<PathBuf>,
     state: watch::Sender<UpdateStatus>,
     publish: Publish,
 }
 
-pub(crate) struct Service<B = TauriBackend>(Arc<Inner<B>>);
+pub(crate) struct Service<B: Backend = TauriBackend>(Arc<Inner<B>>);
 
-impl<B> Clone for Service<B> {
+impl<B: Backend> Clone for Service<B> {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
@@ -61,6 +76,7 @@ impl<B: Backend> Service<B> {
             backend,
             operation: Mutex::new(()),
             notices: Mutex::new(Notices::default()),
+            release: Mutex::new(None),
             path,
             state,
             publish,
@@ -82,6 +98,7 @@ impl<B: Backend> Service<B> {
     fn failed(&self, error: &Error) {
         eprintln!("{error}");
         self.change(|s| {
+            s.failed_phase = Some(s.phase);
             s.phase = UpdatePhase::Failed;
             s.error = Some(error.to_string());
         });
@@ -138,13 +155,23 @@ impl<B: Backend> Service<B> {
         let Ok(_operation) = self.0.operation.try_lock() else {
             return Ok(self.status());
         };
+        if matches!(
+            self.status().phase,
+            UpdatePhase::ReadyToRestart | UpdatePhase::Restarting
+        ) {
+            return Ok(self.status());
+        }
         self.change(|s| {
+            s.failed_phase = None;
+            s.downloaded_bytes = 0;
+            s.total_bytes = None;
             s.phase = UpdatePhase::Checking;
             s.error = None;
         });
         match self.0.backend.check().await {
             Ok(release) => {
                 let version = release.as_ref().map(|r| B::version(r).to_owned());
+                *self.0.release.lock().await = release;
                 self.change(|s| {
                     s.phase = if version.is_some() {
                         UpdatePhase::Available
@@ -167,6 +194,100 @@ impl<B: Backend> Service<B> {
         }
     }
 
+    pub async fn install(&self, expected_version: &str) -> Result<UpdateStatus, Error> {
+        let Ok(_operation) = self.0.operation.try_lock() else {
+            return Ok(self.status());
+        };
+        let status = self.status();
+        if matches!(
+            status.phase,
+            UpdatePhase::ReadyToRestart | UpdatePhase::Restarting
+        ) {
+            return Ok(status);
+        }
+        if status.available_version.as_deref() != Some(expected_version) {
+            return Err(Error::Install(
+                "La version proposée a changé. Vérifiez les mises à jour.".into(),
+            ));
+        }
+        self.change(|s| {
+            s.phase = UpdatePhase::Downloading;
+            s.error = None;
+            s.failed_phase = None;
+            s.downloaded_bytes = 0;
+            s.total_bytes = None;
+        });
+        let result = async {
+            // Le descripteur reste privé. Après un échec, revérifier le manifeste avant de réessayer.
+            let release = match self.0.release.lock().await.take() {
+                Some(release) => Some(release),
+                None => self.0.backend.check().await?,
+            };
+            let release = release.ok_or_else(|| {
+                Error::Install(
+                    "Cette mise à jour n’est plus disponible. Vérifiez à nouveau.".into(),
+                )
+            })?;
+            if B::version(&release) != expected_version {
+                return Err(Error::Install(
+                    "La version proposée a changé. Vérifiez à nouveau.".into(),
+                ));
+            }
+            let service = self.clone();
+            self.0
+                .backend
+                .install(
+                    release,
+                    Arc::new(move |phase, bytes, total| {
+                        service.change(|s| {
+                            s.phase = phase;
+                            if phase != UpdatePhase::Verifying {
+                                s.downloaded_bytes = bytes;
+                                s.total_bytes = total;
+                            }
+                        });
+                    }),
+                )
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.change(|s| s.phase = UpdatePhase::ReadyToRestart);
+                Ok(self.status())
+            }
+            Err(error) => {
+                self.failed(&error);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn restart(&self) -> Result<(), Error> {
+        let _operation = self
+            .0
+            .operation
+            .try_lock()
+            .map_err(|_| Error::Restart("Une opération est encore en cours.".into()))?;
+        if self.status().phase != UpdatePhase::ReadyToRestart {
+            return Err(Error::Restart(
+                "Aucune mise à jour installée en attente.".into(),
+            ));
+        }
+        self.change(|s| {
+            s.phase = UpdatePhase::Restarting;
+            s.error = None;
+        });
+        if let Err(error) = self.0.backend.restart() {
+            self.change(|s| {
+                s.phase = UpdatePhase::ReadyToRestart;
+                s.error = Some(error.to_string());
+            });
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn poll(&self) {
         let mut interval = tokio::time::interval(INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -179,56 +300,11 @@ impl<B: Backend> Service<B> {
 
 pub(crate) struct TauriBackend {
     app: AppHandle,
-    client: reqwest::Client,
 }
 
 /// Comparaison de la version embarquée, et non de CARGO_PKG_VERSION (non modifiée en CI).
 fn newer_stable(current: &semver::Version, remote: &semver::Version) -> bool {
     remote.pre.is_empty() && remote.cmp_precedence(current).is_gt()
-}
-
-const ENDPOINT: &str = "https://api.github.com/repos/clementreiffers/litellm-ember/releases/latest";
-
-#[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-}
-
-async fn check_release(
-    client: &reqwest::Client,
-    endpoint: &str,
-    current: &semver::Version,
-) -> Result<Option<String>, Error> {
-    let result = async {
-        let response = client
-            .get(endpoint)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let release: Release = response.error_for_status()?.json().await?;
-        Ok::<_, reqwest::Error>(Some(release))
-    }
-    .await
-    .map_err(|e| Error::Check(e.to_string()))?;
-    let Some(release) = result else {
-        return Ok(None);
-    };
-    if release.draft || release.prerelease {
-        return Ok(None);
-    }
-    let version = semver::Version::parse(
-        release
-            .tag_name
-            .strip_prefix('v')
-            .unwrap_or(&release.tag_name),
-    )
-    .map_err(|e| Error::Check(e.to_string()))?;
-    Ok(newer_stable(current, &version).then_some(release.tag_name))
 }
 
 fn release_url(version: &str) -> Result<String, String> {
@@ -256,13 +332,56 @@ pub async fn open_release(version: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
+fn configured_updater(
+    builder: tauri_plugin_updater::UpdaterBuilder,
+) -> Result<tauri_plugin_updater::Updater, Error> {
+    builder
+        .version_comparator(|current, remote| newer_stable(&current, &remote.version))
+        .timeout(CHECK_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Check(e.to_string()))
+}
+
 impl Backend for TauriBackend {
-    type Release = String;
-    fn version(release: &String) -> &str {
-        release
+    type Release = Update;
+    fn version(release: &Update) -> &str {
+        &release.version
     }
-    async fn check(&self) -> Result<Option<String>, Error> {
-        check_release(&self.client, ENDPOINT, &self.app.package_info().version).await
+    async fn check(&self) -> Result<Option<Update>, Error> {
+        let updater = configured_updater(self.app.updater_builder())?;
+        updater
+            .check()
+            .await
+            .map_err(|e| Error::Check(e.to_string()))
+    }
+    async fn install(&self, mut release: Update, progress: Progress) -> Result<(), Error> {
+        let executable = tauri::process::current_binary(&self.app.env())
+            .map_err(|e| Error::Install(e.to_string()))?;
+        validate_install_path(&executable)?;
+        release.timeout = Some(DOWNLOAD_TIMEOUT);
+        let mut downloaded = 0;
+        let mut total_bytes = None;
+        let verifying = progress.clone();
+        let bytes = release
+            .download(
+                |count, total| {
+                    downloaded += count as u64;
+                    total_bytes = total;
+                    progress(UpdatePhase::Downloading, downloaded, total);
+                },
+                || verifying(UpdatePhase::Verifying, 0, None),
+            )
+            .await
+            .map_err(|e| Error::Install(e.to_string()))?;
+        progress(UpdatePhase::Installing, downloaded, total_bytes);
+        tauri::async_runtime::spawn_blocking(move || release.install(bytes))
+            .await
+            .map_err(|e| Error::Install(e.to_string()))?
+            .map_err(|e| Error::Install(e.to_string()))
+    }
+    fn restart(&self) -> Result<(), Error> {
+        self.app.request_restart();
+        Ok(())
     }
     fn notify(&self, version: &str) -> Result<(), String> {
         self.app
@@ -270,12 +389,31 @@ impl Backend for TauriBackend {
             .builder()
             .id(NOTICE_ID)
             .title(format!("🔥 Ember {version} est disponible"))
-            .body("Cliquez pour télécharger la mise à jour sur GitHub.")
+            .body("Ouvrez Ember pour installer la mise à jour.")
             .extra("kind", "ember-update")
             .extra("version", version)
             .show()
             .map_err(|e| e.to_string())
     }
+}
+
+/// Ne pas remplacer une copie transloquée ou montée depuis le disque d’installation.
+fn validate_install_path(executable: &std::path::Path) -> Result<(), Error> {
+    let bundle = executable
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
+    if executable
+        .components()
+        .any(|c| c.as_os_str() == "AppTranslocation")
+        || executable.starts_with("/Volumes")
+        || bundle.is_none_or(|p| p.extension().is_none_or(|e| e != "app"))
+    {
+        return Err(Error::Install(
+            "Déplacez Ember dans Applications, puis relancez-la avant la mise à jour.".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn clicked_version(action: &tauri_plugin_notification::ActionPerformed) -> Option<&str> {
@@ -293,13 +431,7 @@ fn clicked_version(action: &tauri_plugin_notification::ActionPerformed) -> Optio
 pub fn start(app: &AppHandle, path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.clone();
     let service = Service::new(
-        TauriBackend {
-            app: app.clone(),
-            client: reqwest::Client::builder()
-                .user_agent("Ember")
-                .timeout(CHECK_TIMEOUT)
-                .build()?,
-        },
+        TauriBackend { app: app.clone() },
         // Tauri utilise la version GitHub injectée par semantic-release ; sans
         // surcharge de release, l'absence de config.version active le repli Cargo.
         app.package_info().version.to_string(),
@@ -311,15 +443,12 @@ pub fn start(app: &AppHandle, path: Option<PathBuf>) -> Result<(), Box<dyn std::
     app.manage(service.clone());
     let handle = app.clone();
     app.notification().on_action(move |action| {
-        let Some(version) = clicked_version(action).map(str::to_owned) else {
+        let Some(_) = clicked_version(action) else {
             return;
         };
         let app = handle.clone();
         tauri::async_runtime::spawn(async move {
             crate::tray::show_updates(&app);
-            if let Err(error) = open_release(&version).await {
-                app.state::<Service>().change(|s| s.error = Some(error));
-            }
         });
     })?;
     tauri::async_runtime::spawn(async move {
@@ -341,6 +470,11 @@ mod tests {
     #[derive(Default)]
     struct Effects {
         checks: AtomicUsize,
+        installs: AtomicUsize,
+        restarts: AtomicUsize,
+        fail_install: AtomicBool,
+        hold_install: AtomicBool,
+        fail_restart: AtomicBool,
         notifications: AtomicUsize,
         fail_check: AtomicBool,
         fail_notify: AtomicBool,
@@ -363,6 +497,27 @@ mod tests {
                 return Err(Error::Check("offline".into()));
             }
             Ok(Some("2.0.0".into()))
+        }
+        async fn install(&self, _: String, progress: Progress) -> Result<(), Error> {
+            self.0.installs.fetch_add(1, Ordering::SeqCst);
+            progress(UpdatePhase::Downloading, 50, Some(100));
+            if self.0.hold_install.load(Ordering::SeqCst) {
+                self.0.released.notified().await;
+            }
+            progress(UpdatePhase::Verifying, 0, None);
+            if self.0.fail_install.load(Ordering::SeqCst) {
+                return Err(Error::Install("signature invalide".into()));
+            }
+            progress(UpdatePhase::Installing, 100, Some(100));
+            Ok(())
+        }
+        fn restart(&self) -> Result<(), Error> {
+            self.0.restarts.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail_restart.load(Ordering::SeqCst) {
+                Err(Error::Restart("refus".into()))
+            } else {
+                Ok(())
+            }
         }
         fn notify(&self, _: &str) -> Result<(), String> {
             self.0.notifications.fetch_add(1, Ordering::SeqCst);
@@ -393,6 +548,99 @@ mod tests {
             .wait_for(|s| s.phase == phase)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installation_is_exclusive_and_ready_state_survives_checks() {
+        let (service, effects) = service(None);
+        assert!(service.restart().await.is_err());
+        assert!(service.install("2.0.0").await.is_err());
+        service.check(false).await.unwrap();
+        assert!(service.install("3.0.0").await.is_err());
+        effects.hold_install.store(true, Ordering::SeqCst);
+        let other = service.clone();
+        let task = tokio::spawn(async move { other.install("2.0.0").await });
+        wait_phase(&service, UpdatePhase::Downloading).await;
+        assert_eq!(service.status().downloaded_bytes, 50);
+        assert!(service.restart().await.is_err());
+        assert_eq!(
+            service.check(false).await.unwrap().phase,
+            UpdatePhase::Downloading
+        );
+        assert_eq!(
+            service.install("2.0.0").await.unwrap().phase,
+            UpdatePhase::Downloading
+        );
+        effects.released.notify_one();
+        assert_eq!(
+            task.await.unwrap().unwrap().phase,
+            UpdatePhase::ReadyToRestart
+        );
+        assert_eq!(
+            service.check(true).await.unwrap().phase,
+            UpdatePhase::ReadyToRestart
+        );
+        assert_eq!(
+            service.install("2.0.0").await.unwrap().phase,
+            UpdatePhase::ReadyToRestart
+        );
+        assert_eq!(effects.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.installs.load(Ordering::SeqCst), 1);
+        effects.fail_restart.store(true, Ordering::SeqCst);
+        assert!(service.restart().await.is_err());
+        assert_eq!(service.status().phase, UpdatePhase::ReadyToRestart);
+        effects.fail_restart.store(false, Ordering::SeqCst);
+        service.restart().await.unwrap();
+        assert_eq!(service.status().phase, UpdatePhase::Restarting);
+    }
+
+    #[tokio::test]
+    async fn failed_verification_keeps_version_and_can_be_retried() {
+        let (service, effects) = service(None);
+        service.check(false).await.unwrap();
+        effects.fail_install.store(true, Ordering::SeqCst);
+        assert!(service.install("2.0.0").await.is_err());
+        let status = service.status();
+        assert_eq!(status.phase, UpdatePhase::Failed);
+        assert_eq!(status.failed_phase, Some(UpdatePhase::Verifying));
+        assert_eq!(status.available_version.as_deref(), Some("2.0.0"));
+        assert!(service.restart().await.is_err());
+        effects.fail_install.store(false, Ordering::SeqCst);
+        assert_eq!(
+            service.install("2.0.0").await.unwrap().phase,
+            UpdatePhase::ReadyToRestart
+        );
+        assert_eq!(effects.checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn installation_requires_an_installed_bundle() {
+        for path in [
+            "/Volumes/Ember/Ember.app/Contents/MacOS/ember",
+            "/private/var/AppTranslocation/id/d/Ember.app/Contents/MacOS/ember",
+            "/tmp/ember",
+        ] {
+            assert!(validate_install_path(std::path::Path::new(path)).is_err());
+        }
+        assert!(validate_install_path(std::path::Path::new(
+            "/Applications/Ember.app/Contents/MacOS/ember"
+        ))
+        .is_ok());
+        assert!(validate_install_path(std::path::Path::new(
+            "/Users/test/Applications/Ember.app/Contents/MacOS/ember"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn release_links_only_open_our_version_tags() {
+        assert_eq!(
+            release_url("1.2.3").unwrap(),
+            "https://github.com/clementreiffers/litellm-ember/releases/tag/1.2.3"
+        );
+        for invalid in ["https://example.com", "../../other", "1.2.3?redirect=bad"] {
+            assert!(release_url(invalid).is_err());
+        }
     }
 
     #[test]
@@ -494,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn only_update_notification_taps_open_the_release() {
+    fn only_update_notification_taps_open_the_panel() {
         let payload = |id, kind: &str, action| {
             serde_json::from_value(serde_json::json!({
             "actionId": action, "notification": { "id": id, "extra": { "kind": kind, "version": "2.0.0" } }
@@ -514,91 +762,110 @@ mod tests {
 }
 
 #[cfg(test)]
-mod github_tests {
+mod manifest_tests {
     use super::*;
     use httpmock::prelude::*;
 
-    #[tokio::test]
-    async fn public_checks_handle_versions_missing_releases_and_http_errors() {
-        let client = reqwest::Client::builder()
-            .user_agent("Ember")
-            .timeout(CHECK_TIMEOUT)
-            .build()
+    const KEY: &str = include_str!("../test-data/updater/public-key.txt");
+    const SIGNATURE: &str = include_str!("../test-data/updater/payload.txt.sig");
+    const PAYLOAD: &[u8] = include_bytes!("../test-data/updater/payload.txt");
+
+    fn updater(server: &MockServer, target: &str) -> tauri_plugin_updater::Updater {
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.package_info_mut().version = "1.9.0".parse().unwrap();
+        context.config_mut().plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({
+                "pubkey": KEY.trim(), "requireSignedVersion": true,
+                "dangerousInsecureTransportProtocol": true,
+                "endpoints": [format!("{}/latest.json", server.base_url())]
+            }),
+        );
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .build(context)
             .unwrap();
-        for (tag, draft, prerelease, code, expected) in [
-            ("1.10.0", false, false, 200, "available"),
-            ("v2.0.0", false, false, 200, "available"),
-            ("1.9.0", false, false, 200, "none"),
-            ("1.8.0", false, false, 200, "none"),
-            ("2.0.0-beta.1", false, false, 200, "none"),
-            ("2.0.0", true, false, 200, "none"),
-            ("2.0.0", false, true, 200, "none"),
-            ("invalid", false, false, 200, "error"),
-            ("", false, false, 404, "none"),
-            ("", false, false, 403, "error"),
-            ("", false, false, 429, "error"),
-            ("", false, false, 503, "error"),
-        ] {
-            let server = MockServer::start();
-            let request = server.mock(|when, then| {
-                when.path("/latest")
-                    .header("user-agent", "Ember")
-                    .matches(|request| {
+        configured_updater(app.updater_builder().target(target)).unwrap()
+    }
+
+    fn manifest(server: &MockServer, version: &str) -> serde_json::Value {
+        let platform = serde_json::json!({
+            "url": format!("{}/update", server.base_url()), "signature": SIGNATURE.trim()
+        });
+        serde_json::json!({"version": version, "platforms": {
+            "darwin-aarch64": platform, "darwin-x86_64": platform
+        }})
+    }
+
+    #[tokio::test]
+    async fn manifest_checks_only_offer_newer_stable_versions_on_both_architectures() {
+        for target in ["darwin-aarch64", "darwin-x86_64"] {
+            for (version, available) in [
+                ("1.10.0", true),
+                ("1.9.0", false),
+                ("1.8.0", false),
+                ("2.0.0-beta.1", false),
+            ] {
+                let server = MockServer::start();
+                let request = server.mock(|when, then| {
+                    when.path("/latest.json").matches(|request| {
                         !request.headers.as_ref().is_some_and(|headers| {
                             headers
                                 .iter()
                                 .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
                         })
                     });
-                then.status(code).json_body(
-                    serde_json::json!({"tag_name": tag, "draft": draft, "prerelease": prerelease}),
+                    then.json_body(manifest(&server, version));
+                });
+                assert_eq!(
+                    updater(&server, target).check().await.unwrap().is_some(),
+                    available
                 );
-            });
-            let result = check_release(
-                &client,
-                &format!("{}/latest", server.base_url()),
-                &"1.9.0".parse().unwrap(),
-            )
-            .await;
-            match expected {
-                "available" => assert_eq!(result.unwrap().as_deref(), Some(tag)),
-                "none" => assert!(result.unwrap().is_none()),
-                _ => assert!(result.is_err()),
+                request.assert_hits(1);
             }
-            request.assert_hits(1);
         }
     }
 
     #[tokio::test]
-    async fn invalid_json_and_stalled_requests_fail() {
-        for delay in [0, 200] {
+    async fn missing_manifest_http_errors_and_invalid_json_are_not_up_to_date() {
+        for status in [404, 403, 429, 503, 200] {
             let server = MockServer::start();
             server.mock(|when, then| {
-                when.path("/latest");
-                then.delay(Duration::from_millis(delay)).body("invalid");
+                when.path("/latest.json");
+                then.status(status).body("invalid");
             });
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(20))
-                .build()
-                .unwrap();
-            assert!(check_release(
-                &client,
-                &format!("{}/latest", server.base_url()),
-                &"1.0.0".parse().unwrap()
-            )
-            .await
-            .is_err());
+            assert!(updater(&server, "darwin-aarch64").check().await.is_err());
         }
     }
 
-    #[test]
-    fn release_links_only_open_version_tags_on_our_repository() {
-        assert_eq!(
-            release_url("v1.2.3").unwrap(),
-            "https://github.com/clementreiffers/litellm-ember/releases/tag/v1.2.3"
-        );
-        for invalid in ["https://example.com", "../../other", "1.2.3?redirect=bad"] {
-            assert!(release_url(invalid).is_err());
+    #[tokio::test]
+    async fn download_accepts_cli_signature_and_rejects_corruption_and_version_substitution() {
+        for (version, bytes, valid) in [
+            ("2.0.0", PAYLOAD, true),
+            ("2.0.0", &b"corrupt"[..], false),
+            ("3.0.0", PAYLOAD, false),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/latest.json");
+                then.json_body(manifest(&server, version));
+            });
+            server.mock(|when, then| {
+                when.path("/update");
+                then.body(bytes);
+            });
+            let release = updater(&server, "darwin-aarch64")
+                .check()
+                .await
+                .unwrap()
+                .unwrap();
+            let mut received = 0;
+            let result = release.download(|count, _| received += count, || {}).await;
+            assert_eq!(received, bytes.len());
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                assert_eq!(result.unwrap(), PAYLOAD);
+            }
         }
     }
 }

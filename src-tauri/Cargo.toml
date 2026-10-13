@@ -11,6 +11,7 @@ shared = { path = "../shared" }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2.6.0"
+tauri-plugin-updater = "2.13.3"
 semver = "1"
 tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }

@@ -28,5 +28,13 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Suivi du budget LiteLLM dans la menu bar"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/clementreiffers/litellm-ember/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

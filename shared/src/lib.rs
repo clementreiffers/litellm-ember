@@ -2,11 +2,15 @@ use serde::{Deserialize, Serialize};
 
 /// État non secret de la mise à jour ; les chemins et artefacts restent dans le backend.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UpdateStatus {
     pub revision: u64,
     pub current_version: String,
     pub available_version: Option<String>,
     pub phase: UpdatePhase,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub failed_phase: Option<UpdatePhase>,
     pub error: Option<String>,
 }
 
@@ -17,12 +21,24 @@ pub enum UpdatePhase {
     Checking,
     UpToDate,
     Available,
+    Downloading,
+    Verifying,
+    Installing,
+    ReadyToRestart,
+    Restarting,
     Failed,
 }
 
 impl UpdatePhase {
     pub fn busy(self) -> bool {
-        matches!(self, Self::Checking)
+        matches!(
+            self,
+            Self::Checking
+                | Self::Downloading
+                | Self::Verifying
+                | Self::Installing
+                | Self::Restarting
+        )
     }
 }
 
@@ -220,7 +236,7 @@ mod tests {
             available_version: Some("1.1.0".into()),
             phase: UpdatePhase::Checking,
             revision: 7,
-            error: None,
+            ..Default::default()
         };
         let back: UpdateStatus =
             serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
@@ -228,6 +244,19 @@ mod tests {
         assert!(back.phase.busy());
         assert!(!UpdatePhase::Failed.busy());
         assert!(!UpdatePhase::Available.busy());
+        assert!(!UpdatePhase::ReadyToRestart.busy());
+        for phase in [
+            UpdatePhase::Downloading,
+            UpdatePhase::Verifying,
+            UpdatePhase::Installing,
+            UpdatePhase::Restarting,
+        ] {
+            assert!(phase.busy());
+        }
+        let old: UpdateStatus =
+            serde_json::from_str(r#"{"current_version":"1.0.0","phase":"Available"}"#).unwrap();
+        assert_eq!(old.downloaded_bytes, 0);
+        assert_eq!(old.failed_phase, None);
     }
 
     #[test]

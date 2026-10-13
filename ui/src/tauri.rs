@@ -130,6 +130,25 @@ pub async fn open_update_release(expected_version: String) -> Result<(), String>
         })
 }
 
+pub async fn install_update(expected_version: String) -> Result<shared::UpdateStatus, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args {
+        expected_version: String,
+    }
+    let args =
+        serde_wasm_bindgen::to_value(&Args { expected_version }).map_err(|e| e.to_string())?;
+    let value = invoke_with("install_update", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Installation impossible".into())
+    })?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn restart_after_update() -> Result<(), String> {
+    invoke_as("restart_after_update").await
+}
+
 pub async fn on_event<T: serde::de::DeserializeOwned + 'static>(
     name: &str,
     on_update: impl Fn(T) + 'static,

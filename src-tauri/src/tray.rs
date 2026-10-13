@@ -36,6 +36,22 @@ async fn open_update_release(expected_version: String) -> Result<(), String> {
     updater::open_release(&expected_version).await
 }
 
+#[tauri::command]
+async fn install_update(
+    service: State<'_, updater::Service>,
+    expected_version: String,
+) -> Result<shared::UpdateStatus, String> {
+    service
+        .install(&expected_version)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn restart_after_update(service: State<'_, updater::Service>) -> Result<(), String> {
+    service.restart().await.map_err(|e| e.to_string())
+}
+
 /// Délai d'ouverture pendant lequel la perte de focus n'est pas prise en compte immédiatement.
 const GRACE: Duration = Duration::from_millis(600);
 
@@ -117,6 +133,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_stats,
             close_window,
@@ -129,7 +146,9 @@ pub fn run() {
             test_notification,
             get_update_status,
             check_for_updates,
-            open_update_release
+            open_update_release,
+            install_update,
+            restart_after_update
         ])
         .setup(move |app| {
             app.set_activation_policy(ActivationPolicy::Accessory);

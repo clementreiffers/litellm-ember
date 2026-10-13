@@ -17,7 +17,7 @@ Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it runni
 - **The Activity tab**: requests, errors, cache hits, latency, and hourly activity, with a breakdown by model.
 - **Unusual spending alerts**: a daily rolling comparison of the last completed week against the previous two weeks, with configurable percentage and dollar thresholds.
 - **macOS notifications**: two configurable thresholds, set to 50% and 75% of the budget consumed by default.
-- **Update notifications**: checks public GitHub releases at startup and every 24 hours. Open the release from the notification or check manually in Settings.
+- **Integrated updates**: checks at startup and every 24 hours. Install a signed update from Settings, then restart when ready.
 
 The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The History and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
 
@@ -67,8 +67,8 @@ Configure your endpoint, API key, refresh interval, and alert thresholds from th
 Ready-to-use macOS builds are available on [GitHub Releases](https://github.com/clementreiffers/litellm-ember/releases). Choose the version you want, or go directly to the [latest release](https://github.com/clementreiffers/litellm-ember/releases/latest).
 
 1. Open your chosen release and expand **Assets**.
-2. Download `Ember-X.Y.Z-macos-universal.zip`.
-3. Unzip it, move **Ember.app** to **Applications**, and launch it.
+2. Download `Ember-X.Y.Z-macos-universal.dmg`.
+3. Open the DMG, drag **Ember.app** to **Applications**, eject the DMG, and launch Ember from Applications.
 
 The same universal build works on both **Apple Silicon and Intel Macs**. No Rust installation or local build is required.
 
@@ -85,7 +85,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) for commits mer
 
 The highest required bump wins when multiple commits are pushed. Existing reachable `X.Y.Z` tags are used as the release baseline; without a previous release, the first releasable change creates `1.0.0`. Node.js 24 and `npm ci` install the release tooling; `npm test` verifies the versioning rules without publishing.
 
-These builds are not signed with an Apple Developer ID or notarized, so macOS may require approval in **System Settings → Privacy & Security** on first launch.
+Official releases use an Apple Developer ID signature and Apple notarization. macOS may display its normal first-open confirmation; removing `com.apple.quarantine` with `xattr` is not part of installation. Older unsigned releases retain their previous macOS restrictions.
 
 ### Updating Ember
 
@@ -97,17 +97,68 @@ Official builds check the latest stable GitHub release independently of your Lit
 connection. Ember sends one notification per available version, remembering it across
 restarts. Budget notification preferences do not disable update notifications.
 
-Click the notification or **Paramètres → Mises à jour → Voir la release GitHub**
-to open the release page. Download the universal ZIP, quit Ember, and replace the
-application. Settings, cached statistics, and the Keychain entry are preserved.
+Click the notification to open **Paramètres → Mises à jour**, then **Mettre à jour**.
+Ember downloads the universal update, verifies its signature, and installs the entire
+application bundle while the current process keeps running. Once **Redémarrer** appears,
+everything is installed: restarting needs no network connection. You can also quit and
+reopen Ember later. **Notes de version** opens GitHub without starting an installation.
+Settings, cached statistics, and the Keychain entry are preserved.
 
-Checks run at startup and every 24 hours while Ember is running, without a GitHub
-token or signing keys. Network errors and GitHub rate limits are shown in Settings;
-the app keeps working and retries on the next daily check or a manual check.
+Checks run at startup and every 24 hours independently of LiteLLM, without a GitHub token.
+Download, verification and installation errors are shown in Settings with a retry action.
+Only newer stable versions are offered. Installation from a mounted DMG or a translocated
+copy is refused: move Ember to Applications and launch that copy first. If installation
+requires administrator rights, macOS displays its authorization dialog; cancelling keeps
+the current application. No automatic quarantine removal is performed.
 
-Releases publish the universal macOS ZIP and SHA256SUMS.txt. Only the automatically
-provided GITHUB_TOKEN is needed in CI to publish releases. No Tauri updater keys
-or updater manifest are required.
+**Transition from older versions:** install the first release with this updater manually
+from its DMG, replacing the previous app after quitting it. Existing versions cannot
+install their own updater. Subsequent updates use the integrated flow. The transition
+from an unsigned app to Developer ID may require a one-time Keychain authorization;
+Ember does not delete or migrate the existing key.
+
+### Release signing setup (maintainers)
+
+A paid Apple Developer membership is required for official releases. Configure these
+GitHub Actions repository secrets before the first signed release:
+
+| Secret | Value |
+|---|---|
+| `APPLE_CERTIFICATE` | Base64-encoded `.p12` export of the Developer ID Application certificate **and its private key** |
+| `APPLE_CERTIFICATE_PASSWORD` | Password protecting the `.p12` |
+| `APPLE_SIGNING_IDENTITY` | Full `Developer ID Application: Name (TEAMID)` identity |
+| `APPLE_API_KEY` | App Store Connect team API key ID authorized for notarization |
+| `APPLE_API_ISSUER` | API key issuer ID |
+| `APPLE_API_PRIVATE_KEY` | Contents of the corresponding `.p8` file |
+| `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key generated below |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Nonempty password protecting that updater key |
+
+Generate the updater key once with `cargo tauri signer generate --write-keys /secure/path/ember.key`
+and choose a password. Store the generated private key securely outside the repository,
+with an offline backup. Set the repository **variable** `TAURI_SIGNING_PUBLIC_KEY` to the
+contents of `ember.key.pub` (already base64 encoded by Tauri). This public key is embedded
+in official builds. Keep the same updater key and Apple signing identity across releases;
+replacing the updater key without a transition would strand existing installations.
+
+The Apple certificate signs the application for macOS; the separate Tauri key authenticates
+updates. Neither private key is shipped in the app. Pull requests and local development
+need no signing secrets. Local builds have no updater trust key and cannot install official
+updates; use the signed release to exercise the full flow.
+
+The release job builds an Intel/Apple Silicon universal app, signs and notarizes it, and
+staples its ticket before producing the updater archive. It also notarizes and staples
+the DMG. Before publication it checks the signatures, Gatekeeper assessment, stapled tickets,
+universal architecture, embedded version, and updater signature against the public key.
+A missing secret or failed validation stops publication. A checksum alone is never used
+as proof of updater authenticity.
+
+Each release contains the DMG, `.app.tar.gz`, `.app.tar.gz.sig`, `latest.json`, and
+`SHA256SUMS.txt`. Both macOS architectures in the manifest point to the same universal
+archive at a version-specific URL. The archive and its signature are technical assets;
+users only download the DMG for initial installation. A temporarily missing manifest or
+asset during publication is reported as an error and can be retried.
+
+Before shipping the first signed release, follow [the macOS update validation checklist](docs/macos-updates.md).
 
 ## Build from source
 
