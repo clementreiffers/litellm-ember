@@ -49,6 +49,12 @@ struct SummaryCache {
 }
 
 impl Client {
+    pub async fn fetch_model_prices(&self) -> Result<serde_json::Value, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.get("/model/info"))
+            .await
+            .map_err(|_| "Tarifs indisponibles".to_owned())?
+            .map_err(Into::into)
+    }
     #[cfg(test)]
     pub fn new(base_url: &str, api_key: String) -> Result<Self, String> {
         Self::with_http(base_url, api_key, Self::http()?)

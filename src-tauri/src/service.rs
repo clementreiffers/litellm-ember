@@ -43,6 +43,8 @@ impl IncreaseRetry {
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 enum Command {
+    HarnessSettings(Reply<shared::HarnessSettings>),
+    SaveHarnessSettings(shared::HarnessSettings, Reply<shared::HarnessSettings>),
     Save(SettingsInput, Reply<SettingsView>),
     Settings(Reply<SettingsView>),
     History(HistoryMode, Reply<Detail<HistoryDetails>>),
@@ -209,6 +211,24 @@ impl Service {
             .send(command(reply))
             .map_err(|_| Error::Closed.to_string())?;
         result.await.map_err(|_| Error::Closed.to_string())?
+    }
+    pub async fn harness_settings(&self) -> Result<shared::HarnessSettings, String> {
+        self.request(Command::HarnessSettings).await
+    }
+    pub async fn save_harness_settings(
+        &self,
+        input: shared::HarnessSettings,
+    ) -> Result<shared::HarnessSettings, String> {
+        self.request(|r| Command::SaveHarnessSettings(input, r))
+            .await
+    }
+    pub async fn harness_prices(&self) -> Result<(u64, serde_json::Value), String> {
+        let (client, state) = self.request(Command::Context).await?;
+        let value = client.fetch_model_prices().await?;
+        if self.stats().generation != state.generation {
+            return Err(Error::Obsolete.to_string());
+        }
+        Ok((state.generation, value))
     }
     pub async fn settings(&self) -> Result<SettingsView, String> {
         self.request(Command::Settings).await
@@ -481,6 +501,18 @@ async fn coordinate(
                         }));
                     }
                 }
+            }
+            Command::HarnessSettings(reply) => {
+                let _ = reply.send(Ok(store.get().harnesses));
+            }
+            Command::SaveHarnessSettings(input, reply) => {
+                let cloned = store.clone();
+                let result =
+                    tauri::async_runtime::spawn_blocking(move || cloned.save_harnesses(input))
+                        .await
+                        .map_err(|_| "Sauvegarde interrompue".to_owned())
+                        .and_then(|r| r);
+                let _ = reply.send(result);
             }
             Command::Settings(reply) => {
                 let _ = reply.send(Ok(store.view()));

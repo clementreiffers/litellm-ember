@@ -24,10 +24,16 @@ impl Prepared {
             temporary,
             destination: path.to_owned(),
         };
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&prepared.temporary)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&prepared.temporary)?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
         file.write_all(&serde_json::to_vec_pretty(value)?)?;
         file.sync_all()?;
         Ok(prepared)

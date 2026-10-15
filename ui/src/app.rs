@@ -51,11 +51,20 @@ fn budget_color(pct: f64) -> [u8; 3] {
     std::array::from_fn(|i| (start[i] + (end[i] - start[i]) * progress).round() as u8)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Usage,
     History,
     Activity,
+    Agents,
+}
+
+fn tab_for_agents(tab: Tab, count: usize) -> Tab {
+    if tab == Tab::Agents && count == 0 {
+        Tab::Usage
+    } else {
+        tab
+    }
 }
 
 #[component]
@@ -103,6 +112,13 @@ pub fn App() -> impl IntoView {
         }
     });
     let tab = RwSignal::new(Tab::Usage);
+    let harnesses = crate::harness::subscribe();
+    Effect::new(move |_| {
+        let next = tab_for_agents(tab.get(), harnesses.with(|s| s.agents.len()));
+        if next != tab.get() {
+            tab.set(next);
+        }
+    });
     // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
     let week = RwSignal::new(Remote::<WeekDetails>::default());
     let history = RwSignal::new(Remote::<shared::HistoryDetails>::default());
@@ -151,8 +167,8 @@ pub fn App() -> impl IntoView {
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week history activity updates /> }>
-            <Settings on_close=close_settings updates />
+            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses /> }>
+            <Settings on_close=close_settings updates harnesses />
         </Show>
       </div>
     }
@@ -167,6 +183,7 @@ fn Main(
     history: RwSignal<Remote<shared::HistoryDetails>>,
     activity: RwSignal<Remote<Activity>>,
     updates: RwSignal<shared::UpdateStatus>,
+    harnesses: RwSignal<shared::HarnessSnapshot>,
 ) -> impl IntoView {
     let generation = Signal::from(Memo::new(move |_| stats.with(|s| s.generation)));
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
@@ -178,7 +195,7 @@ fn Main(
                 details::load_history(history, generation, shared::HistoryMode::Refresh);
             }
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
-            Tab::Usage => {}
+            Tab::Usage | Tab::Agents => {}
         }
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
@@ -202,7 +219,7 @@ fn Main(
                     details::load_history(history, generation, shared::HistoryMode::Force);
                 }
                 Tab::Activity => details::load(activity, tauri::get_activity, generation),
-                Tab::Usage => {}
+                Tab::Usage | Tab::Agents => {}
             }
         });
     };
@@ -243,9 +260,11 @@ fn Main(
             {tab_button(Tab::Usage, "Consommation")}
             {tab_button(Tab::History, "Historique")}
             {tab_button(Tab::Activity, "Activité")}
+            <Show when=move || harnesses.with(|s|!s.agents.is_empty())>{tab_button(Tab::Agents, "Agents")}</Show>
         </nav>
 
         {move || match tab.get() {
+            Tab::Agents => view! { <crate::harness::Agents snapshot=harnesses /> }.into_any(),
             Tab::Usage => view! { <UsageTab stats /> }.into_any(),
             Tab::History => view! { <crate::history::HistoryCalendar history /><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
@@ -287,7 +306,15 @@ fn BudgetBar(stats: RwSignal<Stats>) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::budget_color;
+    use super::{budget_color, tab_for_agents, Tab};
+
+    #[test]
+    fn finishing_last_agent_returns_to_usage_without_stealing_other_tabs() {
+        assert_eq!(tab_for_agents(Tab::Agents, 0), Tab::Usage);
+        assert_eq!(tab_for_agents(Tab::Agents, 1), Tab::Agents);
+        assert_eq!(tab_for_agents(Tab::History, 0), Tab::History);
+        assert_eq!(tab_for_agents(Tab::Usage, 2), Tab::Usage);
+    }
 
     #[test]
     fn budget_color_interpolates_through_green_orange_and_red() {

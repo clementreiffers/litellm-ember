@@ -13,6 +13,7 @@ const KEYCHAIN_ACCOUNT: &str = "litellm-api-key";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub harnesses: shared::HarnessSettings,
     #[serde(flatten)]
     pub spend_increase: shared::SpendIncreaseSettings,
     pub base_url: String,
@@ -26,6 +27,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            harnesses: Default::default(),
             spend_increase: Default::default(),
             base_url: String::new(),
             refresh_secs: DEFAULT_REFRESH_SECS,
@@ -199,6 +201,29 @@ impl SettingsStore {
             .expect("état des paramètres empoisonné")
             .clone()
     }
+    pub fn save_harnesses(
+        &self,
+        input: shared::HarnessSettings,
+    ) -> Result<shared::HarnessSettings, String> {
+        crate::harness::validate_settings(&input)?;
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| "Sauvegarde indisponible")?;
+        if self.path_unavailable {
+            return Err("Répertoire des paramètres inaccessible".into());
+        }
+        let mut next = self.get();
+        next.harnesses = input.clone();
+        if let Some(path) = &self.path {
+            crate::persistence::write(path, &next).map_err(|e| e.to_string())?;
+        }
+        *self
+            .settings
+            .lock()
+            .map_err(|_| "Paramètres indisponibles")? = next;
+        Ok(input)
+    }
     pub fn fault(&self) -> Option<String> {
         self.fault.lock().expect("état d'erreur empoisonné").clone()
     }
@@ -251,6 +276,7 @@ impl SettingsStore {
         let changed =
             previous.base_url != base_url || old_key != next_key || previous.source_id.is_empty();
         let new = Settings {
+            harnesses: previous.harnesses.clone(),
             spend_increase: input.spend_increase,
             base_url,
             refresh_secs: input.refresh_secs,
@@ -352,6 +378,22 @@ mod tests {
             notify_info_percent: 50,
             notify_critical_percent: 75,
         }
+    }
+
+    #[test]
+    fn harness_settings_work_without_endpoint_and_survive_connection_save() {
+        let path =
+            std::env::temp_dir().join(format!("ember-settings-{}.json", uuid::Uuid::new_v4()));
+        let store = SettingsStore::load_with(Some(path.clone()), Box::new(MemoryKeys::default()));
+        let mut config = shared::HarnessSettings::default();
+        config.codex.root = "/custom/codex".into();
+        store.save_harnesses(config.clone()).unwrap();
+        assert!(store.get().base_url.is_empty());
+        store.save(input("https://example.com", 30)).unwrap();
+        let loaded = SettingsStore::load_with(Some(path.clone()), Box::new(MemoryKeys::default()));
+        assert_eq!(loaded.get().harnesses, config);
+        assert_eq!(loaded.get().base_url, "https://example.com");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod app;
 mod chart;
 mod details;
+mod harness;
 mod history;
 mod settings;
 mod tauri;

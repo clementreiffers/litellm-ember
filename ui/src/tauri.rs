@@ -186,3 +186,44 @@ pub async fn get_history(
     })?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
+
+pub async fn get_harness_snapshot() -> Result<shared::HarnessSnapshot, String> {
+    invoke_as("get_harness_snapshot").await
+}
+pub async fn get_harness_settings() -> Result<shared::HarnessSettings, String> {
+    invoke_as("get_harness_settings").await
+}
+pub async fn save_harness_settings(
+    input: &shared::HarnessSettings,
+) -> Result<shared::HarnessSettings, String> {
+    #[derive(Serialize)]
+    struct Args<'a> {
+        input: &'a shared::HarnessSettings,
+    }
+    let args = Args { input }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| e.to_string())?;
+    let value = invoke_with("save_harness_settings", args)
+        .await
+        .map_err(|e| {
+            e.as_string()
+                .unwrap_or_else(|| "Sauvegarde impossible".into())
+        })?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+pub async fn save_opencode_password(value: Option<String>) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Args {
+        value: Option<String>,
+    }
+    let args = Args { value }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| e.to_string())?;
+    invoke_with("save_opencode_password", args)
+        .await
+        .map_err(|e| {
+            e.as_string()
+                .unwrap_or_else(|| "Trousseau indisponible".into())
+        })?;
+    Ok(())
+}

@@ -22,6 +22,48 @@ Ember puts your **LiteLLM spending right in the macOS menu bar**. Leave it runni
 
 The panel uses a dark theme with Liquid Glass on macOS 26 and native vibrancy on earlier versions. The History and Activity tabs load their data when opened and reuse it for 60 seconds. A refresh button lets you reload the data manually.
 
+## Local agents
+
+The **Agents** tab appears while a local Codex, Claude Code, or OpenCode task is
+running or waiting for your input. It disappears after the last task finishes,
+returning to Usage if selected. Merely opening a terminal or installing a harness
+does not show the tab. This feature works independently of your LiteLLM connection.
+
+Open **Paramètres → Harnais** to inspect detection and coverage or change a data
+folder. Codex and Claude Code are read passively from their local transcripts.
+Ember does not install hooks or modify their configuration. Previously installed
+Ember hooks remain supported.
+
+OpenCode uses the API of an existing local instance, discovered through its process.
+Both the original API and the v2 API are supported. For the local v2 service,
+Ember reads OpenCode's service metadata to authenticate automatically, keeping
+the password only in memory. Tabs belonging to an open OpenCode terminal remain
+visible while idle; saved tabs in other project directories are not imported.
+You can also specify a loopback HTTP address and store its password in the macOS
+Keychain through these settings (the username is `opencode`). Ember does not
+launch an OpenCode server. Remote sessions are not supported.
+
+Cards show the current prompt, agent hierarchy, model, tools, duration, observed
+skills and token usage when the harness exposes them. Reading a `SKILL.md` file
+is distinguished from explicitly invoking a skill. Unsupported or ambiguous
+activity is reported in Settings; it is not invented from file modification times.
+Ember keeps prompt text in memory only, never in its caches, logs, or network requests.
+
+Costs are **API equivalents**, not subscription charges or additions to LiteLLM
+spending. Unambiguous `/model/info` prices from your configured LiteLLM instance
+have priority over the dated bundled public catalogue. Input, output and cache
+usage are counted separately and responses are deduplicated. Unknown models stay
+unpriced; incomplete usage, truncated transcripts and standard rates that may have
+tiered variants are marked partial. Harness transcript formats can change: the
+current fixtures cover Codex 0.162, Claude Code 2.1 and OpenCode 1.x protocols.
+
+Normal tests use synthetic records and mock HTTP servers. An optional diagnostic
+reads local sessions without printing prompts:
+
+```sh
+cargo test -p ember live_local_discovery -- --ignored --nocapture
+```
+
 ## Preview
 
 <!--

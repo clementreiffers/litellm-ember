@@ -1,3 +1,4 @@
+mod harness;
 mod history;
 mod increase;
 mod litellm;
@@ -11,5 +12,8 @@ mod tray;
 mod updater;
 
 fn main() {
+    if harness::collect_if_requested() {
+        return;
+    }
     tray::run();
 }

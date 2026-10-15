@@ -13,8 +13,10 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2.6.0"
 tauri-plugin-updater = "2.13.3"
 semver = "1"
-tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread", "net", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls", "stream"] }
+futures-util = "0.3"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

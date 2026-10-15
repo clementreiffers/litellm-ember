@@ -24,6 +24,31 @@ use tauri_plugin_positioner::{Position, WindowExt};
 use crate::{notify, service::Service, updater};
 
 #[tauri::command]
+fn get_harness_snapshot(service: State<'_, crate::harness::Service>) -> shared::HarnessSnapshot {
+    service.snapshot()
+}
+#[tauri::command]
+async fn get_harness_settings(
+    service: State<'_, crate::harness::Service>,
+) -> Result<shared::HarnessSettings, String> {
+    service.settings().await
+}
+#[tauri::command]
+async fn save_harness_settings(
+    input: shared::HarnessSettings,
+    service: State<'_, crate::harness::Service>,
+) -> Result<shared::HarnessSettings, String> {
+    service.configure(input).await
+}
+#[tauri::command]
+async fn save_opencode_password(
+    value: Option<String>,
+    service: State<'_, crate::harness::Service>,
+) -> Result<(), String> {
+    service.password(value).await
+}
+
+#[tauri::command]
 fn get_update_status(service: State<'_, updater::Service>) -> shared::UpdateStatus {
     service.status()
 }
@@ -144,6 +169,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_stats,
+            get_harness_snapshot,
+            get_harness_settings,
+            save_harness_settings,
+            save_opencode_password,
             close_window,
             get_settings,
             save_settings,
@@ -210,6 +239,10 @@ pub fn run() {
                     let _ = handle.emit("stats-updated", snapshot);
                 },
             );
+            app.manage(crate::harness::Service::start(
+                app.handle().clone(),
+                service.clone(),
+            ));
             app.manage(service);
             updater::start(
                 app.handle(),
