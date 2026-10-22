@@ -7,7 +7,22 @@ use super::{
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use shared::{DailyCosts, ModelCost};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{Duration, Instant},
+};
+
+struct CachedCosts {
+    date: String,
+    request_id: u64,
+    fetched: Instant,
+    value: Option<DailyCosts>,
+}
+#[derive(Default)]
+pub(super) struct CostState {
+    sequence: u64,
+    entries: VecDeque<CachedCosts>,
+}
 
 impl Client {
     pub async fn fetch_day_costs(&self, date: &str, force: bool) -> Result<DailyCosts, String> {
@@ -32,7 +47,48 @@ impl Client {
                 });
             }
         }
-        self.fetch_day_costs_in_zone(day, &Local).await
+        let id = {
+            let mut state = self.costs.lock().await;
+            let ttl = Duration::from_secs(if day == Local::now().date_naive() {
+                60
+            } else {
+                900
+            });
+            if !force {
+                if let Some(index) = state.entries.iter().position(|entry| {
+                    entry.date == date && entry.value.is_some() && entry.fetched.elapsed() < ttl
+                }) {
+                    let entry = state.entries.remove(index).unwrap();
+                    let value = entry.value.clone().unwrap();
+                    state.entries.push_back(entry);
+                    return Ok(value);
+                }
+            }
+            state.sequence += 1;
+            let id = state.sequence;
+            state.entries.retain(|entry| entry.date != date);
+            state.entries.push_back(CachedCosts {
+                date: date.into(),
+                request_id: id,
+                fetched: Instant::now(),
+                value: None,
+            });
+            while state.entries.len() > 30 {
+                state.entries.pop_front();
+            }
+            id
+        };
+        let value = self.fetch_day_costs_in_zone(day, &Local).await?;
+        let mut state = self.costs.lock().await;
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.date == date && entry.request_id == id)
+        {
+            entry.value = Some(value.clone());
+            entry.fetched = Instant::now();
+        }
+        Ok(value)
     }
 
     async fn fetch_day_costs_in_zone(
@@ -146,6 +202,153 @@ mod tests {
     use chrono::{NaiveDate, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn daily_cost_preview_cache_expires_and_preserves_latest_forced_result() {
+        let server = MockServer::start();
+        let mut summary = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200).json_body(json!([]));
+        });
+        server.mock(|when,then| {
+            when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0,"total_is_capped":false}));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        client.fetch_day_costs("2024-02-29", false).await.unwrap();
+        client
+            .costs
+            .lock()
+            .await
+            .entries
+            .front_mut()
+            .unwrap()
+            .fetched -= std::time::Duration::from_secs(901);
+        client.fetch_day_costs("2024-02-29", false).await.unwrap();
+        summary.assert_hits(2);
+        summary.delete();
+        let mut old = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(250))
+                .json_body(json!([{ "startTime":"2024-02-29","spend":1,"models":{"m":1}}]));
+        });
+        let cloned = client.clone();
+        let pending = tokio::spawn(async move { cloned.fetch_day_costs("2024-02-29", true).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while old.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        old.delete();
+        let corrected = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{ "startTime":"2024-02-29","spend":2,"models":{"m":2}}]));
+        });
+        client.fetch_day_costs("2024-02-29", true).await.unwrap();
+        pending.await.unwrap().unwrap();
+        assert_eq!(
+            client
+                .fetch_day_costs("2024-02-29", false)
+                .await
+                .unwrap()
+                .models[0]
+                .spend,
+            2.0
+        );
+        corrected.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn daily_costs_dst_uses_distinct_midnight_offsets_and_rejects_missing_midnight() {
+        use super::super::tests::{d, ShiftZone};
+        for (day, before, after, first_start, last_start, first_end, last_end) in [
+            (
+                "2024-03-31",
+                3600,
+                7200,
+                "2024-03-30 23:00:00",
+                "2024-03-31 22:00:00",
+                "2024-03-31 00:00:00",
+                "2024-04-01 00:00:00",
+            ),
+            (
+                "2024-10-27",
+                7200,
+                3600,
+                "2024-10-26 22:00:00",
+                "2024-10-27 23:00:00",
+                "2024-10-27 00:00:00",
+                "2024-10-28 00:00:00",
+            ),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/spend/logs");
+                then.status(200)
+                    .json_body(json!([{ "startTime":day,"spend":10,"models":{"m":10}}]));
+            });
+            for (start, end, spend) in [(first_start, first_end, 3.0), (last_start, last_end, 1.0)]
+            {
+                server.mock(|when,then| {
+                    when.path("/spend/logs/v2").query_param("start_date",start).query_param("end_date",end);
+                    then.status(200).json_body(json!({"data":[{"request_id":"one","model":"m","spend":spend,"startTime":format!("{}Z",start.replace(' ',"T"))}],"total":1,"page":1,"page_size":1000,"total_pages":1,"total_is_capped":false}));
+                });
+            }
+            let zone = ShiftZone {
+                at: d(day).and_hms_opt(1, 0, 0).unwrap(),
+                before: chrono::FixedOffset::east_opt(before).unwrap(),
+                after: chrono::FixedOffset::east_opt(after).unwrap(),
+            };
+            let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+            assert_eq!(
+                client
+                    .fetch_day_costs_in_zone(d(day), &zone)
+                    .await
+                    .unwrap()
+                    .models[0]
+                    .spend,
+                12.0
+            );
+        }
+        let server = MockServer::start();
+        let any = server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+        let zone = ShiftZone {
+            at: d("2024-03-31").and_hms_opt(0, 0, 0).unwrap(),
+            before: chrono::FixedOffset::east_opt(0).unwrap(),
+            after: chrono::FixedOffset::east_opt(3600).unwrap(),
+        };
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        assert!(client
+            .fetch_day_costs_in_zone(d("2024-03-31"), &zone)
+            .await
+            .is_err());
+        any.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn daily_cost_preview_is_cached_before_details_finish() {
+        let server = MockServer::start();
+        let summary = server.mock(|when, then| {
+            when.path("/spend/logs").query_param("summarize", "true");
+            then.status(200).json_body(json!([]));
+        });
+        server.mock(|when,then| {
+            when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0,"total_is_capped":false}));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        client.fetch_day_costs("2024-02-28", false).await.unwrap();
+        client.fetch_day_costs("2024-02-29", false).await.unwrap();
+        client.fetch_day_costs("2024-02-28", false).await.unwrap();
+        summary.assert_hits(2);
+        client.fetch_day_costs("2024-02-28", true).await.unwrap();
+        summary.assert_hits(3);
+    }
 
     #[tokio::test]
     async fn daily_costs_correct_local_boundaries_and_merge_aliases() {

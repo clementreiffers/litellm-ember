@@ -270,6 +270,10 @@ If the legacy endpoint also reports truncation, Ember shows an error instead of 
 
 Up to 30 recently visited daily aggregates stay in memory for 15 minutes, making return visits fast. This is a cache limit, not a limit on selectable dates. Today's data expires after 60 seconds. **Rafraîchir tout** bypasses the selected day's cache; changing the endpoint or API key clears connection-specific data. No historical request logs are written to disk.
 
+Cost previews are cached with the same 30-day capacity and 15-minute expiry, even while token details are still loading. Revisiting a day reuses available values during the running app session. Restarting Ember clears these in-memory caches.
+
+For complete usage, Ember first tries `/user/daily/activity/aggregated`, scoped to the key's hash and its user ID from `/key/info`. This endpoint can return model costs and token counters without downloading the whole day's request logs. Its historical buckets are UTC, so Ember corrects the local-day boundaries for costs and tokens. Forbidden, missing, slow, malformed, or incomplete analytics responses fall back to the paginated endpoint described above. An unavailable analytics source is retried after 15 minutes, or immediately through **Rafraîchir tout**. API keys without permission continue to work through the existing endpoints.
+
 The header, budget gauge, period model costs, and menu-bar amount always describe the **current budget period**. The History calendar below uses UTC dates, which may differ from the local days used in Consommation.
 
 ### Daily spending calendar

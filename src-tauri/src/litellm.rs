@@ -1,6 +1,7 @@
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
+mod analytics;
 mod costs;
 mod daily;
 mod domain;
@@ -36,6 +37,8 @@ impl From<TransportError> for String {
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
     daily: std::sync::Arc<tokio::sync::Mutex<daily::DailyState>>,
+    analytics: std::sync::Arc<tokio::sync::Mutex<analytics::Access>>,
+    costs: std::sync::Arc<tokio::sync::Mutex<costs::CostState>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -86,6 +89,8 @@ impl Client {
             api_key,
             rows: Default::default(),
             daily: Default::default(),
+            analytics: Default::default(),
+            costs: Default::default(),
             summaries: Default::default(),
         })
     }

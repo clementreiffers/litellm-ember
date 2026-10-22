@@ -29,30 +29,26 @@ pub(super) struct DailyState {
 
 /// Ignore les métadonnées, messages et réponses volumineux : seuls ces compteurs sont utiles.
 #[derive(Deserialize)]
-struct UsageRow {
+pub(super) struct UsageRow {
     request_id: String,
     #[serde(default)]
-    model: String,
-    #[serde(default)]
-    spend: f64,
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-    #[serde(default)]
-    total_tokens: u64,
+    pub(super) model: String,
+    pub(super) spend: Option<f64>,
+    pub(super) prompt_tokens: Option<u64>,
+    pub(super) completion_tokens: Option<u64>,
+    pub(super) total_tokens: Option<u64>,
     #[serde(rename = "startTime")]
-    start_time: DateTime<Utc>,
+    pub(super) start_time: DateTime<Utc>,
 }
 
 impl From<UsageRow> for LogRow {
     fn from(row: UsageRow) -> Self {
         Self {
             model: row.model,
-            spend: row.spend,
-            prompt: row.prompt_tokens,
-            completion: row.completion_tokens,
-            total: row.total_tokens,
+            spend: row.spend.unwrap_or_default(),
+            prompt: row.prompt_tokens.unwrap_or_default(),
+            completion: row.completion_tokens.unwrap_or_default(),
+            total: row.total_tokens.unwrap_or_default(),
             start_time: Some(row.start_time),
             end_time: None,
             completion_start: None,
@@ -109,6 +105,8 @@ impl Client {
     pub fn reuse_daily_cache(&mut self, previous: &Self) {
         if self.base_url == previous.base_url && self.api_key == previous.api_key {
             self.daily = previous.daily.clone();
+            self.analytics = previous.analytics.clone();
+            self.costs = previous.costs.clone();
         }
     }
 
@@ -153,19 +151,24 @@ impl Client {
                 }
                 request_id
             };
-        let rows = match self.fetch_day_pages(day).await? {
-            Some(rows) => rows,
-            None => {
-                let (start, end) = day_range(day, &Local).ok_or("Date hors limites")?;
-                self.get(&format!(
-                    "/spend/logs?summarize=false&start_date={start}&end_date={end}"
-                ))
-                .await?
-            }
+        let models = if let Some(models) = self.fetch_analytics_in_zone(day, &Local, force).await {
+            models
+        } else {
+            let rows = match self.fetch_day_pages(day).await? {
+                Some(rows) => rows,
+                None => {
+                    let (start, end) = day_range(day, &Local).ok_or("Date hors limites")?;
+                    self.get(&format!(
+                        "/spend/logs?summarize=false&start_date={start}&end_date={end}"
+                    ))
+                    .await?
+                }
+            };
+            aggregate_today(&rows, day, &Local)
         };
         let usage = DailyUsage {
             date: date.into(),
-            models: aggregate_today(&rows, day, &Local),
+            models,
         };
         let mut state = self.daily.lock().await;
         if let Some(entry) = state
@@ -189,6 +192,18 @@ impl Client {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Option<Vec<LogRow>>, String> {
+        Ok(self
+            .fetch_range_usage_pages(start, end)
+            .await?
+            .map(|rows| rows.into_iter().map(LogRow::from).collect()))
+    }
+
+    // Conserve les champs absents pour refuser les corrections analytiques incomplètes.
+    pub(super) async fn fetch_range_usage_pages(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<Vec<UsageRow>>, String> {
         let mut url = reqwest::Url::parse(&format!("{}/spend/logs/v2", self.base_url))
             .map_err(|_| "Endpoint invalide")?;
         let hash = format!("{:x}", Sha256::digest(self.api_key.as_bytes()));
@@ -239,7 +254,7 @@ impl Client {
         {
             return Err("Requêtes dupliquées dans la pagination ; réessayez".into());
         }
-        Ok(Some(rows.into_iter().map(LogRow::from).collect()))
+        Ok(Some(rows))
     }
 }
 
