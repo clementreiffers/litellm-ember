@@ -455,6 +455,39 @@ fn PromptCacheCard(
 mod tests {
     use super::*;
     #[test]
+    fn dated_responses_survive_a_b_a_navigation_and_distinguish_empty_from_failure() {
+        let mut remote = Remote::<shared::DailyUsage>::default();
+        let a = remote.begin(100.0).unwrap();
+        remote.reset();
+        let b = remote.begin(200.0).unwrap();
+        remote.reset();
+        let newest_a = remote.begin(300.0).unwrap();
+        let data = |date: &str| {
+            Ok(Detail {
+                generation: 1,
+                data: shared::DailyUsage {
+                    date: date.into(),
+                    models: vec![],
+                },
+            })
+        };
+        remote.complete(a, 1, 1, data("2024-02-29"), 400.0);
+        remote.complete(b, 1, 1, data("2024-02-28"), 500.0);
+        assert!(remote.loading);
+        assert!(remote.data.is_none());
+        remote.complete(newest_a, 1, 1, Err("offline".into()), 600.0);
+        assert!(remote.data.is_none());
+        assert!(remote.error.is_some());
+        let retry = remote.begin(700.0).unwrap();
+        remote.complete(retry, 1, 1, data("2024-02-29"), 800.0);
+        assert!(remote.data.as_ref().unwrap().models.is_empty());
+        assert!(remote.error.is_none());
+        remote.reset();
+        let old_connection = remote.begin(900.0).unwrap();
+        remote.complete(old_connection, 1, 2, data("2024-02-29"), 1000.0);
+        assert!(remote.data.is_none());
+    }
+    #[test]
     fn prompt_cache_labels_distinguish_missing_data_from_zero_usage() {
         let mut usage = shared::PromptCacheUsage::default();
         assert_eq!(

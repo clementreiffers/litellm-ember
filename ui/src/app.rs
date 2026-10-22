@@ -123,6 +123,9 @@ pub fn App() -> impl IntoView {
     let week = RwSignal::new(Remote::<WeekDetails>::default());
     let history = RwSignal::new(Remote::<shared::HistoryDetails>::default());
     let activity = RwSignal::new(Remote::<Activity>::default());
+    let selected_day = RwSignal::new(None::<String>);
+    let day_usage = RwSignal::new(Remote::<shared::DailyUsage>::default());
+    let today_date = RwSignal::new(crate::usage::local_today());
 
     let listener = StoredValue::new_local(None::<tauri::Listener>);
     on_cleanup(move || {
@@ -131,12 +134,14 @@ pub fn App() -> impl IntoView {
         });
     });
     let accept = move |incoming: Stats| {
+        today_date.try_set(crate::usage::local_today());
         stats.try_update(|current| {
             if incoming.revision >= current.revision {
                 if incoming.generation != current.generation {
                     details::reset(week);
                     details::reset(history);
                     details::reset(activity);
+                    details::reset(day_usage);
                 }
                 *current = incoming;
             }
@@ -161,13 +166,14 @@ pub fn App() -> impl IntoView {
         details::reset(week);
         details::reset(history);
         details::reset(activity);
+        details::reset(day_usage);
         show_settings.set(false);
     });
 
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses /> }>
+            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage today_date /> }>
             <Settings on_close=close_settings updates harnesses />
         </Show>
       </div>
@@ -184,18 +190,32 @@ fn Main(
     activity: RwSignal<Remote<Activity>>,
     updates: RwSignal<shared::UpdateStatus>,
     harnesses: RwSignal<shared::HarnessSnapshot>,
+    selected_day: RwSignal<Option<String>>,
+    day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    today_date: RwSignal<String>,
 ) -> impl IntoView {
+    today_date.set(crate::usage::local_today());
     let generation = Signal::from(Memo::new(move |_| stats.with(|s| s.generation)));
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
     Effect::new(move |_| {
         generation.track();
+        let selected = selected_day.get();
         match tab.get() {
             Tab::History => {
                 details::load(week, tauri::get_week, generation);
                 details::load_history(history, generation, shared::HistoryMode::Refresh);
             }
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
-            Tab::Usage | Tab::Agents => {}
+            Tab::Usage => {
+                if let Some(date) = selected {
+                    details::load(
+                        day_usage,
+                        move || tauri::get_day_usage(date.clone(), false),
+                        generation,
+                    );
+                }
+            }
+            Tab::Agents => {}
         }
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
@@ -203,6 +223,16 @@ fn Main(
     // L'état du cycle, y compris son échec, pilote l'animation.
     let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
+        if tab.get_untracked() == Tab::Usage {
+            if let Some(date) = selected_day.get_untracked() {
+                details::reset(day_usage);
+                details::load(
+                    day_usage,
+                    move || tauri::get_day_usage(date.clone(), true),
+                    generation,
+                );
+            }
+        }
         if refreshing.get_untracked() {
             return;
         }
@@ -265,7 +295,7 @@ fn Main(
 
         {move || match tab.get() {
             Tab::Agents => view! { <crate::harness::Agents snapshot=harnesses /> }.into_any(),
-            Tab::Usage => view! { <UsageTab stats /> }.into_any(),
+            Tab::Usage => view! { <UsageTab stats selected_day day_usage today_date /> }.into_any(),
             Tab::History => view! { <crate::history::HistoryCalendar history /><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
@@ -337,9 +367,32 @@ mod tests {
 }
 
 #[component]
-fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
+fn UsageTab(
+    stats: RwSignal<Stats>,
+    selected_day: RwSignal<Option<String>>,
+    day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    today_date: RwSignal<String>,
+) -> impl IntoView {
+    let visible = Memo::new(move |_| {
+        stats.with(|stats| {
+            day_usage.with(|remote| {
+                crate::usage::visible_usage(
+                    selected_day.get().as_deref(),
+                    &today_date.get(),
+                    stats,
+                    remote.data.as_ref(),
+                )
+            })
+        })
+    });
     let today: Signal<Vec<shared::ModelUsage>> =
-        Memo::new(move |_| stats.with(|s| s.today.clone())).into();
+        Signal::derive(move || visible.get().unwrap_or_default());
+    let on_select = Callback::new(move |date: Option<String>| {
+        if selected_day.get_untracked() != date {
+            details::reset(day_usage);
+            selected_day.set(date);
+        }
+    });
     let today_spend: Signal<f64> =
         Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
     let today_tokens: Signal<u64> =
@@ -392,7 +445,17 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
 
     view! {
         <section class="card">
-            <h2>"Aujourd'hui"</h2>
+            <h2>{move || selected_day.get().map(|d| format!("Consommation · {d}")).unwrap_or_else(|| "Aujourd'hui".into())}</h2>
+            <crate::usage::DayNavigation selected=selected_day today=today_date on_select />
+            <div class="hint">"Journée locale"</div>
+            {move || selected_day.with(Option::is_some).then(|| view! {
+                {move || day_usage.with(|r| r.loading).then(|| view! { <div class="refreshing">"Chargement de la journée…"</div> })}
+                {move || day_usage.with(|r| r.error.clone()).map(|error| view! { <div class="error" role="alert">{error}</div> })}
+            })}
+            <Show when=move || visible.with(Option::is_some) fallback=move || view! {
+                <div class="hint">"Données de cette journée indisponibles pour le moment."</div>
+            }>
+            {move || today.with(Vec::is_empty).then(|| view! { <div class="hint">"Aucune consommation retournée pour cette journée."</div> })}
             <div class="today">
                 <Donut values=donut_tokens center_label=donut_label center_caption="tokens" />
                 <div class="today-stats">
@@ -405,6 +468,7 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
             <Bars rows=token_rows />
             <h3>"$ par modèle"</h3>
             <Bars rows=spend_rows />
+            </Show>
         </section>
 
         <section class="card">

@@ -256,6 +256,14 @@ Your API key is stored in the **macOS Keychain** and is never sent back to the i
 
 Alerts remember which thresholds have already been reported. They reset when a new budget period starts or when spending drops below the relevant threshold.
 
+### Daily usage navigation
+
+In **Consommation**, use the date picker or previous/next-day buttons to inspect daily costs, tokens, and model breakdowns. **Aujourd'hui** returns to today's live usage. Dates follow your Mac's local calendar; future dates are unavailable. The selected date stays selected while you switch tabs or open Settings, until you choose another date or restart Ember.
+
+Past days load on demand, and **Rafraîchir tout** reloads the selected day's figures. You can select dates older than 30 days, provided your LiteLLM server still retains their logs. An empty response means no usage was returned; Ember cannot distinguish an unused day from logs removed by server retention. Loading and network errors do not display another day's figures.
+
+The header, budget gauge, period model costs, and menu-bar amount always describe the **current budget period**. The History calendar below uses UTC dates, which may differ from the local days used in Consommation.
+
 ### Daily spending calendar
 
 Open **Historique** for a GitHub-style calendar: weeks run left to right and Monday through Sunday run top to bottom. The 30-day rolling window includes today, which is marked **en cours**. All dates are UTC. Hover, focus with the keyboard, or select a square to read its date and cost.
