@@ -121,6 +121,14 @@ async fn get_activity(service: State<'_, Service>) -> Result<Detail<Activity>, S
     service.activity().await
 }
 #[tauri::command]
+async fn get_day_usage(
+    date: String,
+    force: bool,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyUsage>, String> {
+    service.day_usage(date, force).await
+}
+#[tauri::command]
 async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
     service.refresh_and_wait().await
 }
@@ -179,6 +187,7 @@ pub fn run() {
             get_week,
             get_history,
             get_activity,
+            get_day_usage,
             refresh_now,
             test_notification,
             get_update_status,

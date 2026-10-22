@@ -60,6 +60,14 @@ pub struct ModelUsage {
     pub total_tokens: u64,
 }
 
+/// Consommation à la demande, distincte des statistiques de la période courante.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyUsage {
+    /// Jour local au format YYYY-MM-DD.
+    pub date: String,
+    pub models: Vec<ModelUsage>,
+}
+
 /// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

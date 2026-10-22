@@ -256,6 +256,18 @@ impl Service {
             _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
         }
     }
+    pub async fn day_usage(
+        &self,
+        date: String,
+        force: bool,
+    ) -> Result<Detail<shared::DailyUsage>, String> {
+        let (client, state) = self.request(Command::Context).await?;
+        let mut updates = self.snapshots.clone();
+        tokio::select! {
+            result = client.fetch_day(&date, force) => self.detail(state.generation, result?),
+            _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
+        }
+    }
     fn detail<T>(&self, generation: u64, data: T) -> Result<Detail<T>, String> {
         if generation != self.snapshots.borrow().generation {
             return Err(Error::Obsolete.to_string());
@@ -739,6 +751,67 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn historical_usage_does_not_modify_live_stats() {
+        let server = MockServer::start();
+        mocks(&server, 42.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        let before = finished(&service, 1).await;
+        let historical = service.day_usage("2024-02-29".into(), false).await.unwrap();
+        assert_eq!(historical.generation, before.generation);
+        assert_eq!(historical.data.date, "2024-02-29");
+        assert_eq!(service.stats(), before);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn historical_usage_rejects_old_connection_response() {
+        let old = MockServer::start();
+        let new = MockServer::start();
+        let historical = old.mock(|when, then| {
+            when.path("/spend/logs")
+                .query_param("summarize", "false")
+                .query_param_exists("start_date")
+                .matches(|request| {
+                    request.query_params.as_ref().is_some_and(|params| {
+                        params
+                            .iter()
+                            .any(|(key, value)| key == "start_date" && value.starts_with("2024-"))
+                    })
+                });
+            then.status(200)
+                .delay(Duration::from_millis(500))
+                .json_body(serde_json::json!([]));
+        });
+        mocks(&old, 99.0, 0);
+        mocks(&new, 7.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&old.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        finished(&service, 1).await;
+        let pending_service = service.clone();
+        let pending =
+            tokio::spawn(
+                async move { pending_service.day_usage("2024-02-29".into(), false).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while historical.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service.save(preferences(&new, false)).await.unwrap();
+        assert!(matches!(pending.await.unwrap(), Err(error) if error.contains("configuration")));
+        task.abort();
+    }
+
     #[tokio::test]
     async fn history_survives_restart_and_disk_failure_keeps_the_in_memory_snapshot() {
         let server = MockServer::start();
