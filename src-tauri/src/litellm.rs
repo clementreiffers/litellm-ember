@@ -6,6 +6,7 @@ pub(crate) mod calendar;
 mod costs;
 mod daily;
 mod domain;
+mod local_history;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
