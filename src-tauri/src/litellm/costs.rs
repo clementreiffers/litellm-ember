@@ -27,58 +27,6 @@ pub(super) struct CostState {
 }
 
 impl Client {
-    pub(super) async fn cached_costs(&self, bounds: DayBounds) -> Option<DailyCosts> {
-        let state = self.costs.lock().await;
-        let ttl = Duration::from_secs(if bounds.date == Local::now().date_naive() {
-            60
-        } else {
-            900
-        });
-        state
-            .entries
-            .iter()
-            .find(|e| e.bounds == bounds && e.fetched.elapsed() < ttl)
-            .and_then(|e| e.value.clone())
-    }
-
-    pub(super) async fn reserve_costs(&self, bounds: DayBounds) -> u64 {
-        let mut state = self.costs.lock().await;
-        state.sequence += 1;
-        let request_id = state.sequence;
-        state.entries.retain(|e| e.date != bounds.date.to_string());
-        state.entries.push_back(CachedCosts {
-            date: bounds.date.to_string(),
-            bounds,
-            request_id,
-            fetched: Instant::now(),
-            value: None,
-        });
-        while state.entries.len() > 30 {
-            state.entries.pop_front();
-        }
-        request_id
-    }
-
-    pub(super) async fn store_costs(
-        &self,
-        bounds: DayBounds,
-        request_id: u64,
-        value: &DailyCosts,
-    ) -> bool {
-        let mut state = self.costs.lock().await;
-        if let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|e| e.bounds == bounds && e.request_id == request_id)
-        {
-            entry.value = Some(value.clone());
-            entry.fetched = Instant::now();
-            true
-        } else {
-            false
-        }
-    }
-
     pub async fn fetch_day_costs(&self, date: &str, force: bool) -> Result<DailyCosts, String> {
         self.fetch_day_costs_cached_in_zone(date, force, &Local)
             .await

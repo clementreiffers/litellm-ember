@@ -17,12 +17,36 @@ pub fn retained_selection(selected: Option<&str>, days: &[HistoryDay]) -> Option
         .map(str::to_owned)
 }
 
+pub fn daily_details_outdated(
+    selected: Option<&str>,
+    exact: &[HistoryDay],
+    usage: Option<&shared::DailyUsage>,
+    costs: Option<&shared::DailyCosts>,
+) -> bool {
+    let Some(date) = selected else {
+        return false;
+    };
+    let Some(spend) = exact.iter().find(|d| d.date == date).and_then(|d| d.spend) else {
+        return false;
+    };
+    let shown = usage
+        .filter(|v| v.date == date)
+        .map(|v| v.models.iter().map(|m| m.spend).sum::<f64>())
+        .or_else(|| {
+            costs
+                .filter(|v| v.date == date)
+                .map(|v| v.models.iter().map(|m| m.spend).sum())
+        });
+    shown.is_some_and(|v| (v - spend).abs() > 1e-8)
+}
+
 #[derive(Clone, Copy)]
 pub struct CalendarState {
     pub snapshot: RwSignal<shared::LocalHistorySnapshot>,
     pub selected: RwSignal<Option<String>>,
     pub usage: RwSignal<Remote<shared::DailyUsage>>,
     pub costs: RwSignal<Remote<shared::DailyCosts>>,
+    pub epoch: RwSignal<u64>,
 }
 impl CalendarState {
     pub fn new() -> Self {
@@ -31,11 +55,13 @@ impl CalendarState {
             selected: RwSignal::new(None),
             usage: RwSignal::new(Default::default()),
             costs: RwSignal::new(Default::default()),
+            epoch: RwSignal::new(0),
         }
     }
     pub fn reset_details(self) {
         crate::details::reset(self.usage);
         crate::details::reset(self.costs);
+        self.epoch.update(|e| *e += 1);
     }
     pub fn select(self, date: Option<String>) {
         if self.selected.get_untracked() != date {
@@ -50,9 +76,22 @@ impl CalendarState {
         {
             return;
         }
-        if self.snapshot.with_untracked(|old| {
+        let changed = self.snapshot.with_untracked(|old| {
             old.generation != next.generation || old.calendar_id != next.calendar_id
-        }) {
+        });
+        let outdated = self.usage.with_untracked(|u| {
+            self.costs.with_untracked(|c| {
+                !u.loading
+                    && !c.loading
+                    && daily_details_outdated(
+                        self.selected.get_untracked().as_deref(),
+                        &next.exact_costs,
+                        u.data.as_ref(),
+                        c.data.as_ref(),
+                    )
+            })
+        });
+        if changed || outdated {
             self.reset_details();
         }
         self.select(retained_selection(
@@ -119,8 +158,7 @@ pub fn DayRecap(state: CalendarState) -> impl IntoView {
     });
     let known_total = Signal::derive(move || {
         state.snapshot.with(|s| {
-            s.details
-                .days
+            s.exact_costs
                 .iter()
                 .find(|d| Some(&d.date) == state.selected.get().as_ref())
                 .and_then(|d| d.spend)
@@ -184,7 +222,8 @@ pub fn HistoryCalendar(state: CalendarState) -> impl IntoView {
     view! {
         <section class="card history-card">
             <h2>"Dépenses sur 30 jours"</h2>
-            <div class="hint">"Journées locales · aujourd’hui inclus"</div>
+            <div class="hint">"Dates locales · couleurs estimées depuis les agrégats UTC"</div>
+            <div class="caption">"Cliquez pour les détails exacts de la journée locale."</div>
             {move || history.with(|remote| {
                 let data=&remote.details;
                 if data.days.is_empty() {
@@ -215,7 +254,7 @@ pub fn HistoryCalendar(state: CalendarState) -> impl IntoView {
                     None => view! { <span class="history-cell empty" aria-hidden="true"></span> }.into_any(),
                 }).collect_view();
                 view! {
-                    <div class="history-total">{format!("${total:.2}")}<span class="caption">{if incomplete { " · total connu, incomplet" } else { " · total sur 30 jours" }}</span></div>
+                    <div class="history-total">{format!("≈ ${total:.2}")}<span class="caption">{if incomplete { " · estimation incomplète" } else { " · estimation sur 30 jours" }}</span></div>
                     <div class="history-layout">
                         <div class="history-weekdays" aria-hidden="true">
                             {["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"].into_iter().map(|d| view! { <span>{d}</span> }).collect_view()}
@@ -247,6 +286,38 @@ pub fn HistoryCalendar(state: CalendarState) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn newer_exact_cost_invalidates_old_recap_but_not_aggregate_estimate() {
+        let exact = vec![HistoryDay {
+            date: "2024-02-29".into(),
+            spend: Some(8.0),
+        }];
+        let usage = shared::DailyUsage {
+            date: "2024-02-29".into(),
+            models: vec![shared::ModelUsage {
+                spend: 6.0,
+                ..Default::default()
+            }],
+        };
+        assert!(daily_details_outdated(
+            Some("2024-02-29"),
+            &exact,
+            Some(&usage),
+            None
+        ));
+        assert!(!daily_details_outdated(
+            Some("2024-02-28"),
+            &exact,
+            Some(&usage),
+            None
+        ));
+        assert!(!daily_details_outdated(
+            Some("2024-02-29"),
+            &[],
+            Some(&usage),
+            None
+        ));
+    }
     #[test]
     fn local_snapshot_order_and_selection_range() {
         let current = shared::LocalHistorySnapshot {

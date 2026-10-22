@@ -17,6 +17,7 @@ pub(crate) struct LocalHistory {
     source_id: String,
     pub window: CalendarWindow,
     amounts: Vec<Amount>,
+    estimates: Vec<HistoryDay>,
     synced_day: Option<NaiveDate>,
     updated_at: Option<DateTime<Utc>>,
     #[serde(skip)]
@@ -29,7 +30,7 @@ impl LocalHistory {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|v| serde_json::from_slice::<Self>(&v).ok())
             .filter(|c| {
-                c.version == 2
+                c.version == 3
                     && c.source_id == source_id
                     && !source_id.is_empty()
                     && c.amounts
@@ -37,10 +38,11 @@ impl LocalHistory {
                         .all(|a| a.spend.is_finite() && a.spend >= 0.0)
             });
         let mut state = cached.unwrap_or_else(|| Self {
-            version: 2,
+            version: 3,
             source_id: source_id.clone(),
             window: window.clone(),
             amounts: vec![],
+            estimates: vec![],
             synced_day: None,
             updated_at: None,
             error: None,
@@ -54,7 +56,10 @@ impl LocalHistory {
         }
         if self.source_id != source_id {
             self.amounts.clear();
+            self.estimates.clear();
         }
+        self.estimates
+            .retain(|a| window.days.iter().any(|(d, _)| d.to_string() == a.date));
         self.amounts
             .retain(|a| window.days.iter().any(|(_, b)| *b == Some(a.bounds)));
         self.source_id = source_id;
@@ -71,9 +76,12 @@ impl LocalHistory {
         if mode == HistoryMode::Force
             || self.error.is_some()
             || self.synced_day != Some(self.window.today)
-            || self.window.days[..29]
-                .iter()
-                .any(|(_, b)| !self.amounts.iter().any(|a| Some(a.bounds) == *b))
+            || self.window.days[..29].iter().any(|(d, _)| {
+                !self
+                    .estimates
+                    .iter()
+                    .any(|a| a.date == d.to_string() && a.spend.is_some())
+            })
         {
             return Some(self.window.days[0].0);
         }
@@ -115,6 +123,29 @@ impl LocalHistory {
         }
         true
     }
+    pub fn merge_estimate(&mut self, day: HistoryDay) -> bool {
+        if !day.spend.is_some_and(|v| v.is_finite() && v >= 0.0)
+            || !self
+                .window
+                .days
+                .iter()
+                .any(|(d, _)| d.to_string() == day.date)
+        {
+            return false;
+        }
+        self.estimates.retain(|d| d.date != day.date);
+        self.estimates.push(day);
+        true
+    }
+    pub fn exact_costs(&self) -> Vec<HistoryDay> {
+        self.amounts
+            .iter()
+            .map(|a| HistoryDay {
+                date: a.bounds.date.to_string(),
+                spend: Some(a.spend),
+            })
+            .collect()
+    }
     pub fn finish(&mut self, now: DateTime<Utc>, start: NaiveDate, error: Option<String>) {
         if error.is_none() && start == self.window.days[0].0 {
             self.synced_day = Some(self.window.today);
@@ -128,13 +159,13 @@ impl LocalHistory {
                 .window
                 .days
                 .iter()
-                .map(|(date, bounds)| HistoryDay {
+                .map(|(date, _)| HistoryDay {
                     date: date.to_string(),
                     spend: self
-                        .amounts
+                        .estimates
                         .iter()
-                        .find(|a| Some(a.bounds) == *bounds)
-                        .map(|a| a.spend),
+                        .find(|a| a.date == date.to_string())
+                        .and_then(|a| a.spend),
                 })
                 .collect(),
             first_weekday: self.window.days[0].0.weekday().num_days_from_monday() as u8,
@@ -166,10 +197,15 @@ mod tests {
         let mut state = LocalHistory::load(Some(&path), "key".into(), window.clone());
         assert!(state.view().days.iter().all(|d| d.spend.is_none()));
         assert!(state.merge_day(window.days[29].1.unwrap(), 7.0, now));
+        state.merge_estimate(HistoryDay {
+            date: day.to_string(),
+            spend: Some(6.0),
+        });
         state.finish(now, window.days[0].0, None);
         crate::persistence::write(&path, &state).unwrap();
         let restored = LocalHistory::load(Some(&path), "key".into(), window.clone());
-        assert_eq!(restored.view().days[29].spend, Some(7.0));
+        assert_eq!(restored.view().days[29].spend, Some(6.0));
+        assert_eq!(restored.exact_costs()[0].spend, Some(7.0));
         assert!(
             LocalHistory::load(Some(&path), "other".into(), window.clone())
                 .view()
@@ -181,7 +217,7 @@ mod tests {
             "key".into(),
             CalendarWindow::new(day + Duration::days(1), &Utc),
         );
-        assert_eq!(state.view().days[28].spend, Some(7.0));
+        assert_eq!(state.view().days[28].spend, Some(6.0));
         assert_eq!(state.view().days[29].spend, None);
         state.rebase(
             "key".into(),
@@ -190,7 +226,7 @@ mod tests {
                 &FixedOffset::east_opt(7200).unwrap(),
             ),
         );
-        assert!(state.view().days.iter().all(|d| d.spend.is_none()));
+        assert!(state.exact_costs().is_empty());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -207,6 +243,10 @@ mod tests {
         );
         for (_, bounds) in &window.days {
             state.merge_day(bounds.unwrap(), 1.0, now);
+            state.merge_estimate(HistoryDay {
+                date: bounds.unwrap().date.to_string(),
+                spend: Some(1.0),
+            });
         }
         state.finish(now, window.days[0].0, None);
         assert_eq!(
@@ -221,7 +261,15 @@ mod tests {
         assert!(state.merge_day(window.days[29].1.unwrap(), 2.0, now + Duration::seconds(1)));
         assert!(!state.merge_day(window.days[29].1.unwrap(), 99.0, now));
         state.finish(now, day, Some("offline".into()));
-        assert_eq!(state.view().days[29].spend, Some(2.0));
+        assert_eq!(
+            state
+                .exact_costs()
+                .iter()
+                .find(|d| d.date == day.to_string())
+                .unwrap()
+                .spend,
+            Some(2.0)
+        );
         assert!(state.view().error.is_some());
         assert!(state.range(now, HistoryMode::Refresh).is_some());
     }

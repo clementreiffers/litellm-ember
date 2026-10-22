@@ -1,5 +1,9 @@
 # Local-Day Heatmap and Daily Recap
 
+## Approved adjustment after local testing
+
+The user reported that waiting for local-midnight corrections delayed all heatmap colors. They explicitly selected **fast aggregate colors**, with local date labels and a clear estimate label, while retaining exact local-day details only after clicking. This supersedes the exact-local heatmap calculation and progressive boundary-fetch requirements below. The heatmap now uses one UTC summary request and no detail requests. Aggregate estimates and exact selected-day costs are stored separately; the latter never borrow estimated totals. Existing UTC notification history remains independent. All other selection, cache, and recap behavior still applies.
+
 ## Intent
 
 Make the History heatmap use the same local calendar days as Consommation. Clicking a date displays a compact daily recap below the heatmap, so users can inspect that day's costs and tokens without switching tabs.

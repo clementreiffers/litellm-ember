@@ -44,13 +44,7 @@ impl IncreaseRetry {
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 enum Command {
     LocalHistory(HistoryMode, Reply<shared::LocalHistorySnapshot>),
-    LocalProgress(
-        u64,
-        u64,
-        crate::litellm::calendar::DayBounds,
-        f64,
-        chrono::DateTime<chrono::Utc>,
-    ),
+    LocalProgress(u64, u64, shared::HistoryDay),
     LocalFinished(
         u64,
         u64,
@@ -306,6 +300,7 @@ impl Service {
         tokio::select! {
             result = client.fetch_day(&date, force) => {
                 let data = result?;
+                validate_daily_bounds(bounds, chrono::NaiveDate::parse_from_str(&date,"%Y-%m-%d").ok().and_then(|d|crate::litellm::calendar::day_bounds(d,&Local)))?;
                 if let Some(bounds) = bounds {let _ = self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
                 self.detail(state.generation,data)
             },
@@ -326,6 +321,7 @@ impl Service {
         tokio::select! {
             result=client.fetch_day_costs(&date,force)=>{
                 let data=result?;
+                validate_daily_bounds(bounds, chrono::NaiveDate::parse_from_str(&date,"%Y-%m-%d").ok().and_then(|d|crate::litellm::calendar::day_bounds(d,&Local)))?;
                 if let Some(bounds)=bounds {let _=self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
                 self.detail(state.generation,data)
             },
@@ -351,6 +347,17 @@ fn connection(
         .api_key()
         .ok_or("Aucune clé API : renseignez-la dans les paramètres.")?;
     Client::with_http(&store.get().base_url, key, http.clone()?)
+}
+
+fn validate_daily_bounds(
+    requested: Option<crate::litellm::calendar::DayBounds>,
+    current: Option<crate::litellm::calendar::DayBounds>,
+) -> Result<(), String> {
+    if requested != current {
+        Err("Le fuseau horaire a changé ; rechargez cette journée".into())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -560,31 +567,15 @@ async fn coordinate(
                                 let run = local_run;
                                 let generation = stats.generation;
                                 let today = calendar.window.today;
-                                let bounds = calendar.window.days.clone();
                                 let send = commands.clone();
                                 local_worker = Some(tauri::async_runtime::spawn(async move {
                                     let progress = send.clone();
                                     let result = client
-                                        .fetch_local_history(
-                                            today,
-                                            start,
-                                            mode == HistoryMode::Force,
-                                            move |value| {
-                                                if let Some(bounds) = bounds
-                                                    .iter()
-                                                    .find(|(d, _)| d.to_string() == value.date)
-                                                    .and_then(|(_, b)| *b)
-                                                {
-                                                    let _ = progress.send(Command::LocalProgress(
-                                                        generation,
-                                                        run,
-                                                        bounds,
-                                                        value.models.iter().map(|m| m.spend).sum(),
-                                                        now,
-                                                    ));
-                                                }
-                                            },
-                                        )
+                                        .fetch_local_history(today, start, move |value| {
+                                            let _ = progress.send(Command::LocalProgress(
+                                                generation, run, value,
+                                            ));
+                                        })
                                         .await;
                                     let _ = send.send(Command::LocalFinished(
                                         generation, run, now, start, result,
@@ -611,10 +602,10 @@ async fn coordinate(
                 }
                 let _ = reply.send(Ok(local_snapshots.borrow().clone()));
             }
-            Command::LocalProgress(generation, run, bounds, spend, when) => {
+            Command::LocalProgress(generation, run, day) => {
                 if generation == stats.generation
                     && run == local_run
-                    && calendar.merge_day(bounds, spend, when)
+                    && calendar.merge_estimate(day)
                 {
                     publish_calendar(&local_snapshots, &calendar, generation, true);
                 }
@@ -908,6 +899,7 @@ fn publish_calendar(
         calendar_id: calendar.window.id.clone(),
         loading,
         details: calendar.view(),
+        exact_costs: calendar.exact_costs(),
     });
 }
 
@@ -932,6 +924,18 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn daily_response_rejects_changed_timezone_bounds() {
+        let day = chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        let utc = crate::litellm::calendar::day_bounds(day, &chrono::Utc);
+        let east = crate::litellm::calendar::day_bounds(
+            day,
+            &chrono::FixedOffset::east_opt(7200).unwrap(),
+        );
+        assert!(validate_daily_bounds(utc, utc).is_ok());
+        assert!(validate_daily_bounds(utc, east).is_err());
+        assert!(validate_daily_bounds(utc, None).is_err());
+    }
 
     fn mocks(server: &MockServer, spend: f64, delay: u64) {
         server.mock(|when, then| {
@@ -1140,7 +1144,7 @@ mod tests {
                 serde_json::json!([{"startTime":today.to_string(),"spend":7,"models":{"m":7}}]),
             );
         });
-        server.mock(|when, then| {
+        let details = server.mock(|when, then| {
             when.path("/spend/logs/v2");
             then.status(200).json_body(
                 serde_json::json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}),
@@ -1167,6 +1171,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(complete.details.days[29].spend, Some(7.0));
+        details.assert_hits(0);
         assert!(complete.details.error.is_none());
         assert!(service
             .history(HistoryMode::Cached)
@@ -1197,7 +1202,11 @@ mod tests {
                 serde_json::json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}),
             );
         });
-        mocks(&server, 1.0, 0);
+        server.mock(|when, then| {
+            when.path("/key/info");
+            then.status(200)
+                .json_body(serde_json::json!({"info":{"spend":1.0}}));
+        });
         let store = Arc::new(SettingsStore::for_test(&server.base_url()));
         store.save(preferences(&server, false)).unwrap();
         let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
@@ -1235,14 +1244,18 @@ mod tests {
             loop {
                 updates.changed().await.unwrap();
                 let value = updates.borrow().clone();
-                if value.revision > forced.revision && !value.loading {
+                if value.revision > forced.revision
+                    && !value.loading
+                    && !value.exact_costs.is_empty()
+                {
                     break value;
                 }
             }
         })
         .await
         .unwrap();
-        assert_eq!(complete.details.days[29].spend, Some(9.0));
+        assert_eq!(complete.details.days[29].spend, Some(2.0));
+        assert_eq!(complete.exact_costs[0].spend, Some(9.0));
         service
             .commands
             .send(Command::LocalCost(
@@ -1253,7 +1266,7 @@ mod tests {
             ))
             .unwrap();
         let current = service.local_history(HistoryMode::Cached).await.unwrap();
-        assert_eq!(current.details.days[29].spend, Some(9.0));
+        assert_eq!(current.exact_costs[0].spend, Some(9.0));
         task.abort();
     }
 
@@ -1289,7 +1302,7 @@ mod tests {
             ))
             .unwrap();
         let current = service.local_history(HistoryMode::Cached).await.unwrap();
-        assert_eq!(current.details.days[29].spend, Some(7.0));
+        assert_eq!(current.exact_costs[0].spend, Some(7.0));
         assert!(current.details.error.is_some());
         service.save(preferences(&new, false)).await.unwrap();
         let next = service.local_history(HistoryMode::Cached).await.unwrap();

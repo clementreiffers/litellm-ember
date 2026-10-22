@@ -458,6 +458,9 @@ pub struct LocalHistorySnapshot {
     pub calendar_id: String,
     pub loading: bool,
     pub details: HistoryDetails,
+    /// Coûts locaux vérifiés lors d'une sélection, distincts des estimations du calendrier.
+    #[serde(default)]
+    pub exact_costs: Vec<HistoryDay>,
 }
 mod harness;
 pub use harness::*;

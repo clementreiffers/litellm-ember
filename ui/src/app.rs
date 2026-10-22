@@ -126,6 +126,31 @@ pub fn App() -> impl IntoView {
     let selected_day = RwSignal::new(None::<String>);
     let day_usage = RwSignal::new(Remote::<shared::DailyUsage>::default());
     let day_costs = RwSignal::new(Remote::<shared::DailyCosts>::default());
+    let day_epoch = RwSignal::new(0u64);
+    let previous_calendar = StoredValue::new(String::new());
+    Effect::new(move |_| {
+        let snapshot = history.snapshot.get();
+        let changed =
+            previous_calendar.with_value(|old| !old.is_empty() && *old != snapshot.calendar_id);
+        previous_calendar.set_value(snapshot.calendar_id.clone());
+        let outdated = day_usage.with_untracked(|u| {
+            day_costs.with_untracked(|c| {
+                !u.loading
+                    && !c.loading
+                    && crate::history::daily_details_outdated(
+                        selected_day.get_untracked().as_deref(),
+                        &snapshot.exact_costs,
+                        u.data.as_ref(),
+                        c.data.as_ref(),
+                    )
+            })
+        });
+        if changed || outdated {
+            details::reset(day_usage);
+            details::reset(day_costs);
+            day_epoch.update(|e| *e += 1);
+        }
+    });
     let today_date = RwSignal::new(crate::usage::local_today());
     // Horloge locale uniquement : aucune requête réseau supplémentaire à minuit.
     if let Ok(clock) = leptos::leptos_dom::helpers::set_interval_with_handle(
@@ -214,7 +239,7 @@ pub fn App() -> impl IntoView {
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage day_costs today_date /> }>
+            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage day_costs day_epoch today_date /> }>
             <Settings on_close=close_settings updates harnesses />
         </Show>
       </div>
@@ -234,6 +259,7 @@ fn Main(
     selected_day: RwSignal<Option<String>>,
     day_usage: RwSignal<Remote<shared::DailyUsage>>,
     day_costs: RwSignal<Remote<shared::DailyCosts>>,
+    day_epoch: RwSignal<u64>,
     today_date: RwSignal<String>,
 ) -> impl IntoView {
     today_date.set(crate::usage::local_today());
@@ -241,6 +267,7 @@ fn Main(
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
     Effect::new(move |_| {
         generation.track();
+        day_epoch.track();
         let selected = selected_day.get();
         match tab.get() {
             Tab::History => {
@@ -271,6 +298,7 @@ fn Main(
         generation.track();
         history.selected.track();
         calendar_id.track();
+        history.epoch.track();
         if tab.get() == Tab::History {
             history.load_details(false, generation);
         }

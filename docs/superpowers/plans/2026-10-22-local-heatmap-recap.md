@@ -1,5 +1,9 @@
 # Local-Day Heatmap and Daily Recap Implementation Plan
 
+## Execution adjustment approved by the user
+
+After testing the local build, the user chose fast aggregate heatmap colors over waiting for exact boundary corrections. Task 2's batch boundary loader was replaced by a single key-scoped summary query; heatmap values are explicitly labeled estimates. Exact local-day costs and tokens load only for the clicked recap. The persisted schema is version 3 with separate estimates and verified costs. Task 1's timezone-aware caches, Task 3's guards/persistence, and Task 4's recap remain. Review fixes invalidate incompatible main-screen responses and refresh stale recap values when newer exact daily data arrives. The execution ledger records validation of this amended behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Continue the user's previously selected native execution with one independent final review. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Show a local-day heatmap with a clickable daily recap below it, sharing costs, token details, and caches with Consommation.
@@ -114,3 +118,11 @@ App owns `history_selection: RwSignal<Option<String>>`, separate recap usage/cos
 ## Plan self-review
 
 All spec sections map to Tasks 1–4; Task 5 covers validation/publication. The existing native execution method is preserved. Local history has a new command/event contract so existing UTC notification tests remain meaningful. Calendar identity uses resolved day intervals rather than today's offset alone; no new timezone dependency is required for equivalent day membership.
+
+## Execution results
+
+Tasks 1–4 are implemented, including the user-approved aggregate-only adjustment above. The final suite passes 233 tests, with 6 optional live tests ignored. Both Clippy targets, formatting, and diff whitespace checks pass. The release frontend builds; browser checks cover initial colors without any daily detail command, recap activation, progressive cost/token rendering, errors, cached revisits, tab/settings persistence, independent main selection, forced refresh, date/close races, timezone invalidation of both screens, and recap reconciliation from newer exact results.
+
+The aggregate heatmap live test returned all 30 dates in 522 ms. A separate live daily comparison returned matching model costs between preview and full usage (6.35 s and 7.54 s in that run). These are individual measurements, not latency guarantees. The configured key still denies the preferred analytics endpoint, so live requests exercised the fallback.
+
+Independent review identified two Important issues: main-screen timezone invalidation and stale recap totals after a newer daily result. Both received failing regression coverage and fixes; extended built-WASM checks confirm the user-visible behavior. The documentation mismatch about sharing UTC notification history was corrected. No findings remain deferred. Publication continues on PR #1 after the final native rebuild.
