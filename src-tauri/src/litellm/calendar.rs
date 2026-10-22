@@ -24,7 +24,7 @@ pub(crate) fn day_bounds(date: NaiveDate, zone: &impl TimeZone) -> Option<DayBou
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CalendarWindow {
     pub today: NaiveDate,
     pub days: Vec<(NaiveDate, Option<DayBounds>)>,

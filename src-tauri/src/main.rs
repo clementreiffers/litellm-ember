@@ -2,6 +2,7 @@ mod harness;
 mod history;
 mod increase;
 mod litellm;
+mod local_history;
 mod notify;
 #[cfg(target_os = "macos")]
 mod panel;

@@ -105,6 +105,14 @@ async fn save_settings(
     service.save(input).await
 }
 #[tauri::command]
+async fn get_local_history(
+    service: State<'_, Service>,
+    mode: shared::HistoryMode,
+) -> Result<shared::LocalHistorySnapshot, String> {
+    service.local_history(mode).await
+}
+
+#[tauri::command]
 async fn get_history(
     service: State<'_, Service>,
     mode: shared::HistoryMode,
@@ -194,6 +202,7 @@ pub fn run() {
             save_settings,
             get_week,
             get_history,
+            get_local_history,
             get_activity,
             get_day_usage,
             get_day_costs,
@@ -261,6 +270,14 @@ pub fn run() {
                 app.handle().clone(),
                 service.clone(),
             ));
+            let mut calendar = service.subscribe_local_history();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while calendar.changed().await.is_ok() {
+                    let snapshot = calendar.borrow_and_update().clone();
+                    let _ = handle.emit("local-history-updated", snapshot);
+                }
+            });
             app.manage(service);
             updater::start(
                 app.handle(),

@@ -449,5 +449,15 @@ pub struct HistoryDetails {
     pub updated_at: Option<String>,
     pub error: Option<String>,
 }
+
+/// Calendrier local publié progressivement ; la révision ordonne commandes et événements.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalHistorySnapshot {
+    pub generation: u64,
+    pub revision: u64,
+    pub calendar_id: String,
+    pub loading: bool,
+    pub details: HistoryDetails,
+}
 mod harness;
 pub use harness::*;

@@ -43,6 +43,28 @@ impl IncreaseRetry {
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 enum Command {
+    LocalHistory(HistoryMode, Reply<shared::LocalHistorySnapshot>),
+    LocalProgress(
+        u64,
+        u64,
+        crate::litellm::calendar::DayBounds,
+        f64,
+        chrono::DateTime<chrono::Utc>,
+    ),
+    LocalFinished(
+        u64,
+        u64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::NaiveDate,
+        Result<(), String>,
+    ),
+    LocalCost(
+        u64,
+        crate::litellm::calendar::DayBounds,
+        f64,
+        chrono::DateTime<chrono::Utc>,
+    ),
+    CalendarTick,
     HarnessSettings(Reply<shared::HarnessSettings>),
     SaveHarnessSettings(shared::HarnessSettings, Reply<shared::HarnessSettings>),
     Save(SettingsInput, Reply<SettingsView>),
@@ -123,6 +145,7 @@ pub async fn run_cycle(client: &Client, publish: impl Fn(Event) + Sync) {
 pub struct Service {
     commands: mpsc::UnboundedSender<Command>,
     snapshots: watch::Receiver<Stats>,
+    local_snapshots: watch::Receiver<shared::LocalHistorySnapshot>,
 }
 impl Service {
     pub fn start(
@@ -137,9 +160,12 @@ impl Service {
             .map(|path| path.with_file_name("history.json"));
         let (commands, receiver) = mpsc::unbounded_channel();
         let (snapshots, updates) = watch::channel(Stats::default());
+        let (local_snapshots, local_updates) =
+            watch::channel(shared::LocalHistorySnapshot::default());
         let service = Self {
             commands: commands.clone(),
             snapshots: updates,
+            local_snapshots: local_updates,
         };
         tauri::async_runtime::spawn(async move {
             let loaded = tauri::async_runtime::spawn_blocking(move || {
@@ -180,6 +206,7 @@ impl Service {
                         commands,
                         receiver,
                         snapshots,
+                        local_snapshots,
                     )
                     .await
                 }
@@ -239,6 +266,16 @@ impl Service {
     pub async fn history(&self, mode: HistoryMode) -> Result<Detail<HistoryDetails>, String> {
         self.request(|reply| Command::History(mode, reply)).await
     }
+    pub async fn local_history(
+        &self,
+        mode: HistoryMode,
+    ) -> Result<shared::LocalHistorySnapshot, String> {
+        self.request(|reply| Command::LocalHistory(mode, reply))
+            .await
+    }
+    pub fn subscribe_local_history(&self) -> watch::Receiver<shared::LocalHistorySnapshot> {
+        self.local_snapshots.clone()
+    }
 
     pub async fn week(&self) -> Result<Detail<WeekDetails>, String> {
         let (client, state) = self.request(Command::Context).await?;
@@ -262,9 +299,17 @@ impl Service {
         force: bool,
     ) -> Result<Detail<shared::DailyUsage>, String> {
         let (client, state) = self.request(Command::Context).await?;
+        let requested = chrono::Utc::now();
+        let bounds = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local));
         let mut updates = self.snapshots.clone();
         tokio::select! {
-            result = client.fetch_day(&date, force) => self.detail(state.generation, result?),
+            result = client.fetch_day(&date, force) => {
+                let data = result?;
+                if let Some(bounds) = bounds {let _ = self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
+                self.detail(state.generation,data)
+            },
             _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
         }
     }
@@ -274,9 +319,17 @@ impl Service {
         force: bool,
     ) -> Result<Detail<shared::DailyCosts>, String> {
         let (client, state) = self.request(Command::Context).await?;
+        let requested = chrono::Utc::now();
+        let bounds = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local));
         let mut updates = self.snapshots.clone();
         tokio::select! {
-            result=client.fetch_day_costs(&date,force)=>self.detail(state.generation,result?),
+            result=client.fetch_day_costs(&date,force)=>{
+                let data=result?;
+                if let Some(bounds)=bounds {let _=self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
+                self.detail(state.generation,data)
+            },
             _=updates.wait_for(|snapshot| snapshot.generation != state.generation)=>Err(Error::Obsolete.to_string()),
         }
     }
@@ -315,12 +368,24 @@ async fn coordinate(
     commands: mpsc::UnboundedSender<Command>,
     mut receiver: mpsc::UnboundedReceiver<Command>,
     snapshots: watch::Sender<Stats>,
+    local_snapshots: watch::Sender<shared::LocalHistorySnapshot>,
 ) {
     let http = Client::http();
     let mut client = connection(&store, &http);
     let source = store.get().source_id;
     let cache = paths.stats;
     let history_path = paths.history;
+    let local_path = history_path
+        .as_ref()
+        .map(|p| p.with_file_name("history-local.json"));
+    let mut calendar = crate::local_history::LocalHistory::load(
+        local_path.as_deref(),
+        source.clone(),
+        crate::litellm::calendar::CalendarWindow::new(Local::now().date_naive(), &Local),
+    );
+    let mut local_worker: Option<tauri::async_runtime::JoinHandle<()>> = None;
+    let mut local_run = 0u64;
+    let mut local_tick = tokio::time::interval(Duration::from_secs(1));
     let load_path = history_path.clone();
     let history_source = source.clone();
     let mut history = tauri::async_runtime::spawn_blocking(move || {
@@ -357,6 +422,7 @@ async fn coordinate(
     let mut increase_retry = IncreaseRetry::default();
     let mut pending = true;
     let mut next = tokio::time::Instant::now();
+    publish_calendar(&local_snapshots, &calendar, stats.generation, false);
     loop {
         if pending && worker.is_none() {
             pending = false;
@@ -435,6 +501,7 @@ async fn coordinate(
             publish(&stats);
         }
         let command = tokio::select! {
+            _ = local_tick.tick() => Command::CalendarTick,
             command = receiver.recv() => match command { Some(c) => c, None => break },
             _ = tokio::time::sleep_until(next), if worker.is_none() => {
                 let mut refreshed = connection(&store, &http);
@@ -447,6 +514,129 @@ async fn coordinate(
             }
         };
         match command {
+            Command::CalendarTick => {
+                if calendar.rebase(
+                    store.get().source_id,
+                    crate::litellm::calendar::CalendarWindow::new(
+                        Local::now().date_naive(),
+                        &Local,
+                    ),
+                ) {
+                    local_run += 1;
+                    if let Some(worker) = local_worker.take() {
+                        worker.abort();
+                    }
+                    publish_calendar(&local_snapshots, &calendar, stats.generation, false);
+                }
+            }
+            Command::LocalHistory(mode, reply) => {
+                if calendar.rebase(
+                    store.get().source_id,
+                    crate::litellm::calendar::CalendarWindow::new(
+                        Local::now().date_naive(),
+                        &Local,
+                    ),
+                ) {
+                    local_run += 1;
+                    if let Some(worker) = local_worker.take() {
+                        worker.abort();
+                    }
+                    publish_calendar(&local_snapshots, &calendar, stats.generation, false);
+                }
+                let now = chrono::Utc::now();
+                if mode == HistoryMode::Force {
+                    local_run += 1;
+                    if let Some(worker) = local_worker.take() {
+                        worker.abort();
+                    }
+                }
+                if local_worker.is_none() {
+                    if let Some(start) = calendar.range(now, mode) {
+                        match client.clone() {
+                            Ok(client) => {
+                                local_run += 1;
+                                let run = local_run;
+                                let generation = stats.generation;
+                                let today = calendar.window.today;
+                                let bounds = calendar.window.days.clone();
+                                let send = commands.clone();
+                                local_worker = Some(tauri::async_runtime::spawn(async move {
+                                    let progress = send.clone();
+                                    let result = client
+                                        .fetch_local_history(
+                                            today,
+                                            start,
+                                            mode == HistoryMode::Force,
+                                            move |value| {
+                                                if let Some(bounds) = bounds
+                                                    .iter()
+                                                    .find(|(d, _)| d.to_string() == value.date)
+                                                    .and_then(|(_, b)| *b)
+                                                {
+                                                    let _ = progress.send(Command::LocalProgress(
+                                                        generation,
+                                                        run,
+                                                        bounds,
+                                                        value.models.iter().map(|m| m.spend).sum(),
+                                                        now,
+                                                    ));
+                                                }
+                                            },
+                                        )
+                                        .await;
+                                    let _ = send.send(Command::LocalFinished(
+                                        generation, run, now, start, result,
+                                    ));
+                                }));
+                                publish_calendar(
+                                    &local_snapshots,
+                                    &calendar,
+                                    stats.generation,
+                                    true,
+                                );
+                            }
+                            Err(error) => {
+                                calendar.finish(now, start, Some(error));
+                                publish_calendar(
+                                    &local_snapshots,
+                                    &calendar,
+                                    stats.generation,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+                let _ = reply.send(Ok(local_snapshots.borrow().clone()));
+            }
+            Command::LocalProgress(generation, run, bounds, spend, when) => {
+                if generation == stats.generation
+                    && run == local_run
+                    && calendar.merge_day(bounds, spend, when)
+                {
+                    publish_calendar(&local_snapshots, &calendar, generation, true);
+                }
+            }
+            Command::LocalFinished(generation, run, now, start, result) => {
+                if generation != stats.generation || run != local_run {
+                    continue;
+                }
+                local_worker = None;
+                calendar.finish(now, start, result.err());
+                persist_calendar(&local_path, &mut calendar).await;
+                publish_calendar(&local_snapshots, &calendar, generation, false);
+            }
+            Command::LocalCost(generation, bounds, spend, when) => {
+                if generation == stats.generation && calendar.merge_day(bounds, spend, when) {
+                    persist_calendar(&local_path, &mut calendar).await;
+                    publish_calendar(
+                        &local_snapshots,
+                        &calendar,
+                        generation,
+                        local_worker.is_some(),
+                    );
+                }
+            }
             Command::History(mode, reply) => {
                 let now = chrono::Utc::now();
                 history.roll(now.date_naive());
@@ -564,6 +754,10 @@ async fn coordinate(
                 }
             }
             Command::Save(input, reply) => {
+                local_run += 1;
+                if let Some(worker) = local_worker.take() {
+                    worker.abort();
+                }
                 if let Some((_, worker)) = history_worker.take() {
                     worker.abort();
                 }
@@ -608,6 +802,14 @@ async fn coordinate(
                     };
                 }
                 client = connection(&store, &http);
+                calendar.rebase(
+                    store.get().source_id,
+                    crate::litellm::calendar::CalendarWindow::new(
+                        Local::now().date_naive(),
+                        &Local,
+                    ),
+                );
+                publish_calendar(&local_snapshots, &calendar, stats.generation, false);
                 stats.revision += 1;
                 snapshots.send_replace(stats.clone());
                 publish(&stats);
@@ -686,6 +888,41 @@ async fn coordinate(
     if let Some((_, worker)) = history_worker {
         worker.abort();
     }
+    if let Some(worker) = local_worker {
+        worker.abort();
+    }
+}
+
+fn publish_calendar(
+    sender: &watch::Sender<shared::LocalHistorySnapshot>,
+    calendar: &crate::local_history::LocalHistory,
+    generation: u64,
+    loading: bool,
+) {
+    let revision = sender.borrow().revision + 1;
+    sender.send_replace(shared::LocalHistorySnapshot {
+        generation,
+        revision,
+        calendar_id: calendar.window.id.clone(),
+        loading,
+        details: calendar.view(),
+    });
+}
+
+async fn persist_calendar(
+    path: &Option<PathBuf>,
+    calendar: &mut crate::local_history::LocalHistory,
+) {
+    if let Some(path) = path.clone() {
+        let snapshot = calendar.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            crate::persistence::write(&path, &snapshot).map_err(|e| e.to_string())
+        })
+        .await;
+        if let Err(error) = result.map_err(|e| e.to_string()).and_then(|r| r) {
+            calendar.finish(chrono::Utc::now(), calendar.window.today, Some(error));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -745,9 +982,12 @@ mod tests {
     ) -> (Service, tokio::task::JoinHandle<()>) {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (snapshots, updates) = watch::channel(Stats::default());
+        let (local_snapshots, local_updates) =
+            watch::channel(shared::LocalHistorySnapshot::default());
         let service = Service {
             commands: commands.clone(),
             snapshots: updates,
+            local_snapshots: local_updates,
         };
         let task = tokio::spawn(coordinate(
             store,
@@ -757,6 +997,7 @@ mod tests {
             commands,
             receiver,
             snapshots,
+            local_snapshots,
         ));
         (service, task)
     }
@@ -886,6 +1127,175 @@ mod tests {
         service.save(preferences(&new, false)).await.unwrap();
         assert!(matches!(pending.await.unwrap(), Err(error) if error.contains("configuration")));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_calendar_publishes_progress_and_keeps_utc_history_independent() {
+        let server = MockServer::start();
+        let today = Local::now().date_naive();
+        server.mock(|when, then| {
+            when.path("/spend/logs").query_param_exists("api_key");
+            then.status(200).json_body(
+                serde_json::json!([{"startTime":today.to_string(),"spend":7,"models":{"m":7}}]),
+            );
+        });
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(
+                serde_json::json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}),
+            );
+        });
+        mocks(&server, 1.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
+        let mut updates = service.subscribe_local_history();
+        let cached = service.local_history(HistoryMode::Cached).await.unwrap();
+        assert!(!cached.loading);
+        let initial = service.local_history(HistoryMode::Refresh).await.unwrap();
+        assert!(initial.loading);
+        let complete = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                updates.changed().await.unwrap();
+                let next = updates.borrow().clone();
+                if next.revision > initial.revision && !next.loading {
+                    break next;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete.details.days[29].spend, Some(7.0));
+        assert!(complete.details.error.is_none());
+        assert!(service
+            .history(HistoryMode::Cached)
+            .await
+            .unwrap()
+            .data
+            .days
+            .iter()
+            .all(|d| d.spend.is_none()));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_calendar_force_supersedes_and_selected_cost_beats_older_batch() {
+        let server = MockServer::start();
+        let today = Local::now().date_naive();
+        let mut old = server.mock(|when, then| {
+            when.path("/spend/logs").query_param_exists("api_key");
+            then.status(200)
+                .delay(Duration::from_millis(250))
+                .json_body(
+                    serde_json::json!([{"startTime":today.to_string(),"spend":1,"models":{"m":1}}]),
+                );
+        });
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(
+                serde_json::json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}),
+            );
+        });
+        mocks(&server, 1.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
+        let mut updates = service.subscribe_local_history();
+        let first = service.local_history(HistoryMode::Refresh).await.unwrap();
+        let shared = service.local_history(HistoryMode::Refresh).await.unwrap();
+        assert_eq!(shared.revision, first.revision);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while old.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        old.delete();
+        server.mock(|when, then| {
+            when.path("/spend/logs").query_param_exists("api_key");
+            then.status(200).json_body(
+                serde_json::json!([{"startTime":today.to_string(),"spend":2,"models":{"m":2}}]),
+            );
+        });
+        let forced = service.local_history(HistoryMode::Force).await.unwrap();
+        assert!(forced.revision > first.revision);
+        let bounds = crate::litellm::calendar::day_bounds(today, &Local).unwrap();
+        service
+            .commands
+            .send(Command::LocalCost(
+                forced.generation,
+                bounds,
+                9.0,
+                chrono::Utc::now() + chrono::Duration::seconds(1),
+            ))
+            .unwrap();
+        let complete = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                updates.changed().await.unwrap();
+                let value = updates.borrow().clone();
+                if value.revision > forced.revision && !value.loading {
+                    break value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete.details.days[29].spend, Some(9.0));
+        service
+            .commands
+            .send(Command::LocalCost(
+                forced.generation + 1,
+                bounds,
+                99.0,
+                chrono::Utc::now() + chrono::Duration::seconds(2),
+            ))
+            .unwrap();
+        let current = service.local_history(HistoryMode::Cached).await.unwrap();
+        assert_eq!(current.details.days[29].spend, Some(9.0));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_calendar_disk_failure_keeps_memory_and_saved_connection_clears_it() {
+        let old = MockServer::start();
+        let new = MockServer::start();
+        mocks(&old, 1.0, 0);
+        mocks(&new, 2.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&old.base_url()));
+        store.save(preferences(&old, false)).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("local-calendar-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("history-local.json")).unwrap();
+        let (service, task) = start_with_storage(
+            store,
+            StoragePaths {
+                stats: None,
+                history: Some(directory.join("history.json")),
+            },
+            Arc::new(|_, _| Ok(false)),
+        );
+        let first = service.local_history(HistoryMode::Cached).await.unwrap();
+        let bounds =
+            crate::litellm::calendar::day_bounds(Local::now().date_naive(), &Local).unwrap();
+        service
+            .commands
+            .send(Command::LocalCost(
+                first.generation,
+                bounds,
+                7.0,
+                chrono::Utc::now(),
+            ))
+            .unwrap();
+        let current = service.local_history(HistoryMode::Cached).await.unwrap();
+        assert_eq!(current.details.days[29].spend, Some(7.0));
+        assert!(current.details.error.is_some());
+        service.save(preferences(&new, false)).await.unwrap();
+        let next = service.local_history(HistoryMode::Cached).await.unwrap();
+        assert!(next.details.days.iter().all(|d| d.spend.is_none()));
+        assert!(next.generation > first.generation);
+        task.abort();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
