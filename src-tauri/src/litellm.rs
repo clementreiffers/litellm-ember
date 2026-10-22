@@ -2,6 +2,7 @@
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
 mod analytics;
+pub(crate) mod calendar;
 mod costs;
 mod daily;
 mod domain;

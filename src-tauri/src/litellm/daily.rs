@@ -1,5 +1,9 @@
 //! Chargement paginé et cache des journées de consommation.
-use super::{aggregate_today, day_range, Client, LogRow, TransportError};
+use super::{
+    aggregate_today,
+    calendar::{day_bounds, DayBounds},
+    day_range, Client, LogRow, TransportError,
+};
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
@@ -16,6 +20,7 @@ const PAST_TTL: Duration = Duration::from_secs(15 * 60);
 
 struct DailyCache {
     date: String,
+    bounds: Option<DayBounds>,
     request_id: u64,
     fetched: Instant,
     usage: Option<DailyUsage>,
@@ -88,7 +93,12 @@ impl Page {
 }
 
 impl Client {
-    pub(super) async fn cached_day(&self, date: &str) -> Option<DailyUsage> {
+    pub(super) async fn cached_day_in_zone(
+        &self,
+        date: &str,
+        zone: &impl TimeZone,
+    ) -> Option<DailyUsage> {
+        let bounds = day_bounds(NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?, zone)?;
         let state = self.daily.lock().await;
         let ttl = if date == Local::now().date_naive().to_string() {
             Duration::from_secs(60)
@@ -98,7 +108,7 @@ impl Client {
         state
             .cache
             .iter()
-            .find(|entry| entry.date == date && entry.fetched.elapsed() < ttl)
+            .find(|entry| entry.bounds == Some(bounds) && entry.fetched.elapsed() < ttl)
             .and_then(|entry| entry.usage.clone())
     }
     /// Réutilise les agrégats seulement pour la même connexion, jamais les lignes du jour courant.
@@ -111,6 +121,15 @@ impl Client {
     }
 
     pub async fn fetch_day(&self, date: &str, force: bool) -> Result<DailyUsage, String> {
+        self.fetch_day_in_zone(date, force, &Local).await
+    }
+
+    pub(super) async fn fetch_day_in_zone(
+        &self,
+        date: &str,
+        force: bool,
+        zone: &impl TimeZone,
+    ) -> Result<DailyUsage, String> {
         let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .ok()
             .filter(|day| date.len() == 10 && day.to_string() == date)
@@ -119,69 +138,76 @@ impl Client {
         if day > today {
             return Err("La date ne peut pas être dans le futur".into());
         }
-        let request_id =
-            {
-                let mut state = self.daily.lock().await;
-                let ttl = if day == today {
-                    Duration::from_secs(60)
-                } else {
-                    PAST_TTL
-                };
-                if !force {
-                    if let Some(index) = state.cache.iter().position(|c| {
-                        c.date == date && c.usage.is_some() && c.fetched.elapsed() < ttl
-                    }) {
-                        let cached = state.cache.remove(index).unwrap();
-                        let usage = cached.usage.clone().unwrap();
-                        state.cache.push_back(cached);
-                        return Ok(usage);
-                    }
-                }
-                state.request_id += 1;
-                let request_id = state.request_id;
-                state.cache.retain(|c| c.date != date);
-                state.cache.push_back(DailyCache {
-                    date: date.into(),
-                    request_id,
-                    fetched: Instant::now(),
-                    usage: None,
-                });
-                while state.cache.len() > CACHE_DAYS {
-                    state.cache.pop_front();
-                }
-                request_id
+        let bounds = day_bounds(day, zone);
+        let request_id = {
+            let mut state = self.daily.lock().await;
+            let ttl = if day == today {
+                Duration::from_secs(60)
+            } else {
+                PAST_TTL
             };
-        let models = if let Some(models) = self.fetch_analytics_in_zone(day, &Local, force).await {
+            if !force {
+                if let Some(index) = state.cache.iter().position(|c| {
+                    bounds.is_some()
+                        && c.bounds == bounds
+                        && c.usage.is_some()
+                        && c.fetched.elapsed() < ttl
+                }) {
+                    let cached = state.cache.remove(index).unwrap();
+                    let usage = cached.usage.clone().unwrap();
+                    state.cache.push_back(cached);
+                    return Ok(usage);
+                }
+            }
+            state.request_id += 1;
+            let request_id = state.request_id;
+            state.cache.retain(|c| c.date != date);
+            state.cache.push_back(DailyCache {
+                date: date.into(),
+                bounds,
+                request_id,
+                fetched: Instant::now(),
+                usage: None,
+            });
+            while state.cache.len() > CACHE_DAYS {
+                state.cache.pop_front();
+            }
+            request_id
+        };
+        let models = if let Some(models) = self.fetch_analytics_in_zone(day, zone, force).await {
             models
         } else {
-            let rows = match self.fetch_day_pages(day).await? {
+            let (start, end) = exact_range(day, zone).ok_or("Date hors limites")?;
+            let rows = match self.fetch_range_pages(start, end).await? {
                 Some(rows) => rows,
                 None => {
-                    let (start, end) = day_range(day, &Local).ok_or("Date hors limites")?;
+                    let (start, end) = day_range(day, zone).ok_or("Date hors limites")?;
                     self.get(&format!(
                         "/spend/logs?summarize=false&start_date={start}&end_date={end}"
                     ))
                     .await?
                 }
             };
-            aggregate_today(&rows, day, &Local)
+            aggregate_today(&rows, day, zone)
         };
         let usage = DailyUsage {
             date: date.into(),
             models,
         };
         let mut state = self.daily.lock().await;
-        if let Some(entry) = state
-            .cache
-            .iter_mut()
-            .find(|c| c.date == date && c.request_id == request_id)
-        {
+        if let Some(entry) = state.cache.iter_mut().find(|c| {
+            c.date == date
+                && c.request_id == request_id
+                && bounds.is_some()
+                && bounds == day_bounds(day, zone)
+        }) {
             entry.fetched = Instant::now();
             entry.usage = Some(usage.clone());
         }
         Ok(usage)
     }
 
+    #[cfg(test)]
     async fn fetch_day_pages(&self, day: NaiveDate) -> Result<Option<Vec<LogRow>>, String> {
         let (start, end) = exact_range(day, &Local).ok_or("Date hors limites")?;
         self.fetch_range_pages(start, end).await

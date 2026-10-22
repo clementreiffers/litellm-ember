@@ -141,14 +141,7 @@ impl Client {
         let next = day.succ_opt()?;
         let midnight = day.and_hms_opt(0, 0, 0)?;
         let next_midnight = next.and_hms_opt(0, 0, 0)?;
-        let start = zone
-            .from_local_datetime(&midnight)
-            .earliest()?
-            .with_timezone(&Utc);
-        let end = zone
-            .from_local_datetime(&next_midnight)
-            .earliest()?
-            .with_timezone(&Utc);
+        let super::calendar::DayBounds { start, end, .. } = super::calendar::day_bounds(day, zone)?;
         let utc_start = midnight.and_utc();
         let utc_end = next_midnight.and_utc();
         let mut url =

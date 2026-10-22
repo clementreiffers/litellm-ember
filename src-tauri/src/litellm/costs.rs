@@ -1,6 +1,7 @@
 //! Coûts rapides : résumé UTC corrigé aux frontières de la journée locale.
 use super::{
     aggregate_totals,
+    calendar::{day_bounds, DayBounds},
     domain::{normalize_model, DaySummary},
     Client,
 };
@@ -14,6 +15,7 @@ use std::{
 
 struct CachedCosts {
     date: String,
+    bounds: DayBounds,
     request_id: u64,
     fetched: Instant,
     value: Option<DailyCosts>,
@@ -26,14 +28,25 @@ pub(super) struct CostState {
 
 impl Client {
     pub async fn fetch_day_costs(&self, date: &str, force: bool) -> Result<DailyCosts, String> {
+        self.fetch_day_costs_cached_in_zone(date, force, &Local)
+            .await
+    }
+
+    pub(super) async fn fetch_day_costs_cached_in_zone(
+        &self,
+        date: &str,
+        force: bool,
+        zone: &impl TimeZone,
+    ) -> Result<DailyCosts, String> {
         let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .ok()
             .filter(|day| {
                 date.len() == 10 && day.to_string() == date && *day <= Local::now().date_naive()
             })
             .ok_or("Date invalide ou future")?;
+        let bounds = day_bounds(day, zone).ok_or("Frontière locale indisponible")?;
         if !force {
-            if let Some(usage) = self.cached_day(date).await {
+            if let Some(usage) = self.cached_day_in_zone(date, zone).await {
                 return Ok(DailyCosts {
                     date: usage.date,
                     models: usage
@@ -56,7 +69,7 @@ impl Client {
             });
             if !force {
                 if let Some(index) = state.entries.iter().position(|entry| {
-                    entry.date == date && entry.value.is_some() && entry.fetched.elapsed() < ttl
+                    entry.bounds == bounds && entry.value.is_some() && entry.fetched.elapsed() < ttl
                 }) {
                     let entry = state.entries.remove(index).unwrap();
                     let value = entry.value.clone().unwrap();
@@ -69,6 +82,7 @@ impl Client {
             state.entries.retain(|entry| entry.date != date);
             state.entries.push_back(CachedCosts {
                 date: date.into(),
+                bounds,
                 request_id: id,
                 fetched: Instant::now(),
                 value: None,
@@ -78,13 +92,11 @@ impl Client {
             }
             id
         };
-        let value = self.fetch_day_costs_in_zone(day, &Local).await?;
+        let value = self.fetch_day_costs_in_zone(day, zone).await?;
         let mut state = self.costs.lock().await;
-        if let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.date == date && entry.request_id == id)
-        {
+        if let Some(entry) = state.entries.iter_mut().find(|entry| {
+            entry.date == date && entry.request_id == id && Some(bounds) == day_bounds(day, zone)
+        }) {
             entry.value = Some(value.clone());
             entry.fetched = Instant::now();
         }
@@ -99,16 +111,8 @@ impl Client {
         let next = day.succ_opt().ok_or("Date hors limites")?;
         let midnight = day.and_hms_opt(0, 0, 0).unwrap();
         let next_midnight = next.and_hms_opt(0, 0, 0).unwrap();
-        let start = zone
-            .from_local_datetime(&midnight)
-            .earliest()
-            .ok_or("Frontière locale indisponible")?
-            .with_timezone(&Utc);
-        let end = zone
-            .from_local_datetime(&next_midnight)
-            .earliest()
-            .ok_or("Frontière locale indisponible")?
-            .with_timezone(&Utc);
+        let DayBounds { start, end, .. } =
+            day_bounds(day, zone).ok_or("Frontière locale indisponible")?;
         let utc_start = midnight.and_utc();
         let utc_end = next_midnight.and_utc();
         let summary = async {
@@ -202,6 +206,104 @@ mod tests {
     use chrono::{NaiveDate, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn daily_caches_do_not_cross_calendar_boundaries() {
+        let server = MockServer::start();
+        let summary = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":2,"models":{"m":2}}]));
+        });
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200)
+                .json_body(json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        client
+            .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        client
+            .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        summary.assert_hits(1);
+        client
+            .fetch_day_costs_cached_in_zone(
+                "2024-02-29",
+                false,
+                &chrono::FixedOffset::east_opt(7200).unwrap(),
+            )
+            .await
+            .unwrap();
+        summary.assert_hits(2);
+        client
+            .fetch_day_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        assert!(client
+            .cached_day_in_zone("2024-02-29", &Utc)
+            .await
+            .is_some());
+        assert!(client
+            .cached_day_in_zone("2024-02-29", &chrono::FixedOffset::east_opt(7200).unwrap())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn daily_cache_changed_bounds_reject_old_pending_result() {
+        let server = MockServer::start();
+        let mut old = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(250))
+                .json_body(json!([{"startTime":"2024-02-29","spend":1,"models":{"m":1}}]));
+        });
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200)
+                .json_body(json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0}));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let cloned = client.clone();
+        let pending = tokio::spawn(async move {
+            cloned
+                .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while old.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        old.delete();
+        let current = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":2,"models":{"m":2}}]));
+        });
+        let zone = chrono::FixedOffset::east_opt(7200).unwrap();
+        client
+            .fetch_day_costs_cached_in_zone("2024-02-29", false, &zone)
+            .await
+            .unwrap();
+        pending.await.unwrap().unwrap();
+        assert_eq!(
+            client
+                .fetch_day_costs_cached_in_zone("2024-02-29", false, &zone)
+                .await
+                .unwrap()
+                .models[0]
+                .spend,
+            2.0
+        );
+        current.assert_hits(1);
+    }
 
     #[tokio::test]
     async fn daily_cost_preview_cache_expires_and_preserves_latest_forced_result() {
