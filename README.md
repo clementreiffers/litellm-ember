@@ -262,6 +262,12 @@ In **Consommation**, use the date picker or previous/next-day buttons to inspect
 
 Past days load on demand, and **Rafraîchir tout** reloads the selected day's figures. You can select dates older than 30 days, provided your LiteLLM server still retains their logs. An empty response means no usage was returned; Ember cannot distinguish an unused day from logs removed by server retention. Loading and network errors do not display another day's figures.
 
+Historical loading uses `/spend/logs/v2` with exact local-day boundaries converted to UTC, 1,000 records per page, and up to three concurrent page requests. This endpoint omits prompt and response bodies. Ember checks that all pages are complete before showing totals. Servers that deny or lack this endpoint, or cap the result count, use the original `/spend/logs` query instead.
+
+If the legacy endpoint also reports truncation, Ember shows an error instead of presenting incomplete totals as a full day's usage.
+
+Up to 30 recently visited daily aggregates stay in memory for 15 minutes, making return visits fast. This is a cache limit, not a limit on selectable dates. Today's data expires after 60 seconds. **Rafraîchir tout** bypasses the selected day's cache; changing the endpoint or API key clears connection-specific data. No historical request logs are written to disk.
+
 The header, budget gauge, period model costs, and menu-bar amount always describe the **current budget period**. The History calendar below uses UTC dates, which may differ from the local days used in Consommation.
 
 ### Daily spending calendar

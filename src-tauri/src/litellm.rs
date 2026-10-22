@@ -1,14 +1,17 @@
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
+mod daily;
 mod domain;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
-use shared::{Activity, DailyUsage, ModelCost, ModelUsage, WeekDetails};
+use shared::{Activity, ModelCost, ModelUsage, WeekDetails};
 
 #[derive(Debug, thiserror::Error)]
 enum TransportError {
+    #[error("Historique tronqué par LiteLLM ; impossible de calculer un total complet")]
+    Truncated,
     #[error("{0}")]
     Request(String),
     #[error("HTTP {status} sur {path}")]
@@ -31,7 +34,7 @@ impl From<TransportError> for String {
 #[derive(Clone)]
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
-    daily: std::sync::Arc<tokio::sync::Mutex<DailyState>>,
+    daily: std::sync::Arc<tokio::sync::Mutex<daily::DailyState>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -47,17 +50,6 @@ struct SummaryCache {
     fetched: std::time::Instant,
     path: String,
     rows: std::sync::Arc<Vec<DaySummary>>,
-}
-
-struct DailyCache {
-    fetched: std::time::Instant,
-    usage: DailyUsage,
-}
-
-#[derive(Default)]
-struct DailyState {
-    request_id: u64,
-    cache: Option<DailyCache>,
 }
 
 impl Client {
@@ -130,6 +122,13 @@ impl Client {
                 path: path.to_owned(),
             });
         }
+        if resp
+            .headers()
+            .get("x-litellm-spend-logs-truncated")
+            .is_some_and(|value| value == "true")
+        {
+            return Err(TransportError::Truncated);
+        }
         resp.json().await.map_err(|source| TransportError::Decode {
             path: path.to_owned(),
             source: source.without_url(),
@@ -172,46 +171,6 @@ impl Client {
     pub async fn fetch_today_snapshot(&self) -> Result<(NaiveDate, Vec<ModelUsage>), String> {
         let (today, rows) = self.fetch_today_rows().await?;
         Ok((today, aggregate_today(&rows, today, &Local)))
-    }
-
-    /// Journée locale à la demande ; ne remplace jamais les données du cycle courant.
-    pub async fn fetch_day(&self, date: &str, force: bool) -> Result<DailyUsage, String> {
-        let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .ok()
-            .filter(|day| date.len() == 10 && day.to_string() == date)
-            .ok_or("Date invalide : utilisez YYYY-MM-DD")?;
-        if day > Local::now().date_naive() {
-            return Err("La date ne peut pas être dans le futur".into());
-        }
-        let request_id =
-            {
-                let mut state = self.daily.lock().await;
-                state.request_id += 1;
-                if let Some(cached) = state.cache.as_ref().filter(|c| {
-                    !force && c.usage.date == date && c.fetched.elapsed().as_secs() < 60
-                }) {
-                    return Ok(cached.usage.clone());
-                }
-                state.request_id
-            };
-        let (start, end) = day_range(day, &Local).ok_or("Date hors limites")?;
-        let rows: Vec<LogRow> = self
-            .get(&format!(
-                "/spend/logs?summarize=false&start_date={start}&end_date={end}"
-            ))
-            .await?;
-        let usage = DailyUsage {
-            date: date.into(),
-            models: aggregate_today(&rows, day, &Local),
-        };
-        let mut state = self.daily.lock().await;
-        if state.request_id == request_id {
-            state.cache = Some(DailyCache {
-                fetched: std::time::Instant::now(),
-                usage: usage.clone(),
-            });
-        }
-        Ok(usage)
     }
 
     async fn fetch_today_rows(&self) -> Result<(NaiveDate, std::sync::Arc<Vec<LogRow>>), String> {
@@ -567,7 +526,7 @@ mod tests {
         assert!((today[0].spend - 0.75).abs() < 1e-9);
     }
 
-    fn d(s: &str) -> NaiveDate {
+    pub(super) fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
@@ -590,10 +549,10 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct ShiftZone {
-        at: chrono::NaiveDateTime,
-        before: chrono::FixedOffset,
-        after: chrono::FixedOffset,
+    pub(super) struct ShiftZone {
+        pub(super) at: chrono::NaiveDateTime,
+        pub(super) before: chrono::FixedOffset,
+        pub(super) after: chrono::FixedOffset,
     }
 
     impl chrono::TimeZone for ShiftZone {

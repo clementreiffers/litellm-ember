@@ -424,7 +424,15 @@ async fn coordinate(
         }
         let command = tokio::select! {
             command = receiver.recv() => match command { Some(c) => c, None => break },
-            _ = tokio::time::sleep_until(next), if worker.is_none() => { client = connection(&store, &http); pending = true; continue; }
+            _ = tokio::time::sleep_until(next), if worker.is_none() => {
+                let mut refreshed = connection(&store, &http);
+                if let (Ok(next), Ok(previous)) = (&mut refreshed, &client) {
+                    next.reuse_daily_cache(previous);
+                }
+                client = refreshed;
+                pending = true;
+                continue;
+            }
         };
         match command {
             Command::History(mode, reply) => {
@@ -533,7 +541,11 @@ async fn coordinate(
                 let _ = reply.send(client.clone().map(|c| (c, stats.clone())));
             }
             Command::Refresh(reply) => {
-                client = connection(&store, &http);
+                let mut refreshed = connection(&store, &http);
+                if let (Ok(next), Ok(previous)) = (&mut refreshed, &client) {
+                    next.reuse_daily_cache(previous);
+                }
+                client = refreshed;
                 pending = true;
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(()));
@@ -751,6 +763,58 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn historical_cache_survives_automatic_budget_refresh() {
+        let server = MockServer::start();
+        let historical=server.mock(|when,then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(serde_json::json!({"data":[],"total":0,"page":1,"page_size":1000,"total_pages":0,"total_is_capped":false}));
+        });
+        mocks(&server, 42.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        let mut settings = preferences(&server, false);
+        settings.refresh_secs = 5;
+        store.save(settings).unwrap();
+        let (service, task) = start(store, Arc::new(AtomicUsize::new(0)), None);
+        let before = finished(&service, 1).await;
+        service.day_usage("2024-02-29".into(), false).await.unwrap();
+        let mut snapshots = service.snapshots.clone();
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            snapshots.wait_for(|s| s.cycle_id > before.cycle_id && !s.refreshing),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        service.day_usage("2024-02-29".into(), false).await.unwrap();
+        historical.assert_hits(1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn historical_cache_survives_current_budget_refresh() {
+        let server = MockServer::start();
+        let historical=server.mock(|when,then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(serde_json::json!({
+                "data":[],"total":0,"page":1,"page_size":1000,"total_pages":0,"total_is_capped":false
+            }));
+        });
+        mocks(&server, 42.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        let before = finished(&service, 1).await;
+        service.day_usage("2024-02-29".into(), false).await.unwrap();
+        service.refresh_and_wait().await.unwrap();
+        finished(&service, before.cycle_id + 1).await;
+        service.day_usage("2024-02-29".into(), false).await.unwrap();
+        historical.assert_hits(1);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn historical_usage_does_not_modify_live_stats() {
         let server = MockServer::start();
