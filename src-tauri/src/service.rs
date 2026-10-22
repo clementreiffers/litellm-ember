@@ -205,8 +205,7 @@ impl Service {
                         publish,
                         commands,
                         receiver,
-                        snapshots,
-                        local_snapshots,
+                        (snapshots, local_snapshots),
                     )
                     .await
                 }
@@ -367,9 +366,12 @@ async fn coordinate(
     publish: impl Fn(&Stats) + Send + 'static,
     commands: mpsc::UnboundedSender<Command>,
     mut receiver: mpsc::UnboundedReceiver<Command>,
-    snapshots: watch::Sender<Stats>,
-    local_snapshots: watch::Sender<shared::LocalHistorySnapshot>,
+    publications: (
+        watch::Sender<Stats>,
+        watch::Sender<shared::LocalHistorySnapshot>,
+    ),
 ) {
+    let (snapshots, local_snapshots) = publications;
     let http = Client::http();
     let mut client = connection(&store, &http);
     let source = store.get().source_id;
@@ -996,8 +998,7 @@ mod tests {
             |_| {},
             commands,
             receiver,
-            snapshots,
-            local_snapshots,
+            (snapshots, local_snapshots),
         ));
         (service, task)
     }

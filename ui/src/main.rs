@@ -1,5 +1,6 @@
 mod app;
 mod chart;
+mod daily_view;
 mod details;
 mod harness;
 mod history;

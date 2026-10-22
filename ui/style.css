@@ -24,6 +24,10 @@ h3 { font-size: 11px; color: #aeaeb2; margin: 14px 0 6px; font-weight: 500; }
 .donut-val { fill: #f2f2f7; font-size: 15px; font-weight: 700; }
 .donut-cap { fill: #8e8e93; font-size: 8px; }
 .today-stats { flex: 1; }
+.recap-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+.recap-heading h2 { margin-bottom: 0; }
+.day-recap .donut { width: 96px; height: 96px; }
+.token-counts { margin-top: 6px; }
 .day-navigation { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .day-navigation button, .day-navigation input { min-width: 0; padding: 6px 8px; border: .5px solid rgba(255,255,255,.2); border-radius: 8px; background: rgba(255,255,255,.08); color: #f5f5f7; font: inherit; }
 .day-navigation input { flex: 1; }

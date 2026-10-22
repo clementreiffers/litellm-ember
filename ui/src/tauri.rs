@@ -206,17 +206,17 @@ pub async fn on_event<T: serde::de::DeserializeOwned + 'static>(
 }
 
 /// Lecture locale, actualisation légère ou synchronisation manuelle complète.
-pub async fn get_history(
+pub async fn get_local_history(
     mode: shared::HistoryMode,
-) -> Result<Detail<shared::HistoryDetails>, String> {
+) -> Result<shared::LocalHistorySnapshot, String> {
     #[derive(Serialize)]
     struct Args {
         mode: shared::HistoryMode,
     }
     let args = serde_wasm_bindgen::to_value(&Args { mode }).map_err(|e| e.to_string())?;
-    let value = invoke_with("get_history", args).await.map_err(|e| {
+    let value = invoke_with("get_local_history", args).await.map_err(|e| {
         e.as_string()
-            .unwrap_or_else(|| "Historique indisponible".into())
+            .unwrap_or_else(|| "Historique local indisponible".into())
     })?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }

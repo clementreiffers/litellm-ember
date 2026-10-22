@@ -207,12 +207,6 @@ impl Client {
         Ok(usage)
     }
 
-    #[cfg(test)]
-    async fn fetch_day_pages(&self, day: NaiveDate) -> Result<Option<Vec<LogRow>>, String> {
-        let (start, end) = exact_range(day, &Local).ok_or("Date hors limites")?;
-        self.fetch_range_pages(start, end).await
-    }
-
     pub(super) async fn fetch_range_pages(
         &self,
         start: DateTime<Utc>,

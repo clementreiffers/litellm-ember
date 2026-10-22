@@ -20,6 +20,16 @@ pub fn normalize_selection(date: &str, today: &str) -> Option<String> {
     (date != today).then(|| date.to_owned())
 }
 
+pub fn daily_total(
+    full: Option<&[ModelUsage]>,
+    costs: Option<&[shared::ModelCost]>,
+    known: Option<f64>,
+) -> Option<f64> {
+    full.map(|rows| rows.iter().map(|r| r.spend).sum())
+        .or_else(|| costs.map(|rows| rows.iter().map(|r| r.spend).sum()))
+        .or(known)
+}
+
 pub fn visible_costs(
     selected: Option<&str>,
     full: Option<&[ModelUsage]>,
@@ -115,6 +125,22 @@ pub fn DayNavigation(
 mod tests {
     use super::*;
     use shared::{DailyUsage, ModelUsage, Stats};
+
+    #[test]
+    fn daily_total_prioritizes_details_and_preserves_known_zero() {
+        assert_eq!(daily_total(None, None, Some(0.0)), Some(0.0));
+        let costs = vec![shared::ModelCost {
+            model: "m".into(),
+            spend: 2.0,
+        }];
+        let full = vec![ModelUsage {
+            spend: 3.0,
+            ..Default::default()
+        }];
+        assert_eq!(daily_total(None, Some(&costs), Some(1.0)), Some(2.0));
+        assert_eq!(daily_total(Some(&full), Some(&costs), Some(1.0)), Some(3.0));
+        assert_eq!(daily_total(None, None, None), None);
+    }
 
     #[test]
     fn historical_selection_never_reads_live_or_other_day_usage() {
