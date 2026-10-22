@@ -33,6 +33,14 @@ pub fn local_today() -> String {
     format_local(&js_sys::Date::new_0())
 }
 
+pub fn update_today(today: RwSignal<String>) -> String {
+    let current = local_today();
+    if today.get_untracked() != current {
+        today.set(current.clone());
+    }
+    current
+}
+
 fn calendar_date(value: &str) -> Option<js_sys::Date> {
     if value.len() != 10 {
         return None;
@@ -50,10 +58,10 @@ pub fn DayNavigation(
 ) -> impl IntoView {
     let displayed = Signal::derive(move || selected.get().unwrap_or_else(|| today.get()));
     let step = move |delta: i32| {
+        let current = update_today(today);
         if let Some(date) = calendar_date(&displayed.get_untracked()) {
             date.set_date((date.get_date() as i32 + delta) as u32);
             let next = format_local(&date);
-            let current = today.get_untracked();
             if next.as_str() >= "0001-01-01" && next <= current {
                 on_select.run(normalize_selection(&next, &current));
             }
@@ -67,7 +75,7 @@ pub fn DayNavigation(
                 max=move || today.get() prop:value=move || displayed.get()
                 on:change:target=move |event| {
                     let value = event.target().value();
-                    let current = today.get_untracked();
+                    let current = update_today(today);
                     if value.as_str() >= "0001-01-01" && value <= current && calendar_date(&value).is_some() {
                         on_select.run(normalize_selection(&value, &current));
                     } else {
@@ -77,7 +85,7 @@ pub fn DayNavigation(
             <button type="button" aria-label="Jour suivant" title="Jour suivant"
                 disabled={move || displayed.get() >= today.get()} on:click=move |_| step(1)>"›"</button>
             <button type="button" class="day-today" disabled=move || selected.with(Option::is_none)
-                on:click=move |_| on_select.run(None)>"Aujourd'hui"</button>
+                on:click=move |_| { update_today(today); on_select.run(None); }>"Aujourd'hui"</button>
         </div>
     }
 }

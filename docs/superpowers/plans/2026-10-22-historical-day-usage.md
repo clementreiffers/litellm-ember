@@ -79,3 +79,11 @@
 ## Execution recommendation
 
 Use native execution in this session: the two tasks share a small, tightly coupled interface. Perform one independent whole-branch review after implementation. Obtain the user's plan/execution confirmation before starting product edits.
+
+## Execution results
+
+Both tasks were implemented with native execution after approval. An independent whole-branch review found three issues: historical requests serialized behind obsolete requests, local midnight waited for the next Stats event, and refresh from another tab skipped the selected historical day. All three were reproduced and fixed with regression checks.
+
+The midnight fix adds a one-second local UI clock and rechecks the date during navigation; this replaces the plan's Stats-only clock updates without adding network requests. Historical HTTP requests run outside the cache lock, and only the latest request may publish its cached result. Manual refresh reloads the retained historical selection from any tab.
+
+Final verification: 193 tests passed, 3 optional live tests ignored; rustfmt, backend/shared Clippy, WebAssembly UI Clippy, and the release Trunk build passed. Built-WebAssembly browser checks covered navigation, leap/year boundaries, invalid/future dates, loading/error/empty states, date and connection races, current budget isolation, tab/settings persistence, cross-tab refresh, and midnight without a Stats event. These browser checks used synthetic Tauri responses, not a live LiteLLM server or the native macOS webview.

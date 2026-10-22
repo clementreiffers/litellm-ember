@@ -126,6 +126,15 @@ pub fn App() -> impl IntoView {
     let selected_day = RwSignal::new(None::<String>);
     let day_usage = RwSignal::new(Remote::<shared::DailyUsage>::default());
     let today_date = RwSignal::new(crate::usage::local_today());
+    // Horloge locale uniquement : aucune requête réseau supplémentaire à minuit.
+    if let Ok(clock) = leptos::leptos_dom::helpers::set_interval_with_handle(
+        move || {
+            crate::usage::update_today(today_date);
+        },
+        std::time::Duration::from_secs(1),
+    ) {
+        on_cleanup(move || clock.clear());
+    }
 
     let listener = StoredValue::new_local(None::<tauri::Listener>);
     on_cleanup(move || {
@@ -223,15 +232,13 @@ fn Main(
     // L'état du cycle, y compris son échec, pilote l'animation.
     let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
-        if tab.get_untracked() == Tab::Usage {
-            if let Some(date) = selected_day.get_untracked() {
-                details::reset(day_usage);
-                details::load(
-                    day_usage,
-                    move || tauri::get_day_usage(date.clone(), true),
-                    generation,
-                );
-            }
+        if let Some(date) = selected_day.get_untracked() {
+            details::reset(day_usage);
+            details::load(
+                day_usage,
+                move || tauri::get_day_usage(date.clone(), true),
+                generation,
+            );
         }
         if refreshing.get_untracked() {
             return;

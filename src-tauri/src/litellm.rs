@@ -31,7 +31,7 @@ impl From<TransportError> for String {
 #[derive(Clone)]
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
-    daily: std::sync::Arc<tokio::sync::Mutex<Option<DailyCache>>>,
+    daily: std::sync::Arc<tokio::sync::Mutex<DailyState>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -52,6 +52,12 @@ struct SummaryCache {
 struct DailyCache {
     fetched: std::time::Instant,
     usage: DailyUsage,
+}
+
+#[derive(Default)]
+struct DailyState {
+    request_id: u64,
+    cache: Option<DailyCache>,
 }
 
 impl Client {
@@ -177,13 +183,17 @@ impl Client {
         if day > Local::now().date_naive() {
             return Err("La date ne peut pas être dans le futur".into());
         }
-        let mut cache = self.daily.lock().await;
-        if let Some(cached) = cache
-            .as_ref()
-            .filter(|c| !force && c.usage.date == date && c.fetched.elapsed().as_secs() < 60)
-        {
-            return Ok(cached.usage.clone());
-        }
+        let request_id =
+            {
+                let mut state = self.daily.lock().await;
+                state.request_id += 1;
+                if let Some(cached) = state.cache.as_ref().filter(|c| {
+                    !force && c.usage.date == date && c.fetched.elapsed().as_secs() < 60
+                }) {
+                    return Ok(cached.usage.clone());
+                }
+                state.request_id
+            };
         let (start, end) = day_range(day, &Local).ok_or("Date hors limites")?;
         let rows: Vec<LogRow> = self
             .get(&format!(
@@ -194,10 +204,13 @@ impl Client {
             date: date.into(),
             models: aggregate_today(&rows, day, &Local),
         };
-        *cache = Some(DailyCache {
-            fetched: std::time::Instant::now(),
-            usage: usage.clone(),
-        });
+        let mut state = self.daily.lock().await;
+        if state.request_id == request_id {
+            state.cache = Some(DailyCache {
+                fetched: std::time::Instant::now(),
+                usage: usage.clone(),
+            });
+        }
         Ok(usage)
     }
 
@@ -926,6 +939,68 @@ mod tests {
             assert_eq!(result.date, "2024-02-29");
             assert!(result.models.is_empty());
             mock.assert_hits(1);
+        }
+
+        #[tokio::test]
+        async fn historical_navigation_does_not_wait_for_obsolete_requests() {
+            let server = MockServer::start();
+            let slow = server.mock(|when, then| {
+                when.path("/llm/spend/logs").matches(|request| {
+                    request.query_params.as_ref().is_some_and(|params| {
+                        params
+                            .iter()
+                            .any(|(k, v)| k == "start_date" && v.starts_with("2023-"))
+                    })
+                });
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(500))
+                    .json_body(serde_json::json!([]));
+            });
+            let fast = server.mock(|when, then| {
+                when.path("/llm/spend/logs").matches(|request| {
+                    request.query_params.as_ref().is_some_and(|params| {
+                        params
+                            .iter()
+                            .any(|(k, v)| k == "start_date" && v.starts_with("2024-"))
+                    })
+                });
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            let old_client = client.clone();
+            let old = tokio::spawn(async move { old_client.fetch_day("2023-02-28", false).await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while slow.hits_async().await == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let latest = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.fetch_day("2024-02-29", false),
+            )
+            .await
+            .expect("the latest date must not wait for the obsolete HTTP response")
+            .unwrap();
+            assert_eq!(latest.date, "2024-02-29");
+            old.await.unwrap().unwrap();
+            assert_eq!(client.fetch_day("2024-02-29", false).await.unwrap(), latest);
+            fast.assert_hits(1); // L'ancienne réponse ne remplace pas le cache de la dernière sélection.
+
+            let old_client = client.clone();
+            let old = tokio::spawn(async move { old_client.fetch_day("2023-02-28", true).await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while slow.hits_async().await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            client.fetch_day("2024-02-29", false).await.unwrap();
+            old.await.unwrap().unwrap();
+            client.fetch_day("2024-02-29", false).await.unwrap();
+            fast.assert_hits(1); // Revenir au cache invalide aussi une réponse ancienne en transit.
         }
 
         #[tokio::test]
