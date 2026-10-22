@@ -125,6 +125,7 @@ pub fn App() -> impl IntoView {
     let activity = RwSignal::new(Remote::<Activity>::default());
     let selected_day = RwSignal::new(None::<String>);
     let day_usage = RwSignal::new(Remote::<shared::DailyUsage>::default());
+    let day_costs = RwSignal::new(Remote::<shared::DailyCosts>::default());
     let today_date = RwSignal::new(crate::usage::local_today());
     // Horloge locale uniquement : aucune requête réseau supplémentaire à minuit.
     if let Ok(clock) = leptos::leptos_dom::helpers::set_interval_with_handle(
@@ -151,6 +152,7 @@ pub fn App() -> impl IntoView {
                     details::reset(history);
                     details::reset(activity);
                     details::reset(day_usage);
+                    details::reset(day_costs);
                 }
                 *current = incoming;
             }
@@ -176,13 +178,14 @@ pub fn App() -> impl IntoView {
         details::reset(history);
         details::reset(activity);
         details::reset(day_usage);
+        details::reset(day_costs);
         show_settings.set(false);
     });
 
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage today_date /> }>
+            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage day_costs today_date /> }>
             <Settings on_close=close_settings updates harnesses />
         </Show>
       </div>
@@ -201,6 +204,7 @@ fn Main(
     harnesses: RwSignal<shared::HarnessSnapshot>,
     selected_day: RwSignal<Option<String>>,
     day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    day_costs: RwSignal<Remote<shared::DailyCosts>>,
     today_date: RwSignal<String>,
 ) -> impl IntoView {
     today_date.set(crate::usage::local_today());
@@ -217,6 +221,12 @@ fn Main(
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
             Tab::Usage => {
                 if let Some(date) = selected {
+                    let cost_date = date.clone();
+                    details::load(
+                        day_costs,
+                        move || tauri::get_day_costs(cost_date.clone(), false),
+                        generation,
+                    );
                     details::load(
                         day_usage,
                         move || tauri::get_day_usage(date.clone(), false),
@@ -233,6 +243,13 @@ fn Main(
     let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
         if let Some(date) = selected_day.get_untracked() {
+            let cost_date = date.clone();
+            details::reset(day_costs);
+            details::load(
+                day_costs,
+                move || tauri::get_day_costs(cost_date.clone(), true),
+                generation,
+            );
             details::reset(day_usage);
             details::load(
                 day_usage,
@@ -302,7 +319,7 @@ fn Main(
 
         {move || match tab.get() {
             Tab::Agents => view! { <crate::harness::Agents snapshot=harnesses /> }.into_any(),
-            Tab::Usage => view! { <UsageTab stats selected_day day_usage today_date /> }.into_any(),
+            Tab::Usage => view! { <UsageTab stats selected_day day_usage day_costs today_date /> }.into_any(),
             Tab::History => view! { <crate::history::HistoryCalendar history /><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
@@ -378,6 +395,7 @@ fn UsageTab(
     stats: RwSignal<Stats>,
     selected_day: RwSignal<Option<String>>,
     day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    day_costs: RwSignal<Remote<shared::DailyCosts>>,
     today_date: RwSignal<String>,
 ) -> impl IntoView {
     let visible = Memo::new(move |_| {
@@ -394,14 +412,31 @@ fn UsageTab(
     });
     let today: Signal<Vec<shared::ModelUsage>> =
         Signal::derive(move || visible.get().unwrap_or_default());
+    let costs = Memo::new(move |_| {
+        visible.with(|full| {
+            day_costs.with(|remote| {
+                crate::usage::visible_costs(
+                    selected_day.get().as_deref(),
+                    full.as_deref(),
+                    remote.data.as_ref(),
+                )
+            })
+        })
+    });
     let on_select = Callback::new(move |date: Option<String>| {
         if selected_day.get_untracked() != date {
             details::reset(day_usage);
+            details::reset(day_costs);
             selected_day.set(date);
         }
     });
-    let today_spend: Signal<f64> =
-        Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
+    let today_spend: Signal<f64> = Signal::derive(move || {
+        costs.with(|t| {
+            t.as_ref()
+                .map(|rows| rows.iter().map(|u| u.spend).sum())
+                .unwrap_or(0.0)
+        })
+    });
     let today_tokens: Signal<u64> =
         Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
     let totals_rows: Signal<_> = Memo::new(move |_| {
@@ -430,8 +465,8 @@ fn UsageTab(
     })
     .into();
     let spend_rows: Signal<_> = Memo::new(move |_| {
-        today.with(|t| {
-            let mut v: Vec<_> = t.iter().filter(|u| u.spend > 0.0).collect();
+        costs.with(|t| {
+            let mut v: Vec<_> = t.iter().flatten().filter(|u| u.spend > 0.0).collect();
             v.sort_by(|a, b| b.spend.total_cmp(&a.spend));
             v.into_iter()
                 .map(|u| (u.model.clone(), u.spend, format!("${:.2}", u.spend)))
@@ -456,23 +491,31 @@ fn UsageTab(
             <crate::usage::DayNavigation selected=selected_day today=today_date on_select />
             <div class="hint">"Journée locale"</div>
             {move || selected_day.with(Option::is_some).then(|| view! {
-                {move || day_usage.with(|r| r.loading).then(|| view! { <div class="refreshing">"Chargement de la journée…"</div> })}
+                {move || day_usage.with(|r| r.loading).then(|| view! { <div class="refreshing">{move || if costs.with(Option::is_some) {"Chargement des détails de tokens…"} else {"Chargement de la journée…"}}</div> })}
                 {move || day_usage.with(|r| r.error.clone()).map(|error| view! { <div class="error" role="alert">{error}</div> })}
             })}
-            <Show when=move || visible.with(Option::is_some) fallback=move || view! {
+            <Show when=move || costs.with(Option::is_some) fallback=move || view! {
                 <div class="hint">"Données de cette journée indisponibles pour le moment."</div>
             }>
-            {move || today.with(Vec::is_empty).then(|| view! { <div class="hint">"Aucune consommation retournée pour cette journée."</div> })}
+            {move || visible.with(|v|v.as_ref().is_some_and(Vec::is_empty)).then(|| view! { <div class="hint">"Aucune consommation retournée pour cette journée."</div> })}
             <div class="today">
-                <Donut values=donut_tokens center_label=donut_label center_caption="tokens" />
+                <Show when=move || visible.with(Option::is_some)>
+                    <Donut values=donut_tokens center_label=donut_label center_caption="tokens" />
+                </Show>
                 <div class="today-stats">
                     <div class="big">{move || format!("${:.2}", today_spend.get())}</div>
-                    <div class="caption">{move || format!("{} tokens", fmt_tokens(today_tokens.get()))}</div>
-                    <TokenSplit usage=today />
+                    <Show when=move || visible.with(Option::is_some) fallback=move || view! {
+                        <div class="caption">"Coûts disponibles · détails de tokens en attente"</div>
+                    }>
+                        <div class="caption">{move || format!("{} tokens", fmt_tokens(today_tokens.get()))}</div>
+                        <TokenSplit usage=today />
+                    </Show>
                 </div>
             </div>
-            <h3>"Tokens par modèle"</h3>
-            <Bars rows=token_rows />
+            <Show when=move || visible.with(Option::is_some)>
+                <h3>"Tokens par modèle"</h3>
+                <Bars rows=token_rows />
+            </Show>
             <h3>"$ par modèle"</h3>
             <Bars rows=spend_rows />
             </Show>

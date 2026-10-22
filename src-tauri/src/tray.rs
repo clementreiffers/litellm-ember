@@ -129,6 +129,14 @@ async fn get_day_usage(
     service.day_usage(date, force).await
 }
 #[tauri::command]
+async fn get_day_costs(
+    date: String,
+    force: bool,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    service.day_costs(date, force).await
+}
+#[tauri::command]
 async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
     service.refresh_and_wait().await
 }
@@ -188,6 +196,7 @@ pub fn run() {
             get_history,
             get_activity,
             get_day_usage,
+            get_day_costs,
             refresh_now,
             test_notification,
             get_update_status,

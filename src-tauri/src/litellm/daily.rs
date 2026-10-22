@@ -92,6 +92,19 @@ impl Page {
 }
 
 impl Client {
+    pub(super) async fn cached_day(&self, date: &str) -> Option<DailyUsage> {
+        let state = self.daily.lock().await;
+        let ttl = if date == Local::now().date_naive().to_string() {
+            Duration::from_secs(60)
+        } else {
+            PAST_TTL
+        };
+        state
+            .cache
+            .iter()
+            .find(|entry| entry.date == date && entry.fetched.elapsed() < ttl)
+            .and_then(|entry| entry.usage.clone())
+    }
     /// Réutilise les agrégats seulement pour la même connexion, jamais les lignes du jour courant.
     pub fn reuse_daily_cache(&mut self, previous: &Self) {
         if self.base_url == previous.base_url && self.api_key == previous.api_key {
@@ -168,6 +181,14 @@ impl Client {
 
     async fn fetch_day_pages(&self, day: NaiveDate) -> Result<Option<Vec<LogRow>>, String> {
         let (start, end) = exact_range(day, &Local).ok_or("Date hors limites")?;
+        self.fetch_range_pages(start, end).await
+    }
+
+    pub(super) async fn fetch_range_pages(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<Vec<LogRow>>, String> {
         let mut url = reqwest::Url::parse(&format!("{}/spend/logs/v2", self.base_url))
             .map_err(|_| "Endpoint invalide")?;
         let hash = format!("{:x}", Sha256::digest(self.api_key.as_bytes()));

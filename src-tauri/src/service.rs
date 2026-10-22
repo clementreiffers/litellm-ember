@@ -268,6 +268,18 @@ impl Service {
             _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
         }
     }
+    pub async fn day_costs(
+        &self,
+        date: String,
+        force: bool,
+    ) -> Result<Detail<shared::DailyCosts>, String> {
+        let (client, state) = self.request(Command::Context).await?;
+        let mut updates = self.snapshots.clone();
+        tokio::select! {
+            result=client.fetch_day_costs(&date,force)=>self.detail(state.generation,result?),
+            _=updates.wait_for(|snapshot| snapshot.generation != state.generation)=>Err(Error::Obsolete.to_string()),
+        }
+    }
     fn detail<T>(&self, generation: u64, data: T) -> Result<Detail<T>, String> {
         if generation != self.snapshots.borrow().generation {
             return Err(Error::Obsolete.to_string());

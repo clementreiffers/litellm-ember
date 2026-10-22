@@ -20,6 +20,27 @@ pub fn normalize_selection(date: &str, today: &str) -> Option<String> {
     (date != today).then(|| date.to_owned())
 }
 
+pub fn visible_costs(
+    selected: Option<&str>,
+    full: Option<&[ModelUsage]>,
+    preview: Option<&shared::DailyCosts>,
+) -> Option<Vec<shared::ModelCost>> {
+    if let Some(usage) = full {
+        return Some(
+            usage
+                .iter()
+                .map(|m| shared::ModelCost {
+                    model: m.model.clone(),
+                    spend: m.spend,
+                })
+                .collect(),
+        );
+    }
+    preview
+        .filter(|costs| Some(costs.date.as_str()) == selected)
+        .map(|costs| costs.models.clone())
+}
+
 fn format_local(date: &js_sys::Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
@@ -132,6 +153,40 @@ mod tests {
         assert_eq!(
             visible_usage(None, "2026-10-23", &stats, Some(&historical)),
             None
+        );
+    }
+
+    #[test]
+    fn costs_arrive_before_tokens_and_full_usage_takes_precedence() {
+        let preview = shared::DailyCosts {
+            date: "2024-02-29".into(),
+            models: vec![shared::ModelCost {
+                model: "m".into(),
+                spend: 5.0,
+            }],
+        };
+        assert_eq!(
+            visible_costs(Some("2024-02-29"), None, Some(&preview)).unwrap()[0].spend,
+            5.0
+        );
+        assert_eq!(
+            visible_costs(Some("2024-02-28"), None, Some(&preview)),
+            None
+        );
+        assert_eq!(visible_costs(None, None, Some(&preview)), None);
+        let full = vec![ModelUsage {
+            model: "m".into(),
+            spend: 6.0,
+            total_tokens: 100,
+            ..Default::default()
+        }];
+        assert_eq!(
+            visible_costs(Some("2024-02-29"), Some(&full), Some(&preview)).unwrap()[0].spend,
+            6.0
+        );
+        assert_eq!(
+            visible_costs(Some("2024-02-29"), Some(&[]), Some(&preview)),
+            Some(vec![])
         );
     }
 

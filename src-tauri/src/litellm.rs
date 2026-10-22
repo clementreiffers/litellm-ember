@@ -1,6 +1,7 @@
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
+mod costs;
 mod daily;
 mod domain;
 pub use domain::KeyData;

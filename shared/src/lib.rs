@@ -68,6 +68,13 @@ pub struct DailyUsage {
     pub models: Vec<ModelUsage>,
 }
 
+/// Aperçu des coûts d'une journée locale, sans compteurs de tokens inventés.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyCosts {
+    pub date: String,
+    pub models: Vec<ModelCost>,
+}
+
 /// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

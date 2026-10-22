@@ -262,6 +262,8 @@ In **Consommation**, use the date picker or previous/next-day buttons to inspect
 
 Past days load on demand, and **Rafraîchir tout** reloads the selected day's figures. You can select dates older than 30 days, provided your LiteLLM server still retains their logs. An empty response means no usage was returned; Ember cannot distinguish an unused day from logs removed by server retention. Loading and network errors do not display another day's figures.
 
+Costs and model costs appear first from a lightweight spending summary while token details load separately. Because summaries use UTC days, Ember adds or subtracts the boundary intervals needed to match your local day. Token charts stay hidden until their counters arrive, rather than showing zero. If the summary or its boundary correction is unavailable, the full usage request still supplies the figures. Once complete details arrive, they take precedence over the preview.
+
 Historical loading uses `/spend/logs/v2` with exact local-day boundaries converted to UTC, 1,000 records per page, and up to three concurrent page requests. This endpoint omits prompt and response bodies. Ember checks that all pages are complete before showing totals. Servers that deny or lack this endpoint, or cap the result count, use the original `/spend/logs` query instead.
 
 If the legacy endpoint also reports truncation, Ember shows an error instead of presenting incomplete totals as a full day's usage.

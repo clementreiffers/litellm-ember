@@ -111,6 +111,23 @@ pub async fn get_day_usage(
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
+pub async fn get_day_costs(
+    date: String,
+    force: bool,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    #[derive(Serialize)]
+    struct Args {
+        date: String,
+        force: bool,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { date, force }).map_err(|e| e.to_string())?;
+    let value = invoke_with("get_day_costs", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Coûts indisponibles".into())
+    })?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
 pub async fn refresh_now() {
     let _ = invoke("refresh_now").await;
 }
