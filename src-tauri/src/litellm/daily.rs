@@ -6,7 +6,10 @@ use super::{
     Client, LogRow, TransportError, Validated,
 };
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{
+    future::{BoxFuture, Shared},
+    stream, FutureExt, StreamExt, TryStreamExt,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::DailyUsage;
@@ -32,6 +35,19 @@ struct DailyCache {
 pub(super) struct DailyState {
     request_id: u64,
     cache: VecDeque<DailyCache>,
+}
+
+type Request = Shared<BoxFuture<'static, Result<Validated<DailyUsage>, String>>>;
+struct InFlight {
+    bounds: DayBounds,
+    force: bool,
+    since: Option<Instant>,
+    created: Instant,
+    request: Request,
+}
+#[derive(Default)]
+pub(super) struct Requests {
+    entries: VecDeque<InFlight>,
 }
 
 /// Ignore les métadonnées, messages et réponses volumineux : seuls ces compteurs sont utiles.
@@ -117,6 +133,81 @@ impl Page {
 }
 
 impl Client {
+    /// Les clics et le préchargement partagent la même validation ; une nouvelle force la remplace.
+    pub(crate) async fn fetch_day_shared(
+        &self,
+        date: &str,
+        force: bool,
+        since: Option<Instant>,
+    ) -> Result<Validated<DailyUsage>, String> {
+        let bounds = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()
+            .filter(|d| d.to_string() == date && *d <= Local::now().date_naive())
+            .and_then(|d| day_bounds(d, &Local))
+            .ok_or("Frontière locale indisponible")?;
+        let request = {
+            let mut requests = self.daily_requests.lock().await;
+            requests.entries.retain(|e| {
+                e.request.peek().is_none()
+                    || e.created.elapsed() < Duration::from_secs(60)
+                        && !matches!(e.request.peek(), Some(Err(_)))
+            });
+            if let Some(entry) = requests.entries.iter().find(|e| {
+                e.bounds == bounds
+                    && if force {
+                        e.force
+                            && since
+                                .map_or(e.request.peek().is_none(), |since| e.since == Some(since))
+                    } else {
+                        e.request.peek().is_none()
+                    }
+            }) {
+                entry.request.clone()
+            } else {
+                let mut transport = self.clone();
+                // Le futur ne doit pas retenir le cache qui le possède.
+                transport.daily_requests = Default::default();
+                let date = date.to_owned();
+                let request = async move {
+                    transport
+                        .fetch_day_validated(
+                            &date,
+                            force,
+                            &Local,
+                            since.or_else(|| force.then(Instant::now)),
+                        )
+                        .await
+                }
+                .boxed()
+                .shared();
+                requests.entries.retain(|e| e.bounds != bounds);
+                requests.entries.push_back(InFlight {
+                    bounds,
+                    force,
+                    since,
+                    created: Instant::now(),
+                    request: request.clone(),
+                });
+                while requests.entries.len() > CACHE_DAYS {
+                    requests.entries.pop_front();
+                }
+                request
+            }
+        };
+        let result = request.clone().await;
+        let mut requests = self.daily_requests.lock().await;
+        if !requests
+            .entries
+            .iter()
+            .any(|e| e.bounds == bounds && e.request.ptr_eq(&request))
+        {
+            return Err("La journée a été actualisée ; rechargez les détails".into());
+        }
+        if result.is_err() {
+            requests.entries.retain(|e| !e.request.ptr_eq(&request));
+        }
+        result
+    }
     #[cfg(test)]
     pub(super) async fn cached_day_in_zone(
         &self,
@@ -161,6 +252,7 @@ impl Client {
     pub fn reuse_daily_cache(&mut self, previous: &Self) {
         if self.base_url == previous.base_url && self.api_key == previous.api_key {
             self.daily = previous.daily.clone();
+            self.daily_requests = previous.daily_requests.clone();
             self.analytics = previous.analytics.clone();
             self.costs = previous.costs.clone();
             self.ranges = previous.ranges.clone();

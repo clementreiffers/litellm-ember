@@ -82,6 +82,7 @@ pub struct CachedDaily {
     pub usage: Option<DailyUsage>,
     pub stale: bool,
     pub usage_stale: bool,
+    pub usage_fetched_at: Option<String>,
     pub fetched_at: String,
 }
 

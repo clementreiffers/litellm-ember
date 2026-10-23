@@ -163,8 +163,11 @@ async fn get_day_costs(
     service.day_costs_in_refresh(date, force, refresh).await
 }
 #[tauri::command]
-async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
-    service.refresh_and_wait().await
+async fn refresh_now(
+    today_refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<(), String> {
+    service.refresh_with_day(today_refresh).await
 }
 
 /// Bouton « Tester » des paramètres.

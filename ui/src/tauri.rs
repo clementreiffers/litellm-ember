@@ -195,8 +195,15 @@ pub async fn get_day_costs_in_refresh(
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
-pub async fn refresh_now() {
-    let _ = invoke("refresh_now").await;
+pub async fn refresh_now(today_refresh: Option<u64>) {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args {
+        today_refresh: Option<u64>,
+    }
+    if let Ok(args) = serde_wasm_bindgen::to_value(&Args { today_refresh }) {
+        let _ = invoke_with("refresh_now", args).await;
+    }
 }
 
 pub async fn test_notification() -> Result<(), String> {

@@ -52,6 +52,7 @@ impl DailyStore {
         Some(CachedDaily {
             costs: entry.costs.clone(),
             usage: entry.usage.clone(),
+            usage_fetched_at: entry.usage_fetched.map(|t| t.to_rfc3339()),
             stale: now - entry.fetched >= ttl,
             usage_stale: entry
                 .usage_fetched

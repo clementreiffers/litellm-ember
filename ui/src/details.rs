@@ -111,7 +111,11 @@ pub type DailySelection = (
     RwSignal<Remote<shared::DailyUsage>>,
 );
 
-pub fn refresh_days(selections: Vec<DailySelection>, generation: Signal<u64>) {
+pub fn refresh_days(
+    selections: Vec<DailySelection>,
+    generation: Signal<u64>,
+    refresh_budget: bool,
+) {
     let mut dates = std::collections::HashMap::<String, Vec<_>>::new();
     for (date, costs, usage) in selections {
         let Some(Some(cost_id)) = costs.try_update(|r| {
@@ -132,13 +136,25 @@ pub fn refresh_days(selections: Vec<DailySelection>, generation: Signal<u64>) {
             .push((costs, usage, cost_id, usage_id));
     }
     let requested = generation.get_untracked();
+    let today = crate::usage::local_today();
+    let has_today = dates.contains_key(&today);
+    if refresh_budget && !has_today {
+        leptos::task::spawn_local(async {
+            crate::tauri::refresh_now(None).await;
+        });
+    }
     for (date, mut targets) in dates {
+        let refresh_budget = refresh_budget && date == today;
         leptos::task::spawn_local(async move {
             let refresh = match crate::tauri::begin_day_refresh(date.clone()).await {
                 Ok(value) if value.generation == requested => Ok(value.data),
                 Ok(_) => Err("La configuration a changé ; rechargez cet onglet".to_owned()),
                 Err(error) => Err(error),
             };
+            if refresh_budget {
+                let token = refresh.as_ref().ok().copied();
+                crate::tauri::refresh_now(token).await;
+            }
             if generation.try_get_untracked() != Some(requested) {
                 return;
             }

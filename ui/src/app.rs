@@ -333,12 +333,11 @@ fn Main(
         if let Some(date) = selected_day.get_untracked() {
             selections.push((date, day_costs, day_usage));
         }
-        details::refresh_days(selections, generation);
+        details::refresh_days(selections, generation, !refreshing.get_untracked());
         if refreshing.get_untracked() {
             return;
         }
         leptos::task::spawn_local(async move {
-            tauri::refresh_now().await;
             if week.is_disposed() {
                 return;
             }

@@ -70,6 +70,7 @@ enum Command {
         chrono::NaiveDate,
         Result<(), String>,
     ),
+    #[cfg(test)]
     LocalCost(
         u64,
         crate::litellm::calendar::DayBounds,
@@ -89,13 +90,14 @@ enum Command {
         Result<Box<[Option<f64>; crate::history::DAYS]>, String>,
     ),
     Context(Reply<(Client, Stats)>),
-    Refresh(Option<Reply<()>>),
+    Refresh(Option<u64>, Option<Reply<()>>),
     Event(u64, Event),
 }
 
 pub enum Event {
     Key(KeyData),
     Models(Vec<ModelCost>),
+    #[cfg(test)]
     Today(
         crate::litellm::Validated<shared::DailyUsage>,
         Option<crate::litellm::calendar::DayBounds>,
@@ -119,6 +121,7 @@ pub fn apply(stats: &mut Stats, event: Event) {
             stats.period_start = key.period_start;
         }
         Event::Models(models) => stats.models_total = models,
+        #[cfg(test)]
         Event::Today(value, _) => {
             stats.today_date = Some(value.data.date);
             stats.today = value.data.models;
@@ -131,10 +134,27 @@ pub fn apply(stats: &mut Stats, event: Event) {
 
 #[cfg(test)]
 pub async fn run_cycle(client: &Client, publish: impl Fn(Event) + Sync) {
-    run_cycle_with_force(client, false, publish).await
+    let day = Local::now().date_naive();
+    let date = day.to_string();
+    run_cycle_with_today(
+        client,
+        async {
+            let value = client.fetch_day_shared(&date, false, None).await?;
+            Ok(Some(Event::Today(
+                value,
+                crate::litellm::calendar::day_bounds(day, &Local),
+            )))
+        },
+        publish,
+    )
+    .await
 }
 
-async fn run_cycle_with_force(client: &Client, force: bool, publish: impl Fn(Event) + Sync) {
+async fn run_cycle_with_today(
+    client: &Client,
+    today: impl std::future::Future<Output = Result<Option<Event>, String>>,
+    publish: impl Fn(Event) + Sync,
+) {
     let key = match client.fetch_key().await {
         Ok(key) => key,
         Err(error) => {
@@ -152,27 +172,11 @@ async fn run_cycle_with_force(client: &Client, force: bool, publish: impl Fn(Eve
         });
     };
     let today = async {
-        let day = Local::now().date_naive();
-        let bounds = crate::litellm::calendar::day_bounds(day, &Local);
-        publish(
-            match client
-                .fetch_day_validated(
-                    &day.to_string(),
-                    force,
-                    &Local,
-                    force.then(std::time::Instant::now),
-                )
-                .await
-            {
-                Ok(value) if bounds == crate::litellm::calendar::day_bounds(day, &Local) => {
-                    Event::Today(value, bounds)
-                }
-                Ok(_) => {
-                    Event::Failed("Le fuseau horaire a changé ; rechargez cette journée".into())
-                }
-                Err(error) => Event::Failed(error),
-            },
-        );
+        match today.await {
+            Ok(Some(event)) => publish(event),
+            Ok(None) => {}
+            Err(error) => publish(Event::Failed(error)),
+        }
     };
     tokio::join!(models, today);
     publish(Event::Finished);
@@ -263,10 +267,15 @@ impl Service {
         self.snapshots.borrow().clone()
     }
     pub fn refresh(&self) {
-        let _ = self.commands.send(Command::Refresh(None));
+        let _ = self.commands.send(Command::Refresh(None, None));
     }
+    #[cfg(test)]
     pub async fn refresh_and_wait(&self) -> Result<(), String> {
-        self.request(|reply| Command::Refresh(Some(reply))).await
+        self.refresh_with_day(None).await
+    }
+    pub async fn refresh_with_day(&self, today_refresh: Option<u64>) -> Result<(), String> {
+        self.request(|reply| Command::Refresh(today_refresh, Some(reply)))
+            .await
     }
     async fn request<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, String> {
         let (reply, result) = oneshot::channel();
@@ -365,12 +374,18 @@ impl Service {
             .request(|reply| Command::DailyContext(date.clone(), refresh, reply))
             .await?;
         let mut revalidate = force;
+        let mut cached_usage = None;
         if !force {
             if let Some(cached) = self.cached_day(date.clone()).await?.data {
                 revalidate = cached.usage.is_some() && cached.usage_stale;
                 if !cached.usage_stale {
                     if let Some(usage) = cached.usage {
-                        return self.detail(state.generation, usage);
+                        if let Some(when) = cached.usage_fetched_at.and_then(|t| t.parse().ok()) {
+                            cached_usage = Some(crate::litellm::Validated {
+                                data: usage,
+                                fetched_at: when,
+                            });
+                        }
                     }
                 }
             }
@@ -379,9 +394,13 @@ impl Service {
             .ok()
             .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local));
         let mut updates = self.snapshots.clone();
-        let data = tokio::select! {
-            result = client.fetch_day_validated(&date, revalidate, &Local, since.or_else(||revalidate.then(std::time::Instant::now))) => result?,
-            _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => return Err(Error::Obsolete.to_string()),
+        let data = if let Some(cached) = cached_usage {
+            cached
+        } else {
+            tokio::select! {
+                result = client.fetch_day_shared(&date, revalidate, since) => result?,
+                _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => return Err(Error::Obsolete.to_string()),
+            }
         };
         let requested = data.fetched_at;
         let data = data.data;
@@ -404,14 +423,6 @@ impl Service {
                 )
             })
             .await?;
-        }
-        if let Some(bounds) = bounds {
-            let _ = self.commands.send(Command::LocalCost(
-                state.generation,
-                bounds,
-                data.models.iter().map(|m| m.spend).sum(),
-                requested,
-            ));
         }
         self.detail(state.generation, data)
     }
@@ -477,14 +488,6 @@ impl Service {
                 )
             })
             .await?;
-        }
-        if let Some(bounds) = bounds {
-            let _ = self.commands.send(Command::LocalCost(
-                state.generation,
-                bounds,
-                data.models.iter().map(|m| m.spend).sum(),
-                requested,
-            ));
         }
         self.detail(state.generation, data)
     }
@@ -605,12 +608,14 @@ async fn coordinate(
     let mut increase_retry = IncreaseRetry::default();
     let mut pending = true;
     let mut force_cycle = false;
+    let mut cycle_refresh = None;
     let mut next = tokio::time::Instant::now();
     publish_calendar(&local_snapshots, &calendar, stats.generation, false);
     loop {
         if pending && worker.is_none() {
             pending = false;
             let force = std::mem::take(&mut force_cycle);
+            let refresh = cycle_refresh.take();
             stats.cycle_id += 1;
             stats.error = None;
             if stats.today_date.as_deref()
@@ -645,8 +650,27 @@ async fn coordinate(
                     };
                     let commands = commands.clone();
                     let cycle = stats.cycle_id;
+                    let service = Service {
+                        commands: commands.clone(),
+                        snapshots: snapshots.subscribe(),
+                        local_snapshots: local_snapshots.subscribe(),
+                    };
                     worker = Some(tauri::async_runtime::spawn(async move {
-                        run_cycle_with_force(&client, force, |event| {
+                        let today = async {
+                            let result = service
+                                .day_usage_in_refresh(
+                                    Local::now().date_naive().to_string(),
+                                    force,
+                                    refresh,
+                                )
+                                .await;
+                            match result {
+                                Ok(_)=>Ok(None),
+                                Err(error) if error==Error::Obsolete.to_string() || error=="La journée a été actualisée ; rechargez les détails"=>Ok(None),
+                                Err(error)=>Err(error),
+                            }
+                        };
+                        run_cycle_with_today(&client, today, |event| {
                             if !matches!(event, Event::Finished) {
                                 let _ = commands.send(Command::Event(cycle, event));
                             }
@@ -760,6 +784,33 @@ async fn coordinate(
                     let _ = reply.send(Err(Error::Obsolete.to_string()));
                     continue;
                 }
+                if let Some(value) = &usage {
+                    if daily_store
+                        .get(bounds, chrono::Utc::now())
+                        .and_then(|c| c.usage_fetched_at)
+                        .and_then(|t| t.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                        .is_some_and(|t| t > when)
+                    {
+                        let _ = reply.send(Err(Error::Obsolete.to_string()));
+                        continue;
+                    }
+                    if bounds.date == Local::now().date_naive() {
+                        stats.today_date = Some(value.date.clone());
+                        stats.today = value.models.clone();
+                        stats.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
+                        stats.revision += 1;
+                        snapshots.send_replace(stats.clone());
+                        publish(&stats);
+                    }
+                }
+                let spend = usage
+                    .as_ref()
+                    .map(|u| u.models.iter().map(|m| m.spend).sum())
+                    .or_else(|| {
+                        costs
+                            .as_ref()
+                            .map(|c| c.models.iter().map(|m| m.spend).sum())
+                    });
                 if daily_store.put(bounds, costs, usage, when) {
                     if let Some(path) = daily_path.clone() {
                         let snapshot = daily_store.clone();
@@ -770,6 +821,17 @@ async fn coordinate(
                         if let Err(error) = result.map_err(|e| e.to_string()).and_then(|r| r) {
                             eprintln!("Cache quotidien : {error}");
                         }
+                    }
+                }
+                if let Some(spend) = spend {
+                    if calendar.merge_day(bounds, spend, when) {
+                        persist_calendar(&local_path, &mut calendar).await;
+                        publish_calendar(
+                            &local_snapshots,
+                            &calendar,
+                            generation,
+                            local_worker.is_some(),
+                        );
                     }
                 }
                 let _ = reply.send(Ok(()));
@@ -870,6 +932,7 @@ async fn coordinate(
                 persist_calendar(&local_path, &mut calendar).await;
                 publish_calendar(&local_snapshots, &calendar, generation, false);
             }
+            #[cfg(test)]
             Command::LocalCost(generation, bounds, spend, when) => {
                 if generation == stats.generation && calendar.merge_day(bounds, spend, when) {
                     persist_calendar(&local_path, &mut calendar).await;
@@ -986,7 +1049,29 @@ async fn coordinate(
             Command::Context(reply) => {
                 let _ = reply.send(client.clone().map(|c| (c, stats.clone())));
             }
-            Command::Refresh(reply) => {
+            Command::Refresh(today_refresh, reply) => {
+                let date = Local::now().date_naive().to_string();
+                let attempt = if let Some(id) = today_refresh {
+                    if !daily_attempts
+                        .iter()
+                        .any(|(d, token, _)| d == &date && *token == id)
+                    {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(Error::Obsolete.to_string()));
+                        }
+                        continue;
+                    }
+                    id
+                } else {
+                    daily_sequence += 1;
+                    daily_attempts.retain(|(d, _, _)| d != &date);
+                    daily_attempts.push_back((date, daily_sequence, std::time::Instant::now()));
+                    while daily_attempts.len() > 30 {
+                        daily_attempts.pop_front();
+                    }
+                    daily_sequence
+                };
+                cycle_refresh = Some(attempt);
                 force_cycle = true;
                 let mut refreshed = connection(&store, &http);
                 if let (Ok(next), Ok(previous)) = (&mut refreshed, &client) {
@@ -999,6 +1084,8 @@ async fn coordinate(
                 }
             }
             Command::Save(input, reply) => {
+                cycle_refresh = None;
+                force_cycle = false;
                 if let Some(worker) = preload_worker.take() {
                     worker.abort();
                 }
@@ -1108,6 +1195,7 @@ async fn coordinate(
                         increase_retry = IncreaseRetry::default();
                     }
                 }
+                #[cfg(test)]
                 if let Event::Today(value, bounds) = &event {
                     let day = Local::now().date_naive();
                     if value.data.date != day.to_string()
@@ -1225,6 +1313,287 @@ async fn persist_calendar(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn settings_change_drops_queued_today_refresh_token() {
+        let old = MockServer::start();
+        let new = MockServer::start();
+        let today = Local::now().date_naive();
+        old.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200)
+                .delay(Duration::from_millis(300))
+                .json_body(daily_page(today, 1.0));
+        });
+        mocks(&old, 42.0, 0);
+        mocks(&new, 7.0, 0);
+        new.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 9.0));
+        });
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&old.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        service.refresh_and_wait().await.unwrap();
+        service.save(preferences(&new, false)).await.unwrap();
+        let stats = finished(&service, 3).await;
+        assert!(stats.error.is_none());
+        assert_eq!(stats.today[0].spend, 9.0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn today_selected_and_budget_refresh_share_one_forced_download() {
+        let server = MockServer::start();
+        let today = Local::now().date_naive();
+        let mut initial = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 1.0));
+        });
+        mocks(&server, 42.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        finished(&service, 1).await;
+        initial.delete();
+        let corrected = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200)
+                .delay(Duration::from_millis(100))
+                .json_body(daily_page(today, 9.0));
+        });
+        let id = service
+            .begin_day_refresh(today.to_string())
+            .await
+            .unwrap()
+            .data;
+        service.refresh_with_day(Some(id)).await.unwrap();
+        let detail = service
+            .day_usage_in_refresh(today.to_string(), true, Some(id))
+            .await
+            .unwrap();
+        let stats = finished(&service, 2).await;
+        assert_eq!(detail.data.models, stats.today);
+        assert_eq!(stats.today[0].spend, 9.0);
+        corrected.assert_hits(1);
+        // Un consommateur plus tardif du même clic reprend aussi le résultat terminé.
+        assert_eq!(
+            service
+                .day_usage_in_refresh(today.to_string(), true, Some(id))
+                .await
+                .unwrap()
+                .data,
+            detail.data
+        );
+        corrected.assert_hits(1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_daily_failure_can_retry_without_retaining_failed_future() {
+        let server = MockServer::start();
+        let day = Local::now().date_naive() - chrono::Duration::days(3);
+        let mut failed = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(day));
+            then.status(503).delay(Duration::from_millis(100));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let date = day.to_string();
+        let (a, b) = tokio::join!(
+            client.fetch_day_shared(&date, false, None),
+            client.fetch_day_shared(&date, false, None)
+        );
+        assert!(a.is_err() && b.is_err());
+        failed.assert_hits(1);
+        failed.delete();
+        let valid = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(day));
+            then.status(200).json_body(daily_page(day, 3.0));
+        });
+        assert_eq!(
+            client
+                .fetch_day_shared(&date, false, None)
+                .await
+                .unwrap()
+                .data
+                .models[0]
+                .spend,
+            3.0
+        );
+        valid.assert_hits(1);
+    }
+
+    fn daily_page(day: chrono::NaiveDate, spend: f64) -> serde_json::Value {
+        serde_json::json!({"data":[{"request_id":format!("{day}-{spend}"),"model":"m","spend":spend,"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"startTime":day.and_hms_opt(12,0,0).unwrap().and_local_timezone(Local).earliest().unwrap().to_rfc3339()}],"page":1,"page_size":1000,"total":1,"total_pages":1})
+    }
+    fn daily_start(day: chrono::NaiveDate) -> String {
+        crate::litellm::calendar::day_bounds(day, &Local)
+            .unwrap()
+            .start
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+    async fn wait_daily_request(mock: &httpmock::Mock<'_>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_today_cannot_publish_after_selected_force_succeeds_or_fails() {
+        for success in [true, false] {
+            let server = MockServer::start();
+            let today = Local::now().date_naive();
+            let mut old = server.mock(|when, then| {
+                when.path("/spend/logs/v2")
+                    .query_param("start_date", daily_start(today));
+                then.status(200)
+                    .delay(Duration::from_millis(300))
+                    .json_body(daily_page(today, 2.0));
+            });
+            mocks(&server, 42.0, 0);
+            let (service, task) = start(
+                Arc::new(SettingsStore::for_test(&server.base_url())),
+                Arc::new(AtomicUsize::new(0)),
+                None,
+            );
+            wait_daily_request(&old).await;
+            old.delete();
+            server.mock(|when, then| {
+                when.path("/spend/logs/v2")
+                    .query_param("start_date", daily_start(today));
+                then.status(if success { 200 } else { 503 })
+                    .json_body(daily_page(today, 9.0));
+            });
+            assert_eq!(
+                service.day_usage(today.to_string(), true).await.is_ok(),
+                success
+            );
+            let stats = finished(&service, 1).await;
+            let cached = service.cached_day(today.to_string()).await.unwrap().data;
+            if success {
+                assert_eq!(stats.today[0].spend, 9.0);
+                assert!(stats.error.is_none());
+                assert_eq!(cached.unwrap().usage.unwrap().models[0].spend, 9.0);
+            } else {
+                assert!(stats.today.is_empty());
+                assert!(cached.is_none());
+            }
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn yesterday_click_joins_preload_and_today_cycle_updates_exact_calendar() {
+        let server = MockServer::start();
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let mut current = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 2.0));
+        });
+        let preload = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(yesterday));
+            then.status(200)
+                .delay(Duration::from_millis(300))
+                .json_body(daily_page(yesterday, 3.0));
+        });
+        mocks(&server, 42.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        finished(&service, 1).await;
+        wait_daily_request(&preload).await;
+        assert_eq!(
+            service
+                .day_usage(yesterday.to_string(), false)
+                .await
+                .unwrap()
+                .data
+                .models[0]
+                .spend,
+            3.0
+        );
+        preload.assert_hits(1);
+        service.day_usage(today.to_string(), true).await.unwrap();
+        current.delete();
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 9.0));
+        });
+        service.refresh_and_wait().await.unwrap();
+        finished(&service, 2).await;
+        let calendar = service.local_history(HistoryMode::Cached).await.unwrap();
+        assert_eq!(
+            calendar
+                .exact_costs
+                .iter()
+                .find(|d| d.date == today.to_string())
+                .unwrap()
+                .spend,
+            Some(9.0)
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn global_force_supersedes_older_selected_today_result() {
+        let server = MockServer::start();
+        let today = Local::now().date_naive();
+        let mut current = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 1.0));
+        });
+        mocks(&server, 42.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        finished(&service, 1).await;
+        current.delete();
+        let mut old = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200)
+                .delay(Duration::from_millis(300))
+                .json_body(daily_page(today, 2.0));
+        });
+        let cloned = service.clone();
+        let selected = tokio::spawn(async move { cloned.day_usage(today.to_string(), true).await });
+        wait_daily_request(&old).await;
+        old.delete();
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param("start_date", daily_start(today));
+            then.status(200).json_body(daily_page(today, 9.0));
+        });
+        service.refresh_and_wait().await.unwrap();
+        let stats = finished(&service, 2).await;
+        assert_eq!(stats.today[0].spend, 9.0);
+        assert!(selected.await.unwrap().is_err());
+        task.abort();
+    }
+
     #[tokio::test]
     async fn startup_today_and_yesterday_share_daily_cache_with_first_detail_click() {
         let server = MockServer::start();
@@ -2131,6 +2500,11 @@ mod tests {
     #[tokio::test]
     async fn daily_json_cache_survives_restart_and_failed_refresh_without_crossing_sources() {
         let server = MockServer::start();
+        // Ce test redémarre le coordinateur dans le même processus : isoler ses écritures de celles du cycle automatique.
+        server.mock(|when, then| {
+            when.path("/key/info");
+            then.status(503);
+        });
         let day = Local::now().date_naive() - chrono::Duration::days(2);
         let start = crate::litellm::calendar::day_bounds(day, &Local)
             .unwrap()

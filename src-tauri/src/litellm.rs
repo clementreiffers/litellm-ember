@@ -42,6 +42,7 @@ impl From<TransportError> for String {
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
     daily: std::sync::Arc<tokio::sync::Mutex<daily::DailyState>>,
+    daily_requests: std::sync::Arc<tokio::sync::Mutex<daily::Requests>>,
     analytics: std::sync::Arc<tokio::sync::Mutex<analytics::Access>>,
     costs: std::sync::Arc<tokio::sync::Mutex<costs::CostState>>,
     ranges: std::sync::Arc<tokio::sync::Mutex<ranges::RangeState>>,
@@ -101,6 +102,7 @@ impl Client {
             api_key,
             rows: Default::default(),
             daily: Default::default(),
+            daily_requests: Default::default(),
             analytics: Default::default(),
             costs: Default::default(),
             ranges: Default::default(),
