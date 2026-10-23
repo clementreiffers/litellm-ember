@@ -63,7 +63,7 @@ impl DailyStore {
                                 .costs
                                 .models
                                 .iter()
-                                .any(|c| c.model == m.model && c.spend == m.spend)
+                                .any(|c| c.model == m.model && (c.spend - m.spend).abs() <= 1e-8)
                         })
                 }),
             fetched_at: entry.fetched.to_rfc3339(),
@@ -142,6 +142,78 @@ fn valid(bounds: DayBounds, costs: &DailyCosts, usage: Option<&DailyUsage>) -> b
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_usage_stays_fresh_after_rounding_only_cost_preview() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let now = day
+            .succ_opt()
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        let bounds = day_bounds(day, &Utc).unwrap();
+        let mut store = DailyStore::load(None, "source".into());
+        store.put(
+            bounds,
+            None,
+            Some(DailyUsage {
+                date: day.to_string(),
+                models: vec![ModelUsage {
+                    model: "m".into(),
+                    spend: 23.301333660000004,
+                    total_tokens: 100,
+                    ..Default::default()
+                }],
+            }),
+            now,
+        );
+        store.put(
+            bounds,
+            Some(DailyCosts {
+                date: day.to_string(),
+                models: vec![ModelCost {
+                    model: "m".into(),
+                    spend: 23.30133365999999,
+                }],
+            }),
+            None,
+            now + Duration::milliseconds(3),
+        );
+        let cached = store.get(bounds, now + Duration::seconds(1)).unwrap();
+        assert!(!cached.usage_stale);
+        assert_eq!(cached.usage.unwrap().models[0].total_tokens, 100);
+        assert!(
+            !store
+                .get(bounds, now + Duration::seconds(899))
+                .unwrap()
+                .usage_stale
+        );
+        assert!(
+            store
+                .get(bounds, now + Duration::seconds(900))
+                .unwrap()
+                .usage_stale
+        );
+        store.put(
+            bounds,
+            Some(DailyCosts {
+                date: day.to_string(),
+                models: vec![ModelCost {
+                    model: "m".into(),
+                    spend: 24.0,
+                }],
+            }),
+            None,
+            now + Duration::seconds(2),
+        );
+        assert!(
+            store
+                .get(bounds, now + Duration::seconds(3))
+                .unwrap()
+                .usage_stale
+        );
+    }
+
     use super::*;
     use crate::litellm::calendar::day_bounds;
     use chrono::{Duration, FixedOffset, NaiveDate, Utc};

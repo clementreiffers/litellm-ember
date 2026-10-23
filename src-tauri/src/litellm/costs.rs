@@ -44,7 +44,7 @@ impl CostState {
                         costs
                             .models
                             .iter()
-                            .any(|c| c.model == m.model && c.spend == m.spend)
+                            .any(|c| c.model == m.model && (c.spend - m.spend).abs() <= 1e-8)
                     })
             })
     }
@@ -305,6 +305,34 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_rounding_only_preview_preserves_memory_usage_without_download() {
+        let server = MockServer::start();
+        let logs=server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[{"request_id":"a","model":"m","spend":23.301333660000004,"prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"startTime":"2026-10-20T12:00:00Z"}],"page":1,"page_size":1000,"total":1,"total_pages":1}));});
+        server.mock(|when,then|{when.path("/spend/logs");then.status(200).json_body(json!([{"startTime":"2026-10-20","spend":23.30133365999999,"models":{"m":23.30133365999999}}]));});
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let original = client
+            .fetch_day_in_zone("2026-10-20", false, &Utc)
+            .await
+            .unwrap();
+        client
+            .fetch_day_costs_cached_in_zone("2026-10-20", true, &Utc)
+            .await
+            .unwrap();
+        assert!(client
+            .cached_day_in_zone("2026-10-20", &Utc)
+            .await
+            .is_some());
+        assert_eq!(
+            client
+                .fetch_day_in_zone("2026-10-20", false, &Utc)
+                .await
+                .unwrap(),
+            original
+        );
+        logs.assert_hits(1);
+    }
+
     #[tokio::test]
     async fn daily_costs_accept_zero_empty_model_bucket_and_zero_failure_boundaries() {
         let server = MockServer::start();
@@ -782,6 +810,23 @@ mod tests {
             start.elapsed(),
             costs.models.len(),
             costs.models.iter().map(|m| m.spend).sum::<f64>()
+        );
+        let original = client
+            .fetch_day_validated(&date, false, &chrono::Local, None)
+            .await
+            .unwrap();
+        // Reproduit un aperçu plus récent dont l'ordre des additions diffère des logs détaillés.
+        client.fetch_day_costs(&date, true).await.unwrap();
+        let revisit_started = std::time::Instant::now();
+        let revisit = client
+            .fetch_day_validated(&date, false, &chrono::Local, None)
+            .await
+            .unwrap();
+        assert_eq!(revisit.fetched_at, original.fetched_at);
+        assert_eq!(revisit.data, original.data);
+        println!(
+            "cached_revisit={:?}; validation timestamp unchanged",
+            revisit_started.elapsed()
         );
     }
 

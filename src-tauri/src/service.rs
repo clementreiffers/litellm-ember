@@ -1144,6 +1144,80 @@ async fn persist_calendar(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn daily_cached_revisit_avoids_http_after_rounding_only_preview() {
+        let server = MockServer::start();
+        mocks(&server, 1.0, 0);
+        let logs = server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(503);
+        });
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        let day = Local::now().date_naive().pred_opt().unwrap();
+        let date = day.to_string();
+        let (_, state, attempt, _) = service
+            .request(|reply| Command::DailyContext(date.clone(), None, reply))
+            .await
+            .unwrap();
+        let bounds = crate::litellm::calendar::day_bounds(day, &Local).unwrap();
+        let now = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let usage = shared::DailyUsage {
+            date: date.clone(),
+            models: vec![ModelUsage {
+                model: "m".into(),
+                spend: 23.301333660000004,
+                total_tokens: 100,
+                ..Default::default()
+            }],
+        };
+        service
+            .request(|reply| {
+                Command::StoreDaily(
+                    state.generation,
+                    attempt,
+                    bounds,
+                    None,
+                    Some(usage.clone()),
+                    now,
+                    reply,
+                )
+            })
+            .await
+            .unwrap();
+        let costs = shared::DailyCosts {
+            date: date.clone(),
+            models: vec![ModelCost {
+                model: "m".into(),
+                spend: 23.30133365999999,
+            }],
+        };
+        service
+            .request(|reply| {
+                Command::StoreDaily(
+                    state.generation,
+                    attempt,
+                    bounds,
+                    Some(costs),
+                    None,
+                    now + chrono::Duration::milliseconds(3),
+                    reply,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            service.day_usage(date.clone(), false).await.unwrap().data,
+            usage
+        );
+        assert_eq!(service.day_usage(date, false).await.unwrap().data, usage);
+        logs.assert_hits(0);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn daily_incompatible_usage_bypasses_retained_memory() {
         let server = MockServer::start();
         let day = Local::now().date_naive().pred_opt().unwrap();
