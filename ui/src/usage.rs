@@ -64,6 +64,16 @@ pub fn local_today() -> String {
     format_local(&js_sys::Date::new_0())
 }
 
+/// Identité locale de la date sélectionnée, même en dehors de la fenêtre de l'historique.
+pub fn local_day_bounds(value: &str) -> Option<(i64, i64)> {
+    calendar_date(value)?;
+    let start = js_sys::Date::new(&format!("{value}T00:00:00").into());
+    let end = js_sys::Date::new(&start.get_time().into());
+    end.set_date(end.get_date() + 1);
+    (start.get_time().is_finite() && end.get_time().is_finite())
+        .then_some((start.get_time() as i64, end.get_time() as i64))
+}
+
 pub fn update_today(today: RwSignal<String>) -> String {
     let current = local_today();
     if today.get_untracked() != current {

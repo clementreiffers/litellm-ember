@@ -1,3 +1,4 @@
+mod daily_store;
 mod harness;
 mod history;
 mod increase;

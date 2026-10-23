@@ -117,20 +117,12 @@ impl CalendarState {
             }
         });
     }
-    pub fn load_details(self, force: bool, generation: Signal<u64>) {
+    pub fn load_details(self, generation: Signal<u64>) {
         if let Some(date) = self.selected.get_untracked() {
-            if force {
-                self.reset_details();
-            }
-            let cost_date = date.clone();
-            crate::details::load(
-                self.costs,
-                move || crate::tauri::get_day_costs(cost_date.clone(), force),
-                generation,
-            );
+            crate::details::load_day_costs(self.costs, date.clone(), false, generation);
             crate::details::load(
                 self.usage,
-                move || crate::tauri::get_day_usage(date.clone(), force),
+                move || crate::tauri::get_day_usage(date.clone(), false),
                 generation,
             );
         }
@@ -169,6 +161,8 @@ pub fn DayRecap(state: CalendarState) -> impl IntoView {
             <section class="card day-recap" aria-label="Récapitulatif de la journée">
                 <div class="recap-heading"><h2>{move ||state.selected.get().map(|d|format!("Consommation · {d}"))}</h2><button type="button" class="close" aria-label="Fermer le récapitulatif" on:click=move |_|state.select(None)>"✕"</button></div>
                 <div class="hint">"Journée locale"</div>
+                {move ||state.usage.with(|r|r.stale).then(||view!{<div class="caption">"Données en cache · validation en cours ou indisponible"</div>})}
+                {move ||(state.costs.with(|r|r.stale) && usage.with(Option::is_none)).then(||view!{<div class="caption">"Coûts en cache · validation en cours ou indisponible"</div>})}
                 {move ||state.usage.with(|r|r.loading).then(||view!{<div class="refreshing">"Chargement des détails de tokens…"</div>})}
                 {move ||state.usage.with(|r|r.error.clone()).map(|e|view!{<div class="error" role="alert">{e}</div>})}
                 {move ||state.costs.with(|r|r.error.clone()).filter(|_|costs.with(Option::is_none)).map(|e|view!{<div class="error" role="alert">{e}</div>})}

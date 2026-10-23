@@ -1,6 +1,10 @@
 //! Source analytique légère, avec repli lorsque le serveur ne la permet pas.
 use super::{domain::normalize_model, Client};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use futures_util::{
+    future::{BoxFuture, Shared},
+    FutureExt,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::ModelUsage;
@@ -12,8 +16,18 @@ use std::{
 #[derive(Default)]
 pub(super) struct Access {
     request_id: u64,
-    user_id: Option<Option<String>>,
+    user_version: u64,
+    user: UserState,
     retry_after: Option<Instant>,
+}
+
+type UserLookup = Shared<BoxFuture<'static, Result<Option<String>, String>>>;
+#[derive(Default)]
+enum UserState {
+    #[default]
+    Unknown,
+    Loading(UserLookup),
+    Ready(Option<String>),
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -77,13 +91,26 @@ struct Response {
 }
 
 impl Client {
+    #[cfg(test)]
     pub(super) async fn fetch_analytics_in_zone(
         &self,
         day: NaiveDate,
         zone: &impl TimeZone,
         force: bool,
     ) -> Option<Vec<ModelUsage>> {
-        let (request_id, user_id) = {
+        let fresh_since = force.then(Instant::now);
+        self.fetch_analytics_since(day, zone, force, fresh_since)
+            .await
+    }
+
+    pub(super) async fn fetch_analytics_since(
+        &self,
+        day: NaiveDate,
+        zone: &impl TimeZone,
+        force: bool,
+        fresh_since: Option<Instant>,
+    ) -> Option<Vec<ModelUsage>> {
+        let (request_id, user_version, lookup) = {
             let mut access = self.analytics.lock().await;
             if !force
                 && access
@@ -92,31 +119,68 @@ impl Client {
             {
                 return None;
             }
-            if access.user_id.is_none() {
-                #[derive(Deserialize)]
-                struct Info {
-                    info: User,
-                }
-                #[derive(Deserialize)]
-                struct User {
-                    user_id: Option<String>,
-                }
-                match tokio::time::timeout(Duration::from_secs(3), self.get::<Info>("/key/info"))
-                    .await
-                {
-                    Ok(Ok(info)) => access.user_id = Some(info.info.user_id),
-                    _ => {
-                        access.retry_after = Some(Instant::now() + Duration::from_secs(900));
-                        return None;
-                    }
-                }
-            }
             access.request_id += 1;
-            (access.request_id, access.user_id.clone().flatten())
+            let request_id = access.request_id;
+            let lookup = match &access.user {
+                UserState::Ready(user) => futures_util::future::ready(Ok(user.clone()))
+                    .boxed()
+                    .shared(),
+                UserState::Loading(future) if !force => future.clone(),
+                _ => {
+                    // Transport indépendant : le futur stocké ne doit pas retenir son propre cache.
+                    let transport =
+                        Self::with_http(&self.base_url, self.api_key.clone(), self.http.clone())
+                            .ok()?;
+                    let future = async move {
+                        #[derive(Deserialize)]
+                        struct Info {
+                            info: User,
+                        }
+                        #[derive(Deserialize)]
+                        struct User {
+                            user_id: Option<String>,
+                        }
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            transport.get::<Info>("/key/info"),
+                        )
+                        .await
+                        .map_err(|_| "Identification expirée".to_owned())?
+                        .map(|value| value.info.user_id)
+                        .map_err(String::from)
+                    }
+                    .boxed()
+                    .shared();
+                    access.user_version += 1;
+                    access.user = UserState::Loading(future.clone());
+                    future
+                }
+            };
+            (request_id, access.user_version, lookup)
         };
+        let user = lookup.clone().await;
+        {
+            let mut access = self.analytics.lock().await;
+            if access.user_version != user_version {
+                return None;
+            }
+            if matches!(&access.user, UserState::Loading(_)) {
+                access.user = match &user {
+                    Ok(id) => UserState::Ready(id.clone()),
+                    Err(_) => UserState::Unknown,
+                };
+            }
+            if user.is_err() {
+                if access.request_id == request_id {
+                    access.retry_after = Some(Instant::now() + Duration::from_secs(900));
+                }
+                return None;
+            }
+        }
+        let user_id = user.ok()?;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            self.analytics_day(day, zone, user_id.as_deref()),
+            self.analytics_day(day, zone, user_id.as_deref(), fresh_since),
         )
         .await
         .ok()
@@ -137,6 +201,7 @@ impl Client {
         day: NaiveDate,
         zone: &impl TimeZone,
         user_id: Option<&str>,
+        fresh_since: Option<Instant>,
     ) -> Option<Vec<ModelUsage>> {
         let next = day.succ_opt()?;
         let midnight = day.and_hms_opt(0, 0, 0)?;
@@ -190,8 +255,8 @@ impl Client {
             return None;
         }
         let (first, last) = tokio::join!(
-            self.analytics_boundary(start.min(utc_start), start.max(utc_start)),
-            self.analytics_boundary(end.min(utc_end), end.max(utc_end))
+            self.analytics_boundary(start.min(utc_start), start.max(utc_start), fresh_since),
+            self.analytics_boundary(end.min(utc_end), end.max(utc_end), fresh_since)
         );
         for (correction, add) in [(first?, start < utc_start), (last?, end > utc_end)] {
             for (name, metrics) in correction {
@@ -221,18 +286,21 @@ impl Client {
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        fresh_since: Option<Instant>,
     ) -> Option<HashMap<String, Metrics>> {
         let mut models = HashMap::<String, Metrics>::new();
         if start == end {
             return Some(models);
         }
-        for row in self.fetch_range_usage_pages(start, end).await.ok()?? {
+        let rows = self
+            .shared_boundary_rows(start, end, fresh_since)
+            .await
+            .ok()??;
+        for row in rows.iter() {
             if row.start_time < start || row.start_time >= end {
                 continue;
             }
-            let Some(name) = normalize_model(&row.model) else {
-                continue;
-            };
+            let name = normalize_model(&row.model)?;
             let metrics = Metrics {
                 spend: row.spend?,
                 api_requests: 1,
@@ -254,6 +322,26 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn analytics_rejects_model_less_boundary() {
+        let server = MockServer::start();
+        info(&server);
+        server.mock(|when, then| {
+            when.path("/user/daily/activity/aggregated");
+            then.status(200).json_body(response("2024-02-29"));
+        });
+        server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[{"request_id":"missing","spend":1,"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"startTime":"2024-02-28T23:00:00Z"}],"total":1,"page":1,"page_size":1000,"total_pages":1}));});
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        assert!(client
+            .fetch_analytics_in_zone(
+                NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(),
+                &chrono::FixedOffset::east_opt(7200).unwrap(),
+                false
+            )
+            .await
+            .is_none());
+    }
+
     use super::super::*;
     use httpmock::prelude::*;
     use serde_json::{json, Value};
@@ -272,6 +360,173 @@ mod tests {
             then.status(200)
                 .json_body(json!({"info":{"user_id":"test-user","spend":5.0}}));
         });
+    }
+
+    #[tokio::test]
+    async fn parallel_costs_and_usage_share_paginated_boundaries() {
+        for force in [false, true] {
+            let server = MockServer::start();
+            info(&server);
+            server.mock(|when, then| {
+                when.path("/user/daily/activity/aggregated");
+                then.status(200).json_body(response("2024-02-29"));
+            });
+            server.mock(|when, then| {
+                when.path("/spend/logs");
+                then.status(200)
+                    .json_body(json!([{"startTime":"2024-02-29","spend":5,"models":{"m":5}}]));
+            });
+            let mut mocks = vec![];
+            for (start, end, spend, input, output) in [
+                ("2024-02-28 22:00:00", "2024-02-29 00:00:00", 3.0, 30, 3),
+                ("2024-02-29 22:00:00", "2024-03-01 00:00:00", 1.0, 10, 1),
+            ] {
+                for page in [1, 2] {
+                    let rows: Vec<_> = if page == 1 {
+                        (0..1000).map(|id|json!({"request_id":format!("excluded-{id}"),"model":"m","spend":999,"prompt_tokens":999,"completion_tokens":999,"total_tokens":1998,"startTime":format!("{}Z",end.replace(' ',"T"))})).collect()
+                    } else {
+                        vec![
+                            json!({"request_id":"included","model":"m","spend":spend,"prompt_tokens":input,"completion_tokens":output,"total_tokens":input+output,"startTime":format!("{}Z",start.replace(' ',"T"))}),
+                        ]
+                    };
+                    mocks.push(server.mock(|when,then| {
+                        when.path("/spend/logs/v2").query_param("start_date",start).query_param("end_date",end).query_param("page",page.to_string());
+                        then.status(200).delay(std::time::Duration::from_millis(50)).json_body(json!({"data":rows,"page":page,"page_size":1000,"total":1001,"total_pages":2}));
+                    }));
+                }
+            }
+            let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+            let zone = chrono::FixedOffset::east_opt(7200).unwrap();
+            let since = force.then(std::time::Instant::now);
+            let (costs, usage) = tokio::join!(
+                client.fetch_day_costs_validated("2024-02-29", force, &zone, since),
+                client.fetch_day_validated("2024-02-29", force, &zone, since)
+            );
+            assert_eq!(costs.unwrap().data.models[0].spend, 7.0);
+            let data = usage.unwrap().data;
+            assert_eq!(data.models[0].spend, 7.0);
+            assert_eq!(data.models[0].total_tokens, 142);
+            for mock in mocks {
+                mock.assert_hits(1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn analytics_key_lookup_does_not_lock_other_dates_and_is_shared() {
+        let server = MockServer::start();
+        let info = server.mock(|when, then| {
+            when.path("/key/info");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(500))
+                .json_body(json!({"info":{"user_id":"test-user"}}));
+        });
+        for date in ["2024-02-28", "2024-02-29"] {
+            server.mock(|when, then| {
+                when.path("/user/daily/activity/aggregated")
+                    .query_param("start_date", date);
+                then.status(200).json_body(response(date));
+            });
+        }
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let cloned = client.clone();
+        let first = tokio::spawn(async move {
+            cloned
+                .fetch_analytics_in_zone(NaiveDate::from_ymd_opt(2024, 2, 28).unwrap(), &Utc, false)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while info.hits_async().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let cloned = client.clone();
+        let second = tokio::spawn(async move {
+            cloned
+                .fetch_analytics_in_zone(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), &Utc, false)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                if client.analytics.lock().await.request_id >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both dates must register while key info is pending");
+        assert_eq!(first.await.unwrap().unwrap()[0].total_tokens, 120);
+        assert_eq!(second.await.unwrap().unwrap()[0].total_tokens, 120);
+        info.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn analytics_forced_key_lookup_supersedes_old_initialization() {
+        for old_succeeds in [false, true] {
+            let server = MockServer::start();
+            let mut old = server.mock(|when, then| {
+                when.path("/key/info");
+                if old_succeeds {
+                    then.status(200)
+                        .delay(std::time::Duration::from_millis(500))
+                        .json_body(json!({"info":{"user_id":"old-user"}}));
+                } else {
+                    then.status(503)
+                        .delay(std::time::Duration::from_millis(500));
+                }
+            });
+            let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+            let cloned = client.clone();
+            let pending = tokio::spawn(async move {
+                cloned
+                    .fetch_analytics_in_zone(
+                        NaiveDate::from_ymd_opt(2024, 2, 28).unwrap(),
+                        &Utc,
+                        false,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while old.hits_async().await == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            old.delete();
+            let new = server.mock(|when, then| {
+                when.path("/key/info");
+                then.status(200)
+                    .json_body(json!({"info":{"user_id":"new-user"}}));
+            });
+            let aggregate = server.mock(|when, then| {
+                when.path("/user/daily/activity/aggregated")
+                    .query_param("user_id", "new-user");
+                then.status(200).json_body(response("2024-02-29"));
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                client.fetch_analytics_in_zone(
+                    NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(),
+                    &Utc,
+                    true,
+                ),
+            )
+            .await
+            .expect("forced lookup must not wait for old network request");
+            assert_eq!(result.unwrap()[0].spend, 5.0);
+            assert!(!pending.is_finished());
+            assert!(pending.await.unwrap().is_none());
+            assert!(client
+                .fetch_analytics_in_zone(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(), &Utc, false)
+                .await
+                .is_some());
+            new.assert_hits(1);
+            aggregate.assert_hits(2);
+        }
     }
 
     #[tokio::test]

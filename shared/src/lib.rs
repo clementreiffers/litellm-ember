@@ -75,6 +75,16 @@ pub struct DailyCosts {
     pub models: Vec<ModelCost>,
 }
 
+/// Agrégats locaux persistés ; une valeur périmée reste un aperçu jusqu'à validation réseau.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedDaily {
+    pub costs: DailyCosts,
+    pub usage: Option<DailyUsage>,
+    pub stale: bool,
+    pub usage_stale: bool,
+    pub fetched_at: String,
+}
+
 /// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

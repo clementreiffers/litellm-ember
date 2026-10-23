@@ -3,7 +3,7 @@ use super::{
     aggregate_totals,
     calendar::{day_bounds, DayBounds},
     domain::{normalize_model, DaySummary},
-    Client,
+    Client, Validated,
 };
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,7 @@ struct CachedCosts {
     bounds: DayBounds,
     request_id: u64,
     fetched: Instant,
+    validated_at: DateTime<Utc>,
     value: Option<DailyCosts>,
 }
 #[derive(Default)]
@@ -26,18 +27,58 @@ pub(super) struct CostState {
     entries: VecDeque<CachedCosts>,
 }
 
+impl CostState {
+    pub(super) fn compatible_usage(
+        &self,
+        bounds: DayBounds,
+        usage: &shared::DailyUsage,
+        validated_at: DateTime<Utc>,
+    ) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.bounds == bounds && entry.validated_at > validated_at)
+            .and_then(|entry| entry.value.as_ref())
+            .is_none_or(|costs| {
+                costs.models.len() == usage.models.len()
+                    && usage.models.iter().all(|m| {
+                        costs
+                            .models
+                            .iter()
+                            .any(|c| c.model == m.model && c.spend == m.spend)
+                    })
+            })
+    }
+}
+
 impl Client {
+    #[cfg(test)]
     pub async fn fetch_day_costs(&self, date: &str, force: bool) -> Result<DailyCosts, String> {
         self.fetch_day_costs_cached_in_zone(date, force, &Local)
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn fetch_day_costs_cached_in_zone(
         &self,
         date: &str,
         force: bool,
         zone: &impl TimeZone,
     ) -> Result<DailyCosts, String> {
+        let fresh_since = force.then(Instant::now);
+        self.fetch_day_costs_validated(date, force, zone, fresh_since)
+            .await
+            .map(|v| v.data)
+    }
+
+    pub(crate) async fn fetch_day_costs_validated(
+        &self,
+        date: &str,
+        force: bool,
+        zone: &impl TimeZone,
+        fresh_since: Option<Instant>,
+    ) -> Result<Validated<DailyCosts>, String> {
+        let started = Instant::now();
+        let validated_at = Utc::now();
         let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .ok()
             .filter(|day| {
@@ -46,17 +87,21 @@ impl Client {
             .ok_or("Date invalide ou future")?;
         let bounds = day_bounds(day, zone).ok_or("Frontière locale indisponible")?;
         if !force {
-            if let Some(usage) = self.cached_day_in_zone(date, zone).await {
-                return Ok(DailyCosts {
-                    date: usage.date,
-                    models: usage
-                        .models
-                        .into_iter()
-                        .map(|m| ModelCost {
-                            model: m.model,
-                            spend: m.spend,
-                        })
-                        .collect(),
+            if let Some(usage) = self.cached_day_validated(date, zone).await {
+                return Ok(Validated {
+                    fetched_at: usage.fetched_at,
+                    data: DailyCosts {
+                        date: usage.data.date,
+                        models: usage
+                            .data
+                            .models
+                            .into_iter()
+                            .map(|m| ModelCost {
+                                model: m.model,
+                                spend: m.spend,
+                            })
+                            .collect(),
+                    },
                 });
             }
         }
@@ -73,40 +118,64 @@ impl Client {
                 }) {
                     let entry = state.entries.remove(index).unwrap();
                     let value = entry.value.clone().unwrap();
+                    let fetched_at = entry.validated_at;
                     state.entries.push_back(entry);
-                    return Ok(value);
+                    return Ok(Validated {
+                        data: value,
+                        fetched_at,
+                    });
                 }
             }
             state.sequence += 1;
             let id = state.sequence;
+            let previous = state
+                .entries
+                .iter()
+                .find(|e| e.bounds == bounds)
+                .map(|e| (e.fetched, e.value.clone(), e.validated_at));
             state.entries.retain(|entry| entry.date != date);
             state.entries.push_back(CachedCosts {
                 date: date.into(),
                 bounds,
                 request_id: id,
-                fetched: Instant::now(),
-                value: None,
+                fetched: previous.as_ref().map(|p| p.0).unwrap_or_else(Instant::now),
+                validated_at: previous.as_ref().map(|p| p.2).unwrap_or(validated_at),
+                value: previous.and_then(|p| p.1),
             });
             while state.entries.len() > 30 {
                 state.entries.pop_front();
             }
             id
         };
-        let value = self.fetch_day_costs_in_zone(day, zone).await?;
+        let value = self.fetch_day_costs_since(day, zone, fresh_since).await?;
         let mut state = self.costs.lock().await;
         if let Some(entry) = state.entries.iter_mut().find(|entry| {
             entry.date == date && entry.request_id == id && Some(bounds) == day_bounds(day, zone)
         }) {
             entry.value = Some(value.clone());
-            entry.fetched = Instant::now();
+            entry.fetched = started;
+            entry.validated_at = validated_at;
         }
-        Ok(value)
+        Ok(Validated {
+            data: value,
+            fetched_at: validated_at,
+        })
     }
 
+    #[cfg(test)]
     async fn fetch_day_costs_in_zone(
         &self,
         day: NaiveDate,
         zone: &impl TimeZone,
+    ) -> Result<DailyCosts, String> {
+        self.fetch_day_costs_since(day, zone, None).await
+    }
+
+    async fn fetch_day_costs_since(
+        &self,
+        day: NaiveDate,
+        zone: &impl TimeZone,
+        fresh_since: Option<Instant>,
     ) -> Result<DailyCosts, String> {
         let next = day.succ_opt().ok_or("Date hors limites")?;
         let midnight = day.and_hms_opt(0, 0, 0).unwrap();
@@ -116,31 +185,54 @@ impl Client {
         let utc_start = midnight.and_utc();
         let utc_end = next_midnight.and_utc();
         let summary = async {
+            #[derive(serde::Deserialize)]
+            struct CompleteSummary {
+                #[serde(rename = "startTime")]
+                start_time: String,
+                spend: f64,
+                models: HashMap<String, f64>,
+            }
             let hash = format!("{:x}", Sha256::digest(self.api_key.as_bytes()));
-            let rows: Vec<DaySummary> = self
+            let rows: Vec<CompleteSummary> = self
                 .get(&format!(
                     "/spend/logs?summarize=true&start_date={day}&end_date={next}&api_key={hash}"
                 ))
                 .await
                 .map_err(String::from)?;
-            if rows.iter().any(|row| {
-                row.start_time
-                    .as_deref()
-                    .and_then(super::parse_date)
-                    .is_none()
-            }) {
+            if rows
+                .iter()
+                .any(|row| super::parse_date(&row.start_time).is_none())
+            {
                 return Err("Date du résumé de consommation invalide".into());
             }
-            let selected: Vec<_> = rows
+            let mut selected = Vec::new();
+            for row in rows
                 .into_iter()
-                .filter(|row| row.start_time.as_deref().and_then(super::parse_date) == Some(day))
-                .collect();
+                .filter(|r| super::parse_date(&r.start_time) == Some(day))
+            {
+                let total: f64 = row.models.values().sum();
+                if !row.spend.is_finite()
+                    || row.spend < 0.0
+                    || !total.is_finite()
+                    || (total - row.spend).abs() > 1e-8
+                    || row.models.iter().any(|(name, spend)| {
+                        normalize_model(name).is_none() || !spend.is_finite() || *spend < 0.0
+                    })
+                {
+                    return Err("Résumé de consommation incomplet ou incohérent".into());
+                }
+                selected.push(DaySummary {
+                    start_time: Some(row.start_time),
+                    spend: row.spend,
+                    models: row.models,
+                });
+            }
             Ok::<_, String>(aggregate_totals(&selected))
         };
         let (summary, start_costs, end_costs) = tokio::try_join!(
             summary,
-            self.boundary_costs(start.min(utc_start), start.max(utc_start)),
-            self.boundary_costs(end.min(utc_end), end.max(utc_end)),
+            self.boundary_costs(start.min(utc_start), start.max(utc_start), fresh_since),
+            self.boundary_costs(end.min(utc_end), end.max(utc_end), fresh_since),
         )?;
         let mut costs: HashMap<String, f64> =
             summary.into_iter().map(|m| (m.model, m.spend)).collect();
@@ -173,16 +265,17 @@ impl Client {
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        fresh_since: Option<Instant>,
     ) -> Result<Vec<ModelCost>, String> {
         if start == end {
             return Ok(vec![]);
         }
         let rows = self
-            .fetch_range_usage_pages(start, end)
+            .shared_boundary_rows(start, end, fresh_since)
             .await?
             .ok_or("Correction de la journée locale indisponible")?;
         let mut costs = HashMap::new();
-        for row in rows {
+        for row in rows.iter() {
             if row.start_time < start || row.start_time >= end {
                 continue;
             }
@@ -190,8 +283,12 @@ impl Client {
                 .spend
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .ok_or("Coût de frontière absent ou invalide")?;
-            if let Some(model) = normalize_model(&row.model) {
-                *costs.entry(model.to_owned()).or_insert(0.0) += spend;
+            let model =
+                normalize_model(&row.model).ok_or("Modèle de frontière absent ou invalide")?;
+            let total = costs.entry(model.to_owned()).or_insert(0.0);
+            *total += spend;
+            if !total.is_finite() {
+                return Err("Coût de frontière hors limites".into());
             }
         }
         Ok(costs
@@ -203,10 +300,82 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_costs_reject_model_less_boundary() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":5,"models":{"m":5}}]));
+        });
+        server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[{"request_id":"missing","spend":1,"startTime":"2024-02-28T23:00:00Z"}],"total":1,"page":1,"page_size":1000,"total_pages":1}));});
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        assert!(client
+            .fetch_day_costs_cached_in_zone(
+                "2024-02-29",
+                false,
+                &chrono::FixedOffset::east_opt(7200).unwrap()
+            )
+            .await
+            .is_err());
+    }
+
     use super::super::Client;
     use chrono::{NaiveDate, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn daily_cost_failed_force_keeps_healthy_memory_value() {
+        let server = MockServer::start();
+        let mut valid = server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":2,"models":{"m":2}}]));
+        });
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let first = client
+            .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        valid.delete();
+        server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(503);
+        });
+        assert!(client
+            .fetch_day_costs_cached_in_zone("2024-02-29", true, &Utc)
+            .await
+            .is_err());
+        assert_eq!(
+            client
+                .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+                .await
+                .unwrap(),
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_costs_reject_unreconciled_or_absent_model_breakdowns() {
+        for row in [
+            json!({"startTime":"2024-02-29","spend":100,"models":{"m":2}}),
+            json!({"startTime":"2024-02-29","spend":100}),
+            json!({"startTime":"2024-02-29","models":{"m":2}}),
+            json!({"startTime":"2024-02-29","spend":1,"models":{"m":2,"n":-1}}),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.path("/spend/logs");
+                then.status(200).json_body(json!([row]));
+            });
+            let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+            assert!(client
+                .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+                .await
+                .is_err());
+        }
+    }
 
     #[tokio::test]
     async fn daily_caches_do_not_cross_calendar_boundaries() {

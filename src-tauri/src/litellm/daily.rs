@@ -1,8 +1,9 @@
 //! Chargement paginé et cache des journées de consommation.
 use super::{
-    aggregate_today,
     calendar::{day_bounds, DayBounds},
-    day_range, Client, LogRow, TransportError,
+    day_range,
+    domain::normalize_model,
+    Client, LogRow, TransportError, Validated,
 };
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use futures_util::{stream, StreamExt, TryStreamExt};
@@ -10,7 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::DailyUsage;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -23,6 +24,7 @@ struct DailyCache {
     bounds: Option<DayBounds>,
     request_id: u64,
     fetched: Instant,
+    validated_at: DateTime<Utc>,
     usage: Option<DailyUsage>,
 }
 
@@ -35,6 +37,7 @@ pub(super) struct DailyState {
 /// Ignore les métadonnées, messages et réponses volumineux : seuls ces compteurs sont utiles.
 #[derive(Deserialize)]
 pub(super) struct UsageRow {
+    #[serde(default)]
     request_id: String,
     #[serde(default)]
     pub(super) model: String,
@@ -46,21 +49,29 @@ pub(super) struct UsageRow {
     pub(super) start_time: DateTime<Utc>,
 }
 
-impl From<UsageRow> for LogRow {
-    fn from(row: UsageRow) -> Self {
-        Self {
-            model: row.model,
-            spend: row.spend.unwrap_or_default(),
-            prompt: row.prompt_tokens.unwrap_or_default(),
-            completion: row.completion_tokens.unwrap_or_default(),
-            total: row.total_tokens.unwrap_or_default(),
+impl TryFrom<UsageRow> for LogRow {
+    type Error = String;
+    fn try_from(row: UsageRow) -> Result<Self, String> {
+        let missing = "Compteurs de consommation absents ou invalides";
+        let model = normalize_model(&row.model)
+            .ok_or("Modèle de consommation absent ou invalide")?
+            .to_owned();
+        Ok(Self {
+            model,
+            spend: row
+                .spend
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or(missing)?,
+            prompt: row.prompt_tokens.ok_or(missing)?,
+            completion: row.completion_tokens.ok_or(missing)?,
+            total: row.total_tokens.ok_or(missing)?,
             start_time: Some(row.start_time),
             end_time: None,
             completion_start: None,
             status: None,
             cache_hit: None,
             prompt_cache: None,
-        }
+        })
     }
 }
 
@@ -93,12 +104,22 @@ impl Page {
 }
 
 impl Client {
+    #[cfg(test)]
     pub(super) async fn cached_day_in_zone(
         &self,
         date: &str,
         zone: &impl TimeZone,
     ) -> Option<DailyUsage> {
+        self.cached_day_validated(date, zone).await.map(|v| v.data)
+    }
+
+    pub(super) async fn cached_day_validated(
+        &self,
+        date: &str,
+        zone: &impl TimeZone,
+    ) -> Option<Validated<DailyUsage>> {
         let bounds = day_bounds(NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?, zone)?;
+        let costs = self.costs.lock().await;
         let state = self.daily.lock().await;
         let ttl = if date == Local::now().date_naive().to_string() {
             Duration::from_secs(60)
@@ -108,8 +129,20 @@ impl Client {
         state
             .cache
             .iter()
-            .find(|entry| entry.bounds == Some(bounds) && entry.fetched.elapsed() < ttl)
-            .and_then(|entry| entry.usage.clone())
+            .find(|entry| {
+                entry.bounds == Some(bounds)
+                    && entry.fetched.elapsed() < ttl
+                    && entry
+                        .usage
+                        .as_ref()
+                        .is_some_and(|u| costs.compatible_usage(bounds, u, entry.validated_at))
+            })
+            .and_then(|entry| {
+                entry.usage.clone().map(|data| Validated {
+                    data,
+                    fetched_at: entry.validated_at,
+                })
+            })
     }
     /// Réutilise les agrégats seulement pour la même connexion, jamais les lignes du jour courant.
     pub fn reuse_daily_cache(&mut self, previous: &Self) {
@@ -117,19 +150,36 @@ impl Client {
             self.daily = previous.daily.clone();
             self.analytics = previous.analytics.clone();
             self.costs = previous.costs.clone();
+            self.ranges = previous.ranges.clone();
         }
     }
 
+    #[cfg(test)]
     pub async fn fetch_day(&self, date: &str, force: bool) -> Result<DailyUsage, String> {
         self.fetch_day_in_zone(date, force, &Local).await
     }
 
+    #[cfg(test)]
     pub(super) async fn fetch_day_in_zone(
         &self,
         date: &str,
         force: bool,
         zone: &impl TimeZone,
     ) -> Result<DailyUsage, String> {
+        self.fetch_day_validated(date, force, zone, force.then(Instant::now))
+            .await
+            .map(|v| v.data)
+    }
+
+    pub(crate) async fn fetch_day_validated(
+        &self,
+        date: &str,
+        force: bool,
+        zone: &impl TimeZone,
+        fresh_since: Option<Instant>,
+    ) -> Result<Validated<DailyUsage>, String> {
+        let started = Instant::now();
+        let validated_at = Utc::now();
         let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .ok()
             .filter(|day| date.len() == 10 && day.to_string() == date)
@@ -140,6 +190,7 @@ impl Client {
         }
         let bounds = day_bounds(day, zone);
         let request_id = {
+            let costs = self.costs.lock().await;
             let mut state = self.daily.lock().await;
             let ttl = if day == today {
                 Duration::from_secs(60)
@@ -152,44 +203,88 @@ impl Client {
                         && c.bounds == bounds
                         && c.usage.is_some()
                         && c.fetched.elapsed() < ttl
+                        && c.usage.as_ref().is_some_and(|u| {
+                            costs.compatible_usage(
+                                bounds.expect("frontières vérifiées"),
+                                u,
+                                c.validated_at,
+                            )
+                        })
                 }) {
                     let cached = state.cache.remove(index).unwrap();
                     let usage = cached.usage.clone().unwrap();
                     state.cache.push_back(cached);
-                    return Ok(usage);
+                    return Ok(Validated {
+                        data: usage,
+                        fetched_at: state.cache.back().expect("entrée réinsérée").validated_at,
+                    });
                 }
             }
             state.request_id += 1;
             let request_id = state.request_id;
+            let previous = state
+                .cache
+                .iter()
+                .find(|c| c.bounds == bounds && bounds.is_some())
+                .map(|c| (c.fetched, c.usage.clone(), c.validated_at));
             state.cache.retain(|c| c.date != date);
             state.cache.push_back(DailyCache {
                 date: date.into(),
                 bounds,
                 request_id,
-                fetched: Instant::now(),
-                usage: None,
+                fetched: previous.as_ref().map(|p| p.0).unwrap_or_else(Instant::now),
+                validated_at: previous.as_ref().map(|p| p.2).unwrap_or(validated_at),
+                usage: previous.and_then(|p| p.1),
             });
             while state.cache.len() > CACHE_DAYS {
                 state.cache.pop_front();
             }
             request_id
         };
-        let models = if let Some(models) = self.fetch_analytics_in_zone(day, zone, force).await {
+        let models = if let Some(models) = self
+            .fetch_analytics_since(day, zone, force, fresh_since)
+            .await
+        {
             models
         } else {
             let (start, end) = exact_range(day, zone).ok_or("Date hors limites")?;
-            let rows = match self.fetch_range_pages(start, end).await? {
+            let rows: Vec<UsageRow> = match self.fetch_range_usage_pages(start, end).await? {
                 Some(rows) => rows,
                 None => {
                     let (start, end) = day_range(day, zone).ok_or("Date hors limites")?;
+                    let hash = format!("{:x}", Sha256::digest(self.api_key.as_bytes()));
                     self.get(&format!(
-                        "/spend/logs?summarize=false&start_date={start}&end_date={end}"
+                        "/spend/logs?summarize=false&start_date={start}&end_date={end}&api_key={hash}"
                     ))
                     .await?
                 }
             };
-            aggregate_today(&rows, day, zone)
+            let rows = rows
+                .into_iter()
+                .filter(|r| r.start_time.with_timezone(zone).date_naive() == day)
+                .map(LogRow::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            aggregate_daily(&rows)?
         };
+        // Les totaux affichés additionnent aussi les modèles ; valider cette somme avant publication.
+        let mut totals = [0u64; 4];
+        let mut spend = 0.0;
+        for model in &models {
+            for (sum, value) in totals.iter_mut().zip([
+                model.requests,
+                model.prompt_tokens,
+                model.completion_tokens,
+                model.total_tokens,
+            ]) {
+                *sum = sum
+                    .checked_add(value)
+                    .ok_or("Compteurs de consommation hors limites")?;
+            }
+            spend += model.spend;
+        }
+        if !spend.is_finite() {
+            return Err("Coût total de consommation hors limites".into());
+        }
         let usage = DailyUsage {
             date: date.into(),
             models,
@@ -201,21 +296,14 @@ impl Client {
                 && bounds.is_some()
                 && bounds == day_bounds(day, zone)
         }) {
-            entry.fetched = Instant::now();
+            entry.fetched = started;
+            entry.validated_at = validated_at;
             entry.usage = Some(usage.clone());
         }
-        Ok(usage)
-    }
-
-    pub(super) async fn fetch_range_pages(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<Vec<LogRow>>, String> {
-        Ok(self
-            .fetch_range_usage_pages(start, end)
-            .await?
-            .map(|rows| rows.into_iter().map(LogRow::from).collect()))
+        Ok(Validated {
+            data: usage,
+            fetched_at: validated_at,
+        })
     }
 
     // Conserve les champs absents pour refuser les corrections analytiques incomplètes.
@@ -278,6 +366,40 @@ impl Client {
     }
 }
 
+fn aggregate_daily(rows: &[LogRow]) -> Result<Vec<shared::ModelUsage>, String> {
+    let mut models = HashMap::<&str, shared::ModelUsage>::new();
+    for row in rows {
+        let model = models
+            .entry(&row.model)
+            .or_insert_with(|| shared::ModelUsage {
+                model: row.model.clone(),
+                ..Default::default()
+            });
+        let overflow = "Compteurs de consommation hors limites";
+        model.requests = model.requests.checked_add(1).ok_or(overflow)?;
+        model.prompt_tokens = model
+            .prompt_tokens
+            .checked_add(row.prompt)
+            .ok_or(overflow)?;
+        model.completion_tokens = model
+            .completion_tokens
+            .checked_add(row.completion)
+            .ok_or(overflow)?;
+        model.total_tokens = model.total_tokens.checked_add(row.total).ok_or(overflow)?;
+        model.spend += row.spend;
+        if !model.spend.is_finite() {
+            return Err("Coût de consommation hors limites".into());
+        }
+    }
+    let mut models: Vec<_> = models.into_values().collect();
+    models.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then(a.model.cmp(&b.model))
+    });
+    Ok(models)
+}
+
 fn exact_range(day: NaiveDate, zone: &impl TimeZone) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let next = day.succ_opt()?;
     let start = zone
@@ -297,6 +419,57 @@ fn exact_range(day: NaiveDate, zone: &impl TimeZone) -> Option<(DateTime<Utc>, D
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_rejects_model_less_rows_and_aggregate_overflow() {
+        for legacy in [false, true] {
+            for fault in [
+                "missing_model",
+                "empty_model",
+                "invalid_model",
+                "prompt_overflow",
+                "completion_overflow",
+                "total_overflow",
+                "spend_overflow",
+            ] {
+                let server = MockServer::start();
+                let mut data = rows(0, 2);
+                match fault {
+                    "missing_model" => {
+                        data[0].as_object_mut().unwrap().remove("model");
+                    }
+                    "empty_model" => data[0]["model"] = json!(""),
+                    "invalid_model" => data[0]["model"] = json!("openai/"),
+                    "prompt_overflow" => data[0]["prompt_tokens"] = json!(u64::MAX),
+                    "completion_overflow" => data[0]["completion_tokens"] = json!(u64::MAX),
+                    "total_overflow" => data[0]["total_tokens"] = json!(u64::MAX),
+                    _ => {
+                        data[0]["spend"] = json!(f64::MAX);
+                        data[1]["spend"] = json!(f64::MAX);
+                    }
+                }
+                server.mock(|when, then| {
+                    when.path(if legacy {
+                        "/llm/spend/logs"
+                    } else {
+                        "/llm/spend/logs/v2"
+                    });
+                    then.status(200).json_body(if legacy {
+                        json!(data)
+                    } else {
+                        page(1, 2, data)
+                    });
+                });
+                assert!(
+                    client(&server)
+                        .fetch_day_in_zone("2024-02-29", false, &Utc)
+                        .await
+                        .is_err(),
+                    "{fault}, legacy={legacy}"
+                );
+            }
+        }
+    }
+
     use super::super::*;
     use super::{exact_range, PAST_TTL};
     use httpmock::prelude::*;
@@ -322,6 +495,187 @@ mod tests {
     fn page(number: usize, total: usize, data: Vec<Value>) -> Value {
         json!({"data":data,"page":number,"page_size":1000,"total":total,
             "total_pages":total.div_ceil(1000),"total_is_capped":false})
+    }
+
+    #[tokio::test]
+    async fn daily_changed_costs_invalidate_memory_usage_outside_persisted_window() {
+        let server = MockServer::start();
+        let mut valid = server.mock(|when, then| {
+            when.path("/llm/spend/logs/v2");
+            then.status(200).json_body(page(1, 1, rows(0, 1)));
+        });
+        server.mock(|when, then| {
+            when.path("/llm/spend/logs")
+                .query_param("summarize", "true");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":9,"models":{"m":9}}]));
+        });
+        let client = client(&server);
+        client
+            .fetch_day_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        valid.delete();
+        let failed = server.mock(|when, then| {
+            when.path("/llm/spend/logs/v2");
+            then.status(503);
+        });
+        assert_eq!(
+            client
+                .fetch_day_costs_cached_in_zone("2024-02-29", true, &Utc)
+                .await
+                .unwrap()
+                .models[0]
+                .spend,
+            9.0
+        );
+        assert!(client
+            .fetch_day_in_zone("2024-02-29", true, &Utc)
+            .await
+            .is_err());
+        assert!(client
+            .fetch_day_in_zone("2024-02-29", false, &Utc)
+            .await
+            .is_err());
+        failed.assert_hits(2);
+        assert_eq!(
+            client
+                .fetch_day_costs_cached_in_zone("2024-02-29", false, &Utc)
+                .await
+                .unwrap()
+                .models[0]
+                .spend,
+            9.0
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_memory_hits_preserve_original_validation_time() {
+        let server = MockServer::start();
+        let logs = server.mock(|when, then| {
+            when.path("/llm/spend/logs/v2");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(20))
+                .json_body(page(1, 1, rows(0, 1)));
+        });
+        let client = client(&server);
+        let first = client
+            .fetch_day_validated("2024-02-29", false, &Utc, None)
+            .await
+            .unwrap();
+        let second = client
+            .fetch_day_validated("2024-02-29", false, &Utc, None)
+            .await
+            .unwrap();
+        let costs = client
+            .fetch_day_costs_validated("2024-02-29", false, &Utc, None)
+            .await
+            .unwrap();
+        assert_eq!(first.fetched_at, second.fetched_at);
+        assert_eq!(first.fetched_at, costs.fetched_at);
+        logs.assert_hits(1);
+        client.daily.lock().await.cache.front_mut().unwrap().fetched -= PAST_TTL;
+        let third = client
+            .fetch_day_validated("2024-02-29", false, &Utc, None)
+            .await
+            .unwrap();
+        assert!(third.fetched_at > first.fetched_at);
+        logs.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn daily_failed_force_keeps_healthy_memory_value() {
+        let server = MockServer::start();
+        let mut valid = server.mock(|when, then| {
+            when.path("/llm/spend/logs/v2");
+            then.status(200).json_body(page(1, 1, rows(0, 1)));
+        });
+        let client = client(&server);
+        let first = client.fetch_day("2024-02-29", false).await.unwrap();
+        valid.delete();
+        server.mock(|when, then| {
+            when.path("/llm/spend/logs/v2");
+            then.status(503);
+        });
+        assert!(client.fetch_day("2024-02-29", true).await.is_err());
+        assert_eq!(client.fetch_day("2024-02-29", false).await.unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn daily_legacy_fallback_preserves_key_scope() {
+        let server = MockServer::start();
+        let scoped = server.mock(|when, then| {
+            when.path("/llm/spend/logs").query_param(
+                "api_key",
+                "f3abf2a6cc4f00987743db5f544ba345b4899ae31f326d8ee9c4816de153c9e0",
+            );
+            then.status(200).json_body(rows(0, 1));
+        });
+        let value = client(&server)
+            .fetch_day_in_zone("2024-02-29", false, &Utc)
+            .await
+            .unwrap();
+        assert_eq!(value.models[0].spend, 0.5);
+        scoped.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn daily_rejects_missing_counters_and_invalid_spend_on_both_sources() {
+        for legacy in [false, true] {
+            for field in [
+                "spend",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ] {
+                for null in [false, true] {
+                    let server = MockServer::start();
+                    let mut data = rows(0, 1);
+                    if null {
+                        data[0][field] = Value::Null;
+                    } else {
+                        data[0].as_object_mut().unwrap().remove(field);
+                    }
+                    if legacy {
+                        server.mock(|when, then| {
+                            when.path("/llm/spend/logs");
+                            then.status(200).json_body(json!(data));
+                        });
+                    } else {
+                        server.mock(|when, then| {
+                            when.path("/llm/spend/logs/v2");
+                            then.status(200).json_body(page(1, 1, data));
+                        });
+                    }
+                    assert!(
+                        client(&server)
+                            .fetch_day_in_zone("2024-02-29", false, &Utc)
+                            .await
+                            .is_err(),
+                        "legacy={legacy} field={field} null={null}"
+                    );
+                }
+            }
+            let server = MockServer::start();
+            let mut data = rows(0, 1);
+            data[0]["spend"] = json!(-1);
+            server.mock(|when, then| {
+                when.path(if legacy {
+                    "/llm/spend/logs"
+                } else {
+                    "/llm/spend/logs/v2"
+                });
+                then.status(200).json_body(if legacy {
+                    json!(data)
+                } else {
+                    page(1, 1, data)
+                });
+            });
+            assert!(client(&server)
+                .fetch_day_in_zone("2024-02-29", false, &Utc)
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]

@@ -152,10 +152,30 @@ pub fn App() -> impl IntoView {
         }
     });
     let today_date = RwSignal::new(crate::usage::local_today());
+    let selected_bounds = StoredValue::new(None::<(String, Option<(i64, i64)>)>);
+    Effect::new(move |_| {
+        selected_bounds.set_value(selected_day.get().map(|date| {
+            let bounds = crate::usage::local_day_bounds(&date);
+            (date, bounds)
+        }));
+    });
     // Horloge locale uniquement : aucune requête réseau supplémentaire à minuit.
     if let Ok(clock) = leptos::leptos_dom::helpers::set_interval_with_handle(
         move || {
             crate::usage::update_today(today_date);
+            if let Some(date) = selected_day.get_untracked() {
+                let next = (date.clone(), crate::usage::local_day_bounds(&date));
+                let changed = selected_bounds.with_value(|old| {
+                    old.as_ref()
+                        .is_some_and(|old| old.0 == date && old.1 != next.1)
+                });
+                selected_bounds.set_value(Some(next));
+                if changed {
+                    details::reset(day_usage);
+                    details::reset(day_costs);
+                    day_epoch.update(|e| *e += 1);
+                }
+            }
         },
         std::time::Duration::from_secs(1),
     ) {
@@ -277,12 +297,7 @@ fn Main(
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
             Tab::Usage => {
                 if let Some(date) = selected {
-                    let cost_date = date.clone();
-                    details::load(
-                        day_costs,
-                        move || tauri::get_day_costs(cost_date.clone(), false),
-                        generation,
-                    );
+                    details::load_day_costs(day_costs, date.clone(), false, generation);
                     details::load(
                         day_usage,
                         move || tauri::get_day_usage(date.clone(), false),
@@ -300,7 +315,7 @@ fn Main(
         calendar_id.track();
         history.epoch.track();
         if tab.get() == Tab::History {
-            history.load_details(false, generation);
+            history.load_details(generation);
         }
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
@@ -308,25 +323,17 @@ fn Main(
     // L'état du cycle, y compris son échec, pilote l'animation.
     let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
+        let mut selections = Vec::new();
         if tab.get_untracked() == Tab::History {
-            history.load_details(true, generation);
+            if let Some(date) = history.selected.get_untracked() {
+                selections.push((date, history.costs, history.usage));
+            }
             history.refresh(shared::HistoryMode::Force, generation);
         }
         if let Some(date) = selected_day.get_untracked() {
-            let cost_date = date.clone();
-            details::reset(day_costs);
-            details::load(
-                day_costs,
-                move || tauri::get_day_costs(cost_date.clone(), true),
-                generation,
-            );
-            details::reset(day_usage);
-            details::load(
-                day_usage,
-                move || tauri::get_day_usage(date.clone(), true),
-                generation,
-            );
+            selections.push((date, day_costs, day_usage));
         }
+        details::refresh_days(selections, generation);
         if refreshing.get_untracked() {
             return;
         }
@@ -513,6 +520,8 @@ fn UsageTab(
             <h2>{move || selected_day.get().map(|d| format!("Consommation · {d}")).unwrap_or_else(|| "Aujourd'hui".into())}</h2>
             <crate::usage::DayNavigation selected=selected_day today=today_date on_select />
             <div class="hint">"Journée locale"</div>
+            {move ||day_usage.with(|r|r.stale).then(||view!{<div class="caption">"Données en cache · validation en cours ou indisponible"</div>})}
+            {move ||(day_costs.with(|r|r.stale) && visible.with(Option::is_none)).then(||view!{<div class="caption">"Coûts en cache · validation en cours ou indisponible"</div>})}
             {move || selected_day.with(Option::is_some).then(|| view! {
                 {move || day_usage.with(|r| r.loading).then(|| view! { <div class="refreshing">{move || if costs.with(Option::is_some) {"Chargement des détails de tokens…"} else {"Chargement de la journée…"}}</div> })}
                 {move || day_usage.with(|r| r.error.clone()).map(|error| view! { <div class="error" role="alert">{error}</div> })}

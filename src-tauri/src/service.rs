@@ -43,6 +43,22 @@ impl IncreaseRetry {
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 enum Command {
+    BeginDailyRefresh(String, Reply<Detail<u64>>),
+    DailyContext(
+        String,
+        Option<u64>,
+        Reply<(Client, Stats, u64, Option<std::time::Instant>)>,
+    ),
+    CachedDaily(String, Reply<Detail<Option<shared::CachedDaily>>>),
+    StoreDaily(
+        u64,
+        u64,
+        crate::litellm::calendar::DayBounds,
+        Option<shared::DailyCosts>,
+        Option<shared::DailyUsage>,
+        chrono::DateTime<chrono::Utc>,
+        Reply<()>,
+    ),
     LocalHistory(HistoryMode, Reply<shared::LocalHistorySnapshot>),
     LocalProgress(u64, u64, shared::HistoryDay),
     LocalFinished(
@@ -269,6 +285,13 @@ impl Service {
     pub fn subscribe_local_history(&self) -> watch::Receiver<shared::LocalHistorySnapshot> {
         self.local_snapshots.clone()
     }
+    pub async fn cached_day(
+        &self,
+        date: String,
+    ) -> Result<Detail<Option<shared::CachedDaily>>, String> {
+        self.request(|reply| Command::CachedDaily(date, reply))
+            .await
+    }
 
     pub async fn week(&self) -> Result<Detail<WeekDetails>, String> {
         let (client, state) = self.request(Command::Context).await?;
@@ -286,47 +309,157 @@ impl Service {
             _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
         }
     }
+    #[cfg(test)]
     pub async fn day_usage(
         &self,
         date: String,
         force: bool,
     ) -> Result<Detail<shared::DailyUsage>, String> {
-        let (client, state) = self.request(Command::Context).await?;
-        let requested = chrono::Utc::now();
+        self.day_usage_in_refresh(date, force, None).await
+    }
+
+    pub async fn begin_day_refresh(&self, date: String) -> Result<Detail<u64>, String> {
+        self.request(|reply| Command::BeginDailyRefresh(date, reply))
+            .await
+    }
+
+    pub async fn day_usage_in_refresh(
+        &self,
+        date: String,
+        force: bool,
+        refresh: Option<u64>,
+    ) -> Result<Detail<shared::DailyUsage>, String> {
+        let refresh = if force && refresh.is_none() {
+            Some(self.begin_day_refresh(date.clone()).await?.data)
+        } else {
+            refresh
+        };
+        let (client, state, attempt, since) = self
+            .request(|reply| Command::DailyContext(date.clone(), refresh, reply))
+            .await?;
+        let mut revalidate = force;
+        if !force {
+            if let Some(cached) = self.cached_day(date.clone()).await?.data {
+                revalidate = cached.usage.is_some() && cached.usage_stale;
+                if !cached.usage_stale {
+                    if let Some(usage) = cached.usage {
+                        return self.detail(state.generation, usage);
+                    }
+                }
+            }
+        }
         let bounds = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
             .ok()
             .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local));
         let mut updates = self.snapshots.clone();
-        tokio::select! {
-            result = client.fetch_day(&date, force) => {
-                let data = result?;
-                validate_daily_bounds(bounds, chrono::NaiveDate::parse_from_str(&date,"%Y-%m-%d").ok().and_then(|d|crate::litellm::calendar::day_bounds(d,&Local)))?;
-                if let Some(bounds) = bounds {let _ = self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
-                self.detail(state.generation,data)
-            },
-            _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => Err(Error::Obsolete.to_string()),
+        let data = tokio::select! {
+            result = client.fetch_day_validated(&date, revalidate, &Local, since.or_else(||revalidate.then(std::time::Instant::now))) => result?,
+            _ = updates.wait_for(|snapshot| snapshot.generation != state.generation) => return Err(Error::Obsolete.to_string()),
+        };
+        let requested = data.fetched_at;
+        let data = data.data;
+        validate_daily_bounds(
+            bounds,
+            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local)),
+        )?;
+        if let Some(bounds) = bounds {
+            self.request(|reply| {
+                Command::StoreDaily(
+                    state.generation,
+                    attempt,
+                    bounds,
+                    None,
+                    Some(data.clone()),
+                    requested,
+                    reply,
+                )
+            })
+            .await?;
         }
+        if let Some(bounds) = bounds {
+            let _ = self.commands.send(Command::LocalCost(
+                state.generation,
+                bounds,
+                data.models.iter().map(|m| m.spend).sum(),
+                requested,
+            ));
+        }
+        self.detail(state.generation, data)
     }
+    #[cfg(test)]
     pub async fn day_costs(
         &self,
         date: String,
         force: bool,
     ) -> Result<Detail<shared::DailyCosts>, String> {
-        let (client, state) = self.request(Command::Context).await?;
-        let requested = chrono::Utc::now();
+        self.day_costs_in_refresh(date, force, None).await
+    }
+
+    pub async fn day_costs_in_refresh(
+        &self,
+        date: String,
+        force: bool,
+        refresh: Option<u64>,
+    ) -> Result<Detail<shared::DailyCosts>, String> {
+        let refresh = if force && refresh.is_none() {
+            Some(self.begin_day_refresh(date.clone()).await?.data)
+        } else {
+            refresh
+        };
+        let (client, state, attempt, since) = self
+            .request(|reply| Command::DailyContext(date.clone(), refresh, reply))
+            .await?;
+        if !force {
+            if let Some(cached) = self
+                .cached_day(date.clone())
+                .await?
+                .data
+                .filter(|c| !c.stale)
+            {
+                return self.detail(state.generation, cached.costs);
+            }
+        }
         let bounds = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
             .ok()
             .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local));
         let mut updates = self.snapshots.clone();
-        tokio::select! {
-            result=client.fetch_day_costs(&date,force)=>{
-                let data=result?;
-                validate_daily_bounds(bounds, chrono::NaiveDate::parse_from_str(&date,"%Y-%m-%d").ok().and_then(|d|crate::litellm::calendar::day_bounds(d,&Local)))?;
-                if let Some(bounds)=bounds {let _=self.commands.send(Command::LocalCost(state.generation,bounds,data.models.iter().map(|m|m.spend).sum(),requested));}
-                self.detail(state.generation,data)
-            },
-            _=updates.wait_for(|snapshot| snapshot.generation != state.generation)=>Err(Error::Obsolete.to_string()),
+        let data = tokio::select! {
+            result=client.fetch_day_costs_validated(&date,force,&Local,since)=>result?,
+            _=updates.wait_for(|snapshot| snapshot.generation != state.generation)=>return Err(Error::Obsolete.to_string()),
+        };
+        let requested = data.fetched_at;
+        let data = data.data;
+        validate_daily_bounds(
+            bounds,
+            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local)),
+        )?;
+        if let Some(bounds) = bounds {
+            self.request(|reply| {
+                Command::StoreDaily(
+                    state.generation,
+                    attempt,
+                    bounds,
+                    Some(data.clone()),
+                    None,
+                    requested,
+                    reply,
+                )
+            })
+            .await?;
         }
+        if let Some(bounds) = bounds {
+            let _ = self.commands.send(Command::LocalCost(
+                state.generation,
+                bounds,
+                data.models.iter().map(|m| m.spend).sum(),
+                requested,
+            ));
+        }
+        self.detail(state.generation, data)
     }
     fn detail<T>(&self, generation: u64, data: T) -> Result<Detail<T>, String> {
         if generation != self.snapshots.borrow().generation {
@@ -384,6 +517,18 @@ async fn coordinate(
     let source = store.get().source_id;
     let cache = paths.stats;
     let history_path = paths.history;
+    let daily_path = history_path
+        .as_ref()
+        .map(|p| p.with_file_name("daily-usage.json"));
+    let load_daily = daily_path.clone();
+    let daily_source = source.clone();
+    let mut daily_store = tauri::async_runtime::spawn_blocking(move || {
+        crate::daily_store::DailyStore::load(load_daily.as_deref(), daily_source)
+    })
+    .await
+    .unwrap_or_else(|_| crate::daily_store::DailyStore::load(None, source.clone()));
+    let mut daily_sequence = 0u64;
+    let mut daily_attempts = std::collections::VecDeque::<(String, u64, std::time::Instant)>::new();
     let local_path = history_path
         .as_ref()
         .map(|p| p.with_file_name("history-local.json"));
@@ -523,6 +668,81 @@ async fn coordinate(
             }
         };
         match command {
+            Command::BeginDailyRefresh(date, reply) => {
+                let valid = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .ok()
+                    .is_some_and(|d| d.to_string() == date && d <= Local::now().date_naive());
+                if !valid {
+                    let _ = reply.send(Err("Date invalide ou future".into()));
+                    continue;
+                }
+                daily_sequence += 1;
+                daily_attempts.retain(|(d, _, _)| d != &date);
+                daily_attempts.push_back((date, daily_sequence, std::time::Instant::now()));
+                while daily_attempts.len() > 30 {
+                    daily_attempts.pop_front();
+                }
+                let _ = reply.send(Ok(Detail {
+                    generation: stats.generation,
+                    data: daily_sequence,
+                }));
+            }
+            Command::DailyContext(date, refresh, reply) => {
+                if refresh.is_none() && !daily_attempts.iter().any(|(d, _, _)| d == &date) {
+                    daily_sequence += 1;
+                    daily_attempts.push_back((
+                        date.clone(),
+                        daily_sequence,
+                        std::time::Instant::now(),
+                    ));
+                    while daily_attempts.len() > 30 {
+                        daily_attempts.pop_front();
+                    }
+                }
+                let current = daily_attempts.iter().find(|(d, _, _)| d == &date);
+                let value = match current {
+                    Some((_, id, started)) if refresh.is_none_or(|r| r == *id) => client
+                        .clone()
+                        .map(|c| (c, stats.clone(), *id, refresh.map(|_| *started))),
+                    _ => Err(Error::Obsolete.to_string()),
+                };
+                let _ = reply.send(value);
+            }
+            Command::CachedDaily(date, reply) => {
+                let value = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .ok()
+                    .filter(|d| d.to_string() == date)
+                    .and_then(|d| crate::litellm::calendar::day_bounds(d, &Local))
+                    .and_then(|bounds| daily_store.get(bounds, chrono::Utc::now()));
+                let _ = reply.send(Ok(Detail {
+                    generation: stats.generation,
+                    data: value,
+                }));
+            }
+            Command::StoreDaily(generation, attempt, bounds, costs, usage, when, reply) => {
+                if generation != stats.generation
+                    || Some(bounds) != crate::litellm::calendar::day_bounds(bounds.date, &Local)
+                    || !daily_attempts
+                        .iter()
+                        .any(|(date, id, _)| date == &bounds.date.to_string() && *id == attempt)
+                {
+                    let _ = reply.send(Err(Error::Obsolete.to_string()));
+                    continue;
+                }
+                if daily_store.put(bounds, costs, usage, when) {
+                    if let Some(path) = daily_path.clone() {
+                        let snapshot = daily_store.clone();
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            crate::persistence::write(&path, &snapshot).map_err(|e| e.to_string())
+                        })
+                        .await;
+                        if let Err(error) = result.map_err(|e| e.to_string()).and_then(|r| r) {
+                            eprintln!("Cache quotidien : {error}");
+                        }
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
             Command::CalendarTick => {
                 if calendar.rebase(
                     store.get().source_id,
@@ -781,6 +1001,8 @@ async fn coordinate(
                     increase_retry = IncreaseRetry::default();
                 }
                 if matches!(saved, Ok(true)) {
+                    daily_attempts.clear();
+                    daily_store = crate::daily_store::DailyStore::load(None, store.get().source_id);
                     history = crate::history::History::empty(
                         store.get().source_id,
                         chrono::Utc::now().date_naive(),
@@ -921,6 +1143,86 @@ async fn persist_calendar(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_incompatible_usage_bypasses_retained_memory() {
+        let server = MockServer::start();
+        let day = Local::now().date_naive().pred_opt().unwrap();
+        let date = day.to_string();
+        let timestamp = day
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap()
+            .to_rfc3339();
+        server.mock(|when, then| {
+            when.path("/spend/logs").query_param("summarize", "true");
+            then.status(200)
+                .json_body(serde_json::json!([{"startTime":date,"spend":9,"models":{"m":9}}]));
+        });
+        let mut logs=server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(serde_json::json!({"data":[{"request_id":"a","model":"m","spend":2,"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"startTime":timestamp}],"page":1,"page_size":1000,"total":1,"total_pages":1}));});
+        mocks(&server, 1.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        assert_eq!(
+            service
+                .day_usage(date.clone(), false)
+                .await
+                .unwrap()
+                .data
+                .models[0]
+                .spend,
+            2.0
+        );
+        logs.delete();
+        // Les corrections de minuit restent disponibles ; seul le téléchargement de la journée échoue.
+        let bounds = crate::litellm::calendar::day_bounds(day, &Local).unwrap();
+        let failed = server.mock(|when, then| {
+            when.path("/spend/logs/v2")
+                .query_param(
+                    "start_date",
+                    bounds.start.format("%Y-%m-%d %H:%M:%S").to_string(),
+                )
+                .query_param(
+                    "end_date",
+                    bounds.end.format("%Y-%m-%d %H:%M:%S").to_string(),
+                );
+            then.status(503);
+        });
+        server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(
+                serde_json::json!({"data":[],"page":1,"page_size":1000,"total":0,"total_pages":0}),
+            );
+        });
+        let id = service.begin_day_refresh(date.clone()).await.unwrap().data;
+        let (costs, usage) = tokio::join!(
+            service.day_costs_in_refresh(date.clone(), true, Some(id)),
+            service.day_usage_in_refresh(date.clone(), true, Some(id))
+        );
+        assert_eq!(costs.unwrap().data.models[0].spend, 9.0);
+        assert!(usage.is_err());
+        assert!(
+            service
+                .cached_day(date.clone())
+                .await
+                .unwrap()
+                .data
+                .unwrap()
+                .usage_stale
+        );
+        assert!(service.day_usage(date.clone(), false).await.is_err());
+        failed.assert_hits(2);
+        assert_eq!(
+            service.day_costs(date, false).await.unwrap().data.models[0].spend,
+            9.0
+        );
+        task.abort();
+    }
+
     use super::*;
     use httpmock::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1308,6 +1610,204 @@ mod tests {
         let next = service.local_history(HistoryMode::Cached).await.unwrap();
         assert!(next.details.days.iter().all(|d| d.spend.is_none()));
         assert!(next.generation > first.generation);
+        task.abort();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daily_refresh_attempts_share_cutoff_and_reject_obsolete_persistence() {
+        let server = MockServer::start();
+        mocks(&server, 1.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        let date = Local::now().date_naive().pred_opt().unwrap().to_string();
+        let first = service.begin_day_refresh(date.clone()).await.unwrap();
+        let a = service
+            .request(|reply| Command::DailyContext(date.clone(), Some(first.data), reply))
+            .await
+            .unwrap();
+        let b = service
+            .request(|reply| Command::DailyContext(date.clone(), Some(first.data), reply))
+            .await
+            .unwrap();
+        assert_eq!(a.2, b.2);
+        assert_eq!(a.3, b.3);
+        let second = service.begin_day_refresh(date.clone()).await.unwrap();
+        assert_ne!(first.data, second.data);
+        assert!(service
+            .request(|reply| Command::DailyContext(date.clone(), Some(first.data), reply))
+            .await
+            .is_err());
+        let bounds = crate::litellm::calendar::day_bounds(
+            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap(),
+            &Local,
+        )
+        .unwrap();
+        assert!(service
+            .request(|reply| Command::StoreDaily(
+                first.generation,
+                first.data,
+                bounds,
+                Some(shared::DailyCosts {
+                    date: date.clone(),
+                    models: vec![]
+                }),
+                None,
+                chrono::Utc::now(),
+                reply
+            ))
+            .await
+            .is_err());
+        assert!(service.cached_day(date).await.unwrap().data.is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn daily_memory_result_does_not_get_a_new_persisted_timestamp() {
+        let server = MockServer::start();
+        let logs = server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(
+                serde_json::json!({"data":[],"page":1,"page_size":1000,"total":0,"total_pages":0}),
+            );
+        });
+        mocks(&server, 1.0, 0);
+        let (service, task) = start(
+            Arc::new(SettingsStore::for_test(&server.base_url())),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+        let date = Local::now().date_naive().pred_opt().unwrap().to_string();
+        let (client, _) = service.request(Command::Context).await.unwrap();
+        let original = client
+            .fetch_day_validated(&date, false, &Local, None)
+            .await
+            .unwrap();
+        service.day_usage(date.clone(), false).await.unwrap();
+        service.day_costs(date.clone(), false).await.unwrap();
+        let cached = service.cached_day(date).await.unwrap().data.unwrap();
+        assert_eq!(cached.fetched_at, original.fetched_at.to_rfc3339());
+        logs.assert_hits(1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn daily_json_cache_survives_restart_and_failed_refresh_without_crossing_sources() {
+        let server = MockServer::start();
+        let day = Local::now().date_naive().pred_opt().unwrap();
+        let date = day.to_string();
+        let timestamp = day
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap()
+            .to_rfc3339();
+        let mut logs=server.mock(|when,then| {
+            when.path("/spend/logs/v2");then.status(200).json_body(serde_json::json!({"data":[{"request_id":"valid","model":"m","spend":2,"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"startTime":timestamp}],"page":1,"page_size":1000,"total":1,"total_pages":1}));
+        });
+        mocks(&server, 1.0, 0);
+        let store = Arc::new(SettingsStore::for_test(&server.base_url()));
+        store.save(preferences(&server, false)).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("daily-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let paths = || StoragePaths {
+            stats: None,
+            history: Some(directory.join("history.json")),
+        };
+        let (service, task) =
+            start_with_storage(store.clone(), paths(), Arc::new(|_, _| Ok(false)));
+        assert!(service
+            .cached_day(date.clone())
+            .await
+            .unwrap()
+            .data
+            .is_none());
+        let original = service.day_usage(date.clone(), false).await.unwrap().data;
+        assert_eq!(original.models[0].total_tokens, 10);
+        logs.assert_hits(1);
+        let json = std::fs::read_to_string(directory.join("daily-usage.json")).unwrap();
+        assert!(!json.contains("request_id") && !json.contains("api_key") && !json.contains("sk-"));
+        task.abort();
+        let (service, task) =
+            start_with_storage(store.clone(), paths(), Arc::new(|_, _| Ok(false)));
+        let cached = service
+            .cached_day(date.clone())
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert!(!cached.stale);
+        assert_eq!(cached.usage, Some(original.clone()));
+        assert_eq!(
+            service.day_usage(date.clone(), false).await.unwrap().data,
+            original
+        );
+        logs.assert_hits(1);
+        logs.delete();
+        let truncated = server.mock(|when, then| {
+            when.path("/spend/logs/v2");
+            then.status(200).json_body(
+                serde_json::json!({"data":[],"page":1,"page_size":1000,"total":1,"total_pages":1}),
+            );
+        });
+        assert!(service.day_usage(date.clone(), true).await.is_err());
+        truncated.assert_hits(1);
+        assert_eq!(
+            service
+                .cached_day(date.clone())
+                .await
+                .unwrap()
+                .data
+                .unwrap()
+                .usage,
+            Some(original.clone())
+        );
+        let other = MockServer::start();
+        mocks(&other, 2.0, 0);
+        service.save(preferences(&other, false)).await.unwrap();
+        assert!(service
+            .cached_day(date.clone())
+            .await
+            .unwrap()
+            .data
+            .is_none());
+        task.abort();
+        // Une entrée expirée reste disponible comme aperçu, sans éviter la validation réseau.
+        let mut raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        raw["entries"][0]["fetched"] =
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::minutes(16)).to_rfc3339());
+        raw["entries"][0]["usage_fetched"] = raw["entries"][0]["fetched"].clone();
+        std::fs::write(
+            directory.join("daily-usage.json"),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+        // L'identité du cache appartient au store d'origine, pas à une nouvelle configuration.
+        store.save(preferences(&server, false)).unwrap();
+        raw["source_id"] = serde_json::json!(store.get().source_id);
+        std::fs::write(
+            directory.join("daily-usage.json"),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+        let (service, task) = start_with_storage(store, paths(), Arc::new(|_, _| Ok(false)));
+        let cached = service
+            .cached_day(date.clone())
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert!(cached.stale);
+        assert!(service.day_usage(date.clone(), false).await.is_err());
+        assert_eq!(
+            service.cached_day(date).await.unwrap().data.unwrap().usage,
+            Some(original)
+        );
         task.abort();
         std::fs::remove_dir_all(directory).unwrap();
     }

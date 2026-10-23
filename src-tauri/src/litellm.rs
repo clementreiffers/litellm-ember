@@ -7,6 +7,7 @@ mod costs;
 mod daily;
 mod domain;
 mod local_history;
+mod ranges;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
@@ -41,6 +42,7 @@ pub struct Client {
     daily: std::sync::Arc<tokio::sync::Mutex<daily::DailyState>>,
     analytics: std::sync::Arc<tokio::sync::Mutex<analytics::Access>>,
     costs: std::sync::Arc<tokio::sync::Mutex<costs::CostState>>,
+    ranges: std::sync::Arc<tokio::sync::Mutex<ranges::RangeState>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -56,6 +58,12 @@ struct SummaryCache {
     fetched: std::time::Instant,
     path: String,
     rows: std::sync::Arc<Vec<DaySummary>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Validated<T> {
+    pub data: T,
+    pub fetched_at: chrono::DateTime<Utc>,
 }
 
 impl Client {
@@ -93,6 +101,7 @@ impl Client {
             daily: Default::default(),
             analytics: Default::default(),
             costs: Default::default(),
+            ranges: Default::default(),
             summaries: Default::default(),
         })
     }

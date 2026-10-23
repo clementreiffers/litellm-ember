@@ -129,20 +129,38 @@ async fn get_activity(service: State<'_, Service>) -> Result<Detail<Activity>, S
     service.activity().await
 }
 #[tauri::command]
+async fn get_cached_day(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<Option<shared::CachedDaily>>, String> {
+    service.cached_day(date).await
+}
+
+#[tauri::command]
+async fn begin_day_refresh(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<u64>, String> {
+    service.begin_day_refresh(date).await
+}
+
+#[tauri::command]
 async fn get_day_usage(
     date: String,
     force: bool,
+    refresh: Option<u64>,
     service: State<'_, Service>,
 ) -> Result<Detail<shared::DailyUsage>, String> {
-    service.day_usage(date, force).await
+    service.day_usage_in_refresh(date, force, refresh).await
 }
 #[tauri::command]
 async fn get_day_costs(
     date: String,
     force: bool,
+    refresh: Option<u64>,
     service: State<'_, Service>,
 ) -> Result<Detail<shared::DailyCosts>, String> {
-    service.day_costs(date, force).await
+    service.day_costs_in_refresh(date, force, refresh).await
 }
 #[tauri::command]
 async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
@@ -205,6 +223,8 @@ pub fn run() {
             get_local_history,
             get_activity,
             get_day_usage,
+            begin_day_refresh,
+            get_cached_day,
             get_day_costs,
             refresh_now,
             test_notification,
