@@ -300,6 +300,9 @@ impl Client {
             if row.start_time < start || row.start_time >= end {
                 continue;
             }
+            if row.empty_failure() {
+                continue;
+            }
             let name = normalize_model(&row.model)?;
             let metrics = Metrics {
                 spend: row.spend?,
@@ -322,6 +325,29 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn analytics_ignores_zero_usage_failed_boundary_without_model() {
+        let server = MockServer::start();
+        info(&server);
+        server.mock(|when, then| {
+            when.path("/user/daily/activity/aggregated");
+            then.status(200).json_body(response("2024-02-29"));
+        });
+        server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[{"request_id":"failed","model":"","status":"failure","spend":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"startTime":"2024-02-28T23:00:00Z"}],"total":1,"page":1,"page_size":1000,"total_pages":1}));});
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let value = client
+            .fetch_analytics_in_zone(
+                NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(),
+                &chrono::FixedOffset::east_opt(7200).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(value[0].spend, 5.0);
+        assert_eq!(value[0].total_tokens, 120);
+        assert_eq!(value[0].requests, 2);
+    }
+
     #[tokio::test]
     async fn analytics_rejects_model_less_boundary() {
         let server = MockServer::start();

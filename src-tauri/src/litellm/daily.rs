@@ -45,8 +45,21 @@ pub(super) struct UsageRow {
     pub(super) prompt_tokens: Option<u64>,
     pub(super) completion_tokens: Option<u64>,
     pub(super) total_tokens: Option<u64>,
+    status: Option<String>,
     #[serde(rename = "startTime")]
     pub(super) start_time: DateTime<Utc>,
+}
+
+impl UsageRow {
+    /// LiteLLM journalise aussi les échecs survenus avant l'identification du modèle.
+    pub(super) fn empty_failure(&self) -> bool {
+        normalize_model(&self.model).is_none()
+            && self.status.as_deref() == Some("failure")
+            && self.spend == Some(0.0)
+            && self.prompt_tokens == Some(0)
+            && self.completion_tokens == Some(0)
+            && self.total_tokens == Some(0)
+    }
 }
 
 impl TryFrom<UsageRow> for LogRow {
@@ -262,6 +275,7 @@ impl Client {
             let rows = rows
                 .into_iter()
                 .filter(|r| r.start_time.with_timezone(zone).date_naive() == day)
+                .filter(|r| !r.empty_failure())
                 .map(LogRow::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
             aggregate_daily(&rows)?
@@ -419,6 +433,61 @@ fn exact_range(day: NaiveDate, zone: &impl TimeZone) -> Option<(DateTime<Utc>, D
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_ignores_only_explicit_zero_usage_failures_without_a_model() {
+        for legacy in [false, true] {
+            for fault in [
+                "zero_failure",
+                "nonzero_cost",
+                "nonzero_tokens",
+                "missing_counter",
+                "unknown_status",
+                "success",
+            ] {
+                let server = MockServer::start();
+                let mut data = rows(0, 1);
+                let mut failed = json!({"request_id":"failed","model":"","spend":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"status":"failure","startTime":"2024-02-29T12:00:00Z"});
+                match fault {
+                    "nonzero_cost" => failed["spend"] = json!(1),
+                    "nonzero_tokens" => failed["prompt_tokens"] = json!(1),
+                    "missing_counter" => {
+                        failed.as_object_mut().unwrap().remove("total_tokens");
+                    }
+                    "unknown_status" => {
+                        failed.as_object_mut().unwrap().remove("status");
+                    }
+                    "success" => failed["status"] = json!("success"),
+                    _ => {}
+                }
+                data.push(failed);
+                server.mock(|when, then| {
+                    when.path(if legacy {
+                        "/llm/spend/logs"
+                    } else {
+                        "/llm/spend/logs/v2"
+                    });
+                    then.status(200).json_body(if legacy {
+                        json!(data)
+                    } else {
+                        page(1, 2, data)
+                    });
+                });
+                let result = client(&server)
+                    .fetch_day_in_zone("2024-02-29", false, &Utc)
+                    .await;
+                if fault == "zero_failure" {
+                    let value = result.unwrap();
+                    assert_eq!(value.models.len(), 1);
+                    assert_eq!(value.models[0].spend, 0.5);
+                    assert_eq!(value.models[0].total_tokens, 12);
+                    assert_eq!(value.models[0].requests, 1);
+                } else {
+                    assert!(result.is_err(), "{fault} legacy={legacy}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn daily_rejects_model_less_rows_and_aggregate_overflow() {
         for legacy in [false, true] {

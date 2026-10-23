@@ -216,7 +216,9 @@ impl Client {
                     || !total.is_finite()
                     || (total - row.spend).abs() > 1e-8
                     || row.models.iter().any(|(name, spend)| {
-                        normalize_model(name).is_none() || !spend.is_finite() || *spend < 0.0
+                        (normalize_model(name).is_none() && *spend != 0.0)
+                            || !spend.is_finite()
+                            || *spend < 0.0
                     })
                 {
                     return Err("Résumé de consommation incomplet ou incohérent".into());
@@ -279,6 +281,9 @@ impl Client {
             if row.start_time < start || row.start_time >= end {
                 continue;
             }
+            if row.empty_failure() {
+                continue;
+            }
             let spend = row
                 .spend
                 .filter(|v| v.is_finite() && *v >= 0.0)
@@ -300,6 +305,28 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daily_costs_accept_zero_empty_model_bucket_and_zero_failure_boundaries() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.path("/spend/logs");
+            then.status(200)
+                .json_body(json!([{"startTime":"2024-02-29","spend":5,"models":{"m":5,"":0}}]));
+        });
+        server.mock(|when,then|{when.path("/spend/logs/v2");then.status(200).json_body(json!({"data":[{"request_id":"failed","model":"","status":"failure","spend":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"startTime":"2024-02-28T23:00:00Z"}],"total":1,"page":1,"page_size":1000,"total_pages":1}));});
+        let client = Client::new(&server.base_url(), "sk-test".into()).unwrap();
+        let value = client
+            .fetch_day_costs_cached_in_zone(
+                "2024-02-29",
+                false,
+                &chrono::FixedOffset::east_opt(7200).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value.models.len(), 1);
+        assert_eq!(value.models[0].spend, 5.0);
+    }
+
     #[tokio::test]
     async fn daily_costs_reject_model_less_boundary() {
         let server = MockServer::start();
@@ -720,11 +747,13 @@ mod tests {
             std::env::var("OPENAI_API_KEY").unwrap(),
         )
         .unwrap();
-        let date = chrono::Local::now()
-            .date_naive()
-            .pred_opt()
-            .unwrap()
-            .to_string();
+        let date = std::env::var("LITELLM_TEST_DATE").unwrap_or_else(|_| {
+            chrono::Local::now()
+                .date_naive()
+                .pred_opt()
+                .unwrap()
+                .to_string()
+        });
         let start = std::time::Instant::now();
         let costs = client.fetch_day_costs(&date, true).await.unwrap();
         let cost_time = start.elapsed();

@@ -82,3 +82,9 @@ The user approved the enumerated fixes; this is corrective work within the exist
 ### Final verification
 
 259 workspace tests passed; 6 optional live tests ignored. The UTC daily subset passed 34 tests with 1 ignored. Backend/shared and WebAssembly Clippy with warnings denied, formatting, diff checks, release frontend build and native development build passed. Both built-WASM regression scripts passed after the final changes.
+
+### Live compatibility correction
+
+After publication, the user reported model-validation and summary-reconciliation errors. Sanitized gateway inspection found seven failed requests on October 22 with empty model names and explicitly zero spending and token counters. The summary contained an empty model bucket with zero cost; its totals reconciled exactly. Equivalent summary buckets also occurred on October 8, 13 and 20.
+
+The daily and boundary paths now exclude only explicitly failed, unnamed rows whose spending and all three counters are present and zero. Summary validation accepts unnamed buckets only at zero cost. Nonzero usage, absent counters and unknown/success status remain rejected. Three regressions failed before the correction and pass afterward, including both legacy and paginated sources. Workspace verification: 262 passed, 6 ignored; backend/shared Clippy passed. Real Rust cost-preview/full-usage comparisons matched per-model totals for October 20–23. The native build was rebuilt and relaunched.

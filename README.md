@@ -280,6 +280,8 @@ Each manual daily refresh uses one shared attempt for costs and tokens. It super
 
 When both screens select the same date, **Rafraîchir tout** shares one request pair between them. Stale or incompatible persisted usage also bypasses the memory cache during revalidation. Daily results require usable model names and checked aggregate totals, so missing models or numeric overflow cannot silently produce incomplete figures.
 
+LiteLLM can log failures before identifying a model. An unnamed failed request is ignored only when spending and all three token counters are explicitly zero; an unnamed summary bucket is allowed only at zero cost. Nonzero or incomplete unnamed usage still produces an error rather than silently reducing totals.
+
 The header, budget gauge, period model costs, and menu-bar amount always describe the **current budget period**. Consommation and the selected-date recap use exact local calendar days. The heatmap uses local date labels with explicitly estimated colors from UTC daily aggregates.
 
 ### Daily spending calendar
