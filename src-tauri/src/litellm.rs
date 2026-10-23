@@ -1,14 +1,24 @@
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
+mod analytics;
+pub(crate) mod calendar;
+mod costs;
+mod daily;
 mod domain;
+mod local_history;
+mod ranges;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
-use shared::{Activity, ModelCost, ModelUsage, WeekDetails};
+#[cfg(test)]
+use shared::ModelUsage;
+use shared::{Activity, ModelCost, WeekDetails};
 
 #[derive(Debug, thiserror::Error)]
 enum TransportError {
+    #[error("Historique tronqué par LiteLLM ; impossible de calculer un total complet")]
+    Truncated,
     #[error("{0}")]
     Request(String),
     #[error("HTTP {status} sur {path}")]
@@ -31,6 +41,11 @@ impl From<TransportError> for String {
 #[derive(Clone)]
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
+    daily: std::sync::Arc<tokio::sync::Mutex<daily::DailyState>>,
+    daily_requests: std::sync::Arc<tokio::sync::Mutex<daily::Requests>>,
+    analytics: std::sync::Arc<tokio::sync::Mutex<analytics::Access>>,
+    costs: std::sync::Arc<tokio::sync::Mutex<costs::CostState>>,
+    ranges: std::sync::Arc<tokio::sync::Mutex<ranges::RangeState>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -46,6 +61,12 @@ struct SummaryCache {
     fetched: std::time::Instant,
     path: String,
     rows: std::sync::Arc<Vec<DaySummary>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Validated<T> {
+    pub data: T,
+    pub fetched_at: chrono::DateTime<Utc>,
 }
 
 impl Client {
@@ -80,6 +101,11 @@ impl Client {
             base_url: crate::settings::validate_url(base_url)?,
             api_key,
             rows: Default::default(),
+            daily: Default::default(),
+            daily_requests: Default::default(),
+            analytics: Default::default(),
+            costs: Default::default(),
+            ranges: Default::default(),
             summaries: Default::default(),
         })
     }
@@ -116,6 +142,13 @@ impl Client {
                 status,
                 path: path.to_owned(),
             });
+        }
+        if resp
+            .headers()
+            .get("x-litellm-spend-logs-truncated")
+            .is_some_and(|value| value == "true")
+        {
+            return Err(TransportError::Truncated);
         }
         resp.json().await.map_err(|source| TransportError::Decode {
             path: path.to_owned(),
@@ -156,6 +189,7 @@ impl Client {
         self.fetch_today_snapshot().await.map(|(_, rows)| rows)
     }
 
+    #[cfg(test)]
     pub async fn fetch_today_snapshot(&self) -> Result<(NaiveDate, Vec<ModelUsage>), String> {
         let (today, rows) = self.fetch_today_rows().await?;
         Ok((today, aggregate_today(&rows, today, &Local)))
@@ -246,6 +280,31 @@ impl Client {
                 .zip(budget_reset_at.and_then(parse_instant))
                 .and_then(|(start, reset)| project_instants(period_spend, start, reset, now)),
         })
+    }
+}
+
+/// Enveloppe UTC couvrant la journée locale, même si sa durée n'est pas de 24 h.
+fn day_range<T: chrono::TimeZone>(day: NaiveDate, zone: &T) -> Option<(NaiveDate, NaiveDate)> {
+    let next = day.succ_opt()?;
+    let start = zone
+        .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+        .earliest();
+    let end = zone
+        .from_local_datetime(&next.and_hms_opt(0, 0, 0)?)
+        .earliest();
+    match start.zip(end) {
+        Some((start, end)) => {
+            let end = end.with_timezone(&Utc);
+            let end_date = end.date_naive();
+            let exclusive_end = if end.time() == chrono::NaiveTime::MIN {
+                end_date
+            } else {
+                end_date.succ_opt()?
+            };
+            Some((start.with_timezone(&Utc).date_naive(), exclusive_end))
+        }
+        // Un saut à minuit peut rendre la frontière locale inexistante.
+        None => Some((day.pred_opt()?, next.succ_opt()?)),
     }
 }
 
@@ -489,8 +548,102 @@ mod tests {
         assert!((today[0].spend - 0.75).abs() < 1e-9);
     }
 
-    fn d(s: &str) -> NaiveDate {
+    pub(super) fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn historical_range_covers_east_west_and_utc_days() {
+        for (offset, start, end) in [
+            (7200, "2024-02-28", "2024-03-01"),
+            (-7200, "2024-02-29", "2024-03-02"),
+            (0, "2024-02-29", "2024-03-01"),
+        ] {
+            assert_eq!(
+                day_range(
+                    d("2024-02-29"),
+                    &chrono::FixedOffset::east_opt(offset).unwrap()
+                )
+                .unwrap(),
+                (d(start), d(end))
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct ShiftZone {
+        pub(super) at: chrono::NaiveDateTime,
+        pub(super) before: chrono::FixedOffset,
+        pub(super) after: chrono::FixedOffset,
+    }
+
+    impl chrono::TimeZone for ShiftZone {
+        type Offset = chrono::FixedOffset;
+        fn from_offset(offset: &Self::Offset) -> Self {
+            Self {
+                at: chrono::NaiveDateTime::MAX,
+                before: *offset,
+                after: *offset,
+            }
+        }
+        fn offset_from_local_date(&self, date: &NaiveDate) -> chrono::LocalResult<Self::Offset> {
+            self.offset_from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+        }
+        fn offset_from_utc_date(&self, date: &NaiveDate) -> Self::Offset {
+            self.offset_from_utc_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+        }
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> Self::Offset {
+            if *utc < self.at {
+                self.before
+            } else {
+                self.after
+            }
+        }
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<Self::Offset> {
+            use chrono::LocalResult;
+            let before_valid =
+                *local - Duration::seconds(self.before.local_minus_utc().into()) < self.at;
+            let after_valid =
+                *local - Duration::seconds(self.after.local_minus_utc().into()) >= self.at;
+            match (before_valid, after_valid) {
+                (true, true) => LocalResult::Ambiguous(self.before, self.after),
+                (true, false) => LocalResult::Single(self.before),
+                (false, true) => LocalResult::Single(self.after),
+                (false, false) => LocalResult::None,
+            }
+        }
+    }
+
+    #[test]
+    fn historical_range_covers_dst_and_missing_or_repeated_midnight() {
+        for (day, hour, before, after, start, end) in [
+            ("2024-03-31", 1, 3600, 7200, "2024-03-30", "2024-04-01"),
+            ("2024-10-27", 1, 7200, 3600, "2024-10-26", "2024-10-28"),
+            ("2024-03-31", 0, 0, 3600, "2024-03-30", "2024-04-02"),
+            ("2024-10-27", 0, 3600, 0, "2024-10-26", "2024-10-28"),
+        ] {
+            let zone = ShiftZone {
+                at: d(day).and_hms_opt(hour, 0, 0).unwrap(),
+                before: chrono::FixedOffset::east_opt(before).unwrap(),
+                after: chrono::FixedOffset::east_opt(after).unwrap(),
+            };
+            assert_eq!(day_range(d(day), &zone).unwrap(), (d(start), d(end)));
+            // Both repeated hours remain in the selected day; adjacent days do not.
+            let rows: Vec<_> = [-1, 0, 1, 24, 48]
+                .into_iter()
+                .map(|hour| {
+                    row(&serde_json::json!({"model":"m", "spend":1,
+                        "startTime": (zone.at.and_utc() + Duration::hours(hour)).to_rfc3339()
+                    })
+                    .to_string())
+                })
+                .collect();
+            let expected = if before == 0 { 2 } else { 3 };
+            assert_eq!(aggregate_today(&rows, d(day), &zone)[0].requests, expected);
+        }
     }
 
     fn at(s: &str) -> DateTime<Utc> {
@@ -694,6 +847,166 @@ mod tests {
     mod http {
         use super::super::*;
         use httpmock::prelude::*;
+
+        #[tokio::test]
+        async fn historical_day_filters_local_boundaries_and_aggregates_models() {
+            let server = MockServer::start();
+            let day = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+            let midnight = day
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .earliest()
+                .unwrap();
+            let next = day
+                .succ_opt()
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .earliest()
+                .unwrap();
+            let mock = server.mock(|when, then| {
+                when.method(GET).path("/llm/spend/logs")
+                    .header("authorization", "Bearer sk-test")
+                    .query_param("summarize", "false");
+                then.status(200).json_body(serde_json::json!([
+                    {"model":"m", "spend":99, "total_tokens":999, "startTime":(midnight - Duration::seconds(1)).to_rfc3339()},
+                    {"model":"openai/m", "spend":1.25, "prompt_tokens":10, "completion_tokens":2, "total_tokens":12, "startTime":midnight.to_rfc3339()},
+                    {"model":"m", "spend":0.75, "prompt_tokens":20, "completion_tokens":3, "total_tokens":23, "startTime":(next - Duration::seconds(1)).to_rfc3339()},
+                    {"model":"m", "spend":99, "total_tokens":999, "startTime":next.to_rfc3339()}
+                ]));
+            });
+            let usage = client(&server)
+                .fetch_day("2024-02-29", false)
+                .await
+                .unwrap();
+            assert_eq!(usage.date, "2024-02-29");
+            assert_eq!(
+                usage.models,
+                vec![ModelUsage {
+                    model: "m".into(),
+                    spend: 2.0,
+                    requests: 2,
+                    prompt_tokens: 30,
+                    completion_tokens: 5,
+                    total_tokens: 35,
+                }]
+            );
+            mock.assert_hits(1);
+        }
+
+        #[tokio::test]
+        async fn historical_day_rejects_invalid_and_future_dates_before_http() {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.path("/llm/spend/logs");
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            let tomorrow = Local::now().date_naive().succ_opt().unwrap().to_string();
+            for date in [
+                "",
+                "2025-02-29",
+                "2024-2-29",
+                "2024-02-29T00:00:00Z",
+                " 2024-02-29",
+                &tomorrow,
+            ] {
+                assert!(client.fetch_day(date, false).await.is_err(), "{date}");
+            }
+            mock.assert_hits(0);
+            let result = client.fetch_day("2024-02-29", false).await.unwrap();
+            assert_eq!(result.date, "2024-02-29");
+            assert!(result.models.is_empty());
+            mock.assert_hits(1);
+        }
+
+        #[tokio::test]
+        async fn historical_navigation_does_not_wait_for_obsolete_requests() {
+            let server = MockServer::start();
+            let slow = server.mock(|when, then| {
+                when.path("/llm/spend/logs").matches(|request| {
+                    request.query_params.as_ref().is_some_and(|params| {
+                        params
+                            .iter()
+                            .any(|(k, v)| k == "start_date" && v.starts_with("2023-"))
+                    })
+                });
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(500))
+                    .json_body(serde_json::json!([]));
+            });
+            let fast = server.mock(|when, then| {
+                when.path("/llm/spend/logs").matches(|request| {
+                    request.query_params.as_ref().is_some_and(|params| {
+                        params
+                            .iter()
+                            .any(|(k, v)| k == "start_date" && v.starts_with("2024-"))
+                    })
+                });
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            let old_client = client.clone();
+            let old = tokio::spawn(async move { old_client.fetch_day("2023-02-28", false).await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while slow.hits_async().await == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let latest = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.fetch_day("2024-02-29", false),
+            )
+            .await
+            .expect("the latest date must not wait for the obsolete HTTP response")
+            .unwrap();
+            assert_eq!(latest.date, "2024-02-29");
+            old.await.unwrap().unwrap();
+            assert_eq!(client.fetch_day("2024-02-29", false).await.unwrap(), latest);
+            fast.assert_hits(1); // L'ancienne réponse ne remplace pas le cache de la dernière sélection.
+
+            let old_client = client.clone();
+            let old = tokio::spawn(async move { old_client.fetch_day("2023-02-28", true).await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while slow.hits_async().await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            client.fetch_day("2024-02-29", false).await.unwrap();
+            old.await.unwrap().unwrap();
+            client.fetch_day("2024-02-29", false).await.unwrap();
+            fast.assert_hits(1); // Revenir au cache invalide aussi une réponse ancienne en transit.
+        }
+
+        #[tokio::test]
+        async fn historical_cache_is_date_specific_and_force_bypasses_it() {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.path("/llm/spend/logs")
+                    .query_param("summarize", "false");
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client = client(&server);
+            client.fetch_today().await.unwrap();
+            client.fetch_day("2024-02-28", false).await.unwrap();
+            client.fetch_day("2024-02-28", false).await.unwrap();
+            mock.assert_hits(2);
+            assert_eq!(
+                client.fetch_day("2024-02-29", false).await.unwrap().date,
+                "2024-02-29"
+            );
+            mock.assert_hits(3);
+            client.fetch_day("2024-02-29", true).await.unwrap();
+            mock.assert_hits(4);
+            client.fetch_activity().await.unwrap();
+            mock.assert_hits(4);
+        }
 
         fn client(server: &MockServer) -> Client {
             Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()

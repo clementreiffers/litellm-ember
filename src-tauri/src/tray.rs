@@ -105,6 +105,14 @@ async fn save_settings(
     service.save(input).await
 }
 #[tauri::command]
+async fn get_local_history(
+    service: State<'_, Service>,
+    mode: shared::HistoryMode,
+) -> Result<shared::LocalHistorySnapshot, String> {
+    service.local_history(mode).await
+}
+
+#[tauri::command]
 async fn get_history(
     service: State<'_, Service>,
     mode: shared::HistoryMode,
@@ -121,8 +129,45 @@ async fn get_activity(service: State<'_, Service>) -> Result<Detail<Activity>, S
     service.activity().await
 }
 #[tauri::command]
-async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
-    service.refresh_and_wait().await
+async fn get_cached_day(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<Option<shared::CachedDaily>>, String> {
+    service.cached_day(date).await
+}
+
+#[tauri::command]
+async fn begin_day_refresh(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<u64>, String> {
+    service.begin_day_refresh(date).await
+}
+
+#[tauri::command]
+async fn get_day_usage(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyUsage>, String> {
+    service.day_usage_in_refresh(date, force, refresh).await
+}
+#[tauri::command]
+async fn get_day_costs(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    service.day_costs_in_refresh(date, force, refresh).await
+}
+#[tauri::command]
+async fn refresh_now(
+    today_refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<(), String> {
+    service.refresh_with_day(today_refresh).await
 }
 
 /// Bouton « Tester » des paramètres.
@@ -178,7 +223,12 @@ pub fn run() {
             save_settings,
             get_week,
             get_history,
+            get_local_history,
             get_activity,
+            get_day_usage,
+            begin_day_refresh,
+            get_cached_day,
+            get_day_costs,
             refresh_now,
             test_notification,
             get_update_status,
@@ -243,6 +293,14 @@ pub fn run() {
                 app.handle().clone(),
                 service.clone(),
             ));
+            let mut calendar = service.subscribe_local_history();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while calendar.changed().await.is_ok() {
+                    let snapshot = calendar.borrow_and_update().clone();
+                    let _ = handle.emit("local-history-updated", snapshot);
+                }
+            });
             app.manage(service);
             updater::start(
                 app.handle(),

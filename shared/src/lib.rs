@@ -60,6 +60,32 @@ pub struct ModelUsage {
     pub total_tokens: u64,
 }
 
+/// Consommation à la demande, distincte des statistiques de la période courante.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyUsage {
+    /// Jour local au format YYYY-MM-DD.
+    pub date: String,
+    pub models: Vec<ModelUsage>,
+}
+
+/// Aperçu des coûts d'une journée locale, sans compteurs de tokens inventés.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyCosts {
+    pub date: String,
+    pub models: Vec<ModelCost>,
+}
+
+/// Agrégats locaux persistés ; une valeur périmée reste un aperçu jusqu'à validation réseau.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedDaily {
+    pub costs: DailyCosts,
+    pub usage: Option<DailyUsage>,
+    pub stale: bool,
+    pub usage_stale: bool,
+    pub usage_fetched_at: Option<String>,
+    pub fetched_at: String,
+}
+
 /// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -433,6 +459,19 @@ pub struct HistoryDetails {
     pub first_weekday: u8,
     pub updated_at: Option<String>,
     pub error: Option<String>,
+}
+
+/// Calendrier local publié progressivement ; la révision ordonne commandes et événements.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalHistorySnapshot {
+    pub generation: u64,
+    pub revision: u64,
+    pub calendar_id: String,
+    pub loading: bool,
+    pub details: HistoryDetails,
+    /// Coûts locaux vérifiés lors d'une sélection, distincts des estimations du calendrier.
+    #[serde(default)]
+    pub exact_costs: Vec<HistoryDay>,
 }
 mod harness;
 pub use harness::*;

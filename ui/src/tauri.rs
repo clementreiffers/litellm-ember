@@ -94,8 +94,116 @@ pub async fn get_activity() -> Result<Detail<Activity>, String> {
     invoke_as("get_activity").await
 }
 
-pub async fn refresh_now() {
-    let _ = invoke("refresh_now").await;
+pub async fn get_day_usage(
+    date: String,
+    force: bool,
+) -> Result<Detail<shared::DailyUsage>, String> {
+    get_day_usage_in_refresh(date, force, None).await
+}
+
+pub async fn begin_day_refresh(date: String) -> Result<Detail<u64>, String> {
+    #[derive(Serialize)]
+    struct Args {
+        date: String,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { date }).map_err(|e| e.to_string())?;
+    let value = invoke_with("begin_day_refresh", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Actualisation indisponible".into())
+    })?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn get_day_usage_in_refresh(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+) -> Result<Detail<shared::DailyUsage>, String> {
+    let bounds = crate::usage::local_day_bounds(&date);
+    #[derive(Serialize)]
+    struct Args {
+        date: String,
+        force: bool,
+        refresh: Option<u64>,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args {
+        date: date.clone(),
+        force,
+        refresh,
+    })
+    .map_err(|e| e.to_string())?;
+    let value = invoke_with("get_day_usage", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Consommation indisponible".into())
+    })?;
+    if bounds != crate::usage::local_day_bounds(&date) {
+        return Err("Le fuseau horaire a changé ; rechargez cette journée".into());
+    }
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn get_cached_day(date: String) -> Result<Detail<Option<shared::CachedDaily>>, String> {
+    let bounds = crate::usage::local_day_bounds(&date);
+    #[derive(Serialize)]
+    struct Args {
+        date: String,
+    }
+    let args =
+        serde_wasm_bindgen::to_value(&Args { date: date.clone() }).map_err(|e| e.to_string())?;
+    let value = invoke_with("get_cached_day", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Cache quotidien indisponible".into())
+    })?;
+    if bounds != crate::usage::local_day_bounds(&date) {
+        return Err("Le fuseau horaire a changé ; rechargez cette journée".into());
+    }
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn get_day_costs(
+    date: String,
+    force: bool,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    get_day_costs_in_refresh(date, force, None).await
+}
+
+pub async fn get_day_costs_in_refresh(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    let bounds = crate::usage::local_day_bounds(&date);
+    #[derive(Serialize)]
+    struct Args {
+        date: String,
+        force: bool,
+        refresh: Option<u64>,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args {
+        date: date.clone(),
+        force,
+        refresh,
+    })
+    .map_err(|e| e.to_string())?;
+    let value = invoke_with("get_day_costs", args).await.map_err(|e| {
+        e.as_string()
+            .unwrap_or_else(|| "Coûts indisponibles".into())
+    })?;
+    if bounds != crate::usage::local_day_bounds(&date) {
+        return Err("Le fuseau horaire a changé ; rechargez cette journée".into());
+    }
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn refresh_now(today_refresh: Option<u64>) {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Args {
+        today_refresh: Option<u64>,
+    }
+    if let Ok(args) = serde_wasm_bindgen::to_value(&Args { today_refresh }) {
+        let _ = invoke_with("refresh_now", args).await;
+    }
 }
 
 pub async fn test_notification() -> Result<(), String> {
@@ -172,17 +280,17 @@ pub async fn on_event<T: serde::de::DeserializeOwned + 'static>(
 }
 
 /// Lecture locale, actualisation légère ou synchronisation manuelle complète.
-pub async fn get_history(
+pub async fn get_local_history(
     mode: shared::HistoryMode,
-) -> Result<Detail<shared::HistoryDetails>, String> {
+) -> Result<shared::LocalHistorySnapshot, String> {
     #[derive(Serialize)]
     struct Args {
         mode: shared::HistoryMode,
     }
     let args = serde_wasm_bindgen::to_value(&Args { mode }).map_err(|e| e.to_string())?;
-    let value = invoke_with("get_history", args).await.map_err(|e| {
+    let value = invoke_with("get_local_history", args).await.map_err(|e| {
         e.as_string()
-            .unwrap_or_else(|| "Historique indisponible".into())
+            .unwrap_or_else(|| "Historique local indisponible".into())
     })?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
