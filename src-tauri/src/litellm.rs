@@ -11,7 +11,9 @@ mod ranges;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
-use shared::{Activity, ModelCost, ModelUsage, WeekDetails};
+#[cfg(test)]
+use shared::ModelUsage;
+use shared::{Activity, ModelCost, WeekDetails};
 
 #[derive(Debug, thiserror::Error)]
 enum TransportError {
@@ -185,6 +187,7 @@ impl Client {
         self.fetch_today_snapshot().await.map(|(_, rows)| rows)
     }
 
+    #[cfg(test)]
     pub async fn fetch_today_snapshot(&self) -> Result<(NaiveDate, Vec<ModelUsage>), String> {
         let (today, rows) = self.fetch_today_rows().await?;
         Ok((today, aggregate_today(&rows, today, &Local)))
