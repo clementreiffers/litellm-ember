@@ -76,6 +76,7 @@ pub fn apply(stats: &mut Stats, event: Event) {
     match event {
         Event::Key(key) => {
             stats.total_spend = key.period_spend;
+            stats.whole_proxy = key.whole_proxy;
             stats.period_spend = key.period_spend;
             stats.max_budget = key.max_budget;
             stats.budget_reset_at = key.budget_reset_at;
@@ -587,6 +588,7 @@ async fn coordinate(
                     let cfg = store.get();
                     let key = KeyData {
                         period_spend: key.period_spend,
+                        whole_proxy: key.whole_proxy,
                         max_budget: key.max_budget,
                         budget_reset_at: key.budget_reset_at.clone(),
                         period_start: key.period_start.clone(),
@@ -654,6 +656,23 @@ async fn coordinate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn key_event_sets_and_clears_whole_proxy_scope() {
+        let mut stats = shared::Stats::default();
+        for whole_proxy in [true, false] {
+            super::apply(
+                &mut stats,
+                super::Event::Key(crate::litellm::KeyData {
+                    period_spend: 2.0,
+                    whole_proxy,
+                    max_budget: None,
+                    budget_reset_at: None,
+                    period_start: None,
+                }),
+            );
+            assert_eq!(stats.whole_proxy, whole_proxy);
+        }
+    }
     use super::*;
     use httpmock::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1058,6 +1077,7 @@ mod tests {
                 old_state.cycle_id,
                 Event::Key(KeyData {
                     period_spend: 999.0,
+                    whole_proxy: false,
                     max_budget: None,
                     budget_reset_at: None,
                     period_start: None,

@@ -53,6 +53,7 @@ pub(super) fn project(
 
 pub struct KeyData {
     pub period_spend: f64,
+    pub whole_proxy: bool,
     pub max_budget: Option<f64>,
     pub budget_reset_at: Option<String>,
     pub period_start: Option<String>,
@@ -110,6 +111,7 @@ pub(super) struct KeyInfo {
 #[derive(Deserialize)]
 pub(super) struct KeyInfoInner {
     pub(super) spend: f64,
+    pub(super) user_id: Option<String>,
     pub(super) max_budget: Option<f64>,
     pub(super) budget_reset_at: Option<String>,
     pub(super) budget_duration: Option<String>,

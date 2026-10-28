@@ -2,6 +2,7 @@
 use chrono::DateTime;
 use chrono::{Duration, Local, NaiveDate, Utc};
 mod domain;
+mod scope;
 pub use domain::KeyData;
 use domain::*;
 use serde::Deserialize;
@@ -31,6 +32,7 @@ impl From<TransportError> for String {
 #[derive(Clone)]
 pub struct Client {
     rows: std::sync::Arc<tokio::sync::Mutex<Option<RowsCache>>>,
+    scope: std::sync::Arc<tokio::sync::Mutex<scope::Cache>>,
     summaries: std::sync::Arc<tokio::sync::Mutex<Option<SummaryCache>>>,
     http: reqwest::Client,
     base_url: String,
@@ -80,6 +82,7 @@ impl Client {
             base_url: crate::settings::validate_url(base_url)?,
             api_key,
             rows: Default::default(),
+            scope: Default::default(),
             summaries: Default::default(),
         })
     }
@@ -110,15 +113,16 @@ impl Client {
             .send()
             .await
             .map_err(|error| TransportError::Request(describe(error)))?;
+        let safe_path = path.split('?').next().unwrap_or(path);
         let status = resp.status();
         if !status.is_success() {
             return Err(TransportError::Status {
                 status,
-                path: path.to_owned(),
+                path: safe_path.to_owned(),
             });
         }
         resp.json().await.map_err(|source| TransportError::Decode {
-            path: path.to_owned(),
+            path: safe_path.to_owned(),
             source: source.without_url(),
         })
     }
@@ -126,8 +130,10 @@ impl Client {
     /// Étape 1 (≈0,5 s) : dépense de la période de budget en cours (`/key/info`).
     pub async fn fetch_key(&self) -> Result<KeyData, String> {
         let key: KeyInfo = self.get("/key/info").await?;
+        self.seed_scope(key.info.user_id.clone()).await;
         Ok(KeyData {
             period_spend: key.info.spend,
+            whole_proxy: key.info.user_id.is_none(),
             max_budget: key.info.max_budget,
             budget_reset_at: key.info.budget_reset_at.clone(),
             period_start: period_start(&key.info),
@@ -143,9 +149,12 @@ impl Client {
             .map(|d| d.to_string())
             .unwrap_or_else(|| (now - Duration::days(7)).to_string());
         let summary = self
-            .summary(format!(
-                "/spend/logs?summarize=true&start_date={start}&end_date={tomorrow}"
-            ))
+            .summary(
+                self.scoped_path(format!(
+                    "/spend/logs?summarize=true&start_date={start}&end_date={tomorrow}"
+                ))
+                .await?,
+            )
             .await?;
         Ok(aggregate_totals(&summary))
     }
@@ -178,9 +187,13 @@ impl Client {
             .unwrap_or(now.with_timezone(&Utc).date_naive());
         let end = now.with_timezone(&Utc).date_naive() + Duration::days(1);
         let rows = std::sync::Arc::new(
-            self.get::<Vec<LogRow>>(&format!(
-                "/spend/logs?summarize=false&start_date={start}&end_date={end}"
-            ))
+            self.get::<Vec<LogRow>>(
+                &self
+                    .scoped_path(format!(
+                        "/spend/logs?summarize=false&start_date={start}&end_date={end}"
+                    ))
+                    .await?,
+            )
             .await?,
         );
         *cache = Some(RowsCache {
@@ -210,9 +223,13 @@ impl Client {
         }
         let end = today + Duration::days(1);
         let rows: Vec<DailySpend> = self
-            .get(&format!(
-                "/spend/logs?summarize=true&start_date={start}&end_date={end}"
-            ))
+            .get(
+                &self
+                    .scoped_path(format!(
+                        "/spend/logs?summarize=true&start_date={start}&end_date={end}"
+                    ))
+                    .await?,
+            )
             .await?;
         crate::history::aggregate(
             today,
@@ -234,10 +251,13 @@ impl Client {
             .and_then(parse_date)
             .unwrap_or(today - Duration::days(6));
         let summary = self
-            .summary(format!(
-                "/spend/logs?summarize=true&start_date={start}&end_date={}",
-                today + Duration::days(1)
-            ))
+            .summary(
+                self.scoped_path(format!(
+                    "/spend/logs?summarize=true&start_date={start}&end_date={}",
+                    today + Duration::days(1)
+                ))
+                .await?,
+            )
             .await?;
         Ok(WeekDetails {
             days: aggregate_days(&summary, start, today),
@@ -516,6 +536,7 @@ mod tests {
     fn period_start_subtracts_the_budget_duration() {
         let info = |reset: Option<&str>, dur: Option<&str>| KeyInfoInner {
             spend: 0.0,
+            user_id: None,
             max_budget: None,
             budget_reset_at: reset.map(str::to_string),
             budget_duration: dur.map(str::to_string),
@@ -695,8 +716,112 @@ mod tests {
         use super::super::*;
         use httpmock::prelude::*;
 
+        #[tokio::test]
+        async fn spend_routes_use_one_resolved_scope_for_user_and_admin_keys() {
+            const HASH: &str = "f3abf2a6cc4f00987743db5f544ba345b4899ae31f326d8ee9c4816de153c9e0";
+            fn no_key(request: &httpmock::prelude::HttpMockRequest) -> bool {
+                !request
+                    .query_params
+                    .as_ref()
+                    .is_some_and(|pairs| pairs.iter().any(|(k, _)| k == "api_key"))
+            }
+            for user in [true, false] {
+                let server = MockServer::start();
+                let info = server.mock(|when, then| {
+                    when.path("/llm/key/info");
+                    then.status(200).json_body(serde_json::json!({"info": {
+                        "spend": 1.0, "user_id": if user { Some("test-user") } else { None }
+                    }}));
+                });
+                let logs = server.mock(|when, then| {
+                    let when = when.path("/llm/spend/logs");
+                    if user {
+                        when.query_param("api_key", HASH);
+                    } else {
+                        when.matches(no_key);
+                    }
+                    then.status(200).json_body(serde_json::json!([]));
+                });
+                let client =
+                    Client::new(&format!("{}/llm", server.base_url()), "sk-test".into()).unwrap();
+                let key = client.fetch_key().await.unwrap();
+                assert_eq!(info.hits(), 1, "after key");
+                assert_eq!(key.whole_proxy, !user);
+                client.fetch_models(None).await.unwrap();
+                assert_eq!(info.hits(), 1, "after models");
+                client.fetch_week(None, None, 0.0).await.unwrap();
+                client.fetch_activity().await.unwrap();
+                let day = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+                client.fetch_history(day, day).await.unwrap();
+                assert_eq!(info.hits(), 1, "after history");
+                assert!(logs.hits() >= 4);
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_scope_lookup_retries_without_unfiltered_request() {
+            let server = MockServer::start();
+            let mut failure = server.mock(|when, then| {
+                when.path("/llm/key/info");
+                then.status(503);
+            });
+            let logs = server.mock(|when, then| {
+                when.path("/llm/spend/logs").query_param(
+                    "api_key",
+                    "f3abf2a6cc4f00987743db5f544ba345b4899ae31f326d8ee9c4816de153c9e0",
+                );
+                then.status(200).json_body(serde_json::json!([]));
+            });
+            let client =
+                Client::new(&format!("{}/llm", server.base_url()), "sk-test".into()).unwrap();
+            assert!(client.fetch_models(None).await.is_err());
+            failure.assert_hits(1);
+            logs.assert_hits(0);
+            failure.delete();
+            let success = server.mock(|when, then| {
+                when.path("/llm/key/info");
+                then.status(200)
+                    .json_body(serde_json::json!({"info":{"user_id":"test-user"}}));
+            });
+            client.fetch_models(None).await.unwrap();
+            success.assert_hits(1);
+            logs.assert_hits(1);
+        }
+
+        #[tokio::test]
+        async fn transport_errors_do_not_expose_query_parameters() {
+            for (status, body) in [(500, "{}"), (200, "not json")] {
+                let server = MockServer::start();
+                let mock = server.mock(|when, then| {
+                    when.method(GET)
+                        .path("/llm/spend/logs")
+                        .query_param("api_key", "secret-hash")
+                        .query_param("user_id", "private-user");
+                    then.status(status).body(body);
+                });
+                let error = client(&server)
+                    .get::<serde_json::Value>(
+                        "/spend/logs?api_key=secret-hash&user_id=private-user",
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("/spend/logs"), "{error}");
+                for secret in ["api_key", "user_id", "?", "secret-hash", "private-user"] {
+                    assert!(!error.contains(secret), "error leaked {secret}: {error}");
+                }
+                if status == 500 {
+                    assert!(error.contains("500"), "{error}");
+                } else {
+                    assert!(error.contains("réponse invalide"), "{error}");
+                }
+                mock.assert_hits(1);
+            }
+        }
+
         fn client(server: &MockServer) -> Client {
-            Client::new(&format!("{}/llm/", server.base_url()), "sk-test".into()).unwrap()
+            Client::for_spend_test(&format!("{}/llm/", server.base_url()), "sk-test".into())
+                .unwrap()
         }
 
         #[tokio::test]

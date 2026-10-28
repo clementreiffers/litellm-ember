@@ -248,6 +248,8 @@ The application interface is currently in French. The tab names used above corre
 
 Your key must have access to the `/key/info` and `/spend/logs` endpoints. Without a saved key, the application makes no requests to LiteLLM.
 
+Spend queries are filtered by the key's SHA-256 hash when `/key/info` reports a user ID, so a user key only sees its own spending. Keys whose `/key/info` has no user ID (admin or master keys) send no key filter: every spend view then covers the whole proxy and shows **Toutes les clés du proxy (clé administrateur)**. If `/key/info` fails, spend queries fail too rather than guessing a scope. Error messages show the endpoint path without its query string.
+
 ### Local storage
 
 After upgrading from a build with the previous application identity, enter your endpoint and API key again. Existing local data and Keychain entries are left untouched and are not imported automatically. macOS may ask you to allow notifications again.
