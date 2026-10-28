@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 use std::sync::Mutex;
 #[cfg(not(target_os = "macos"))]
 use std::time::{Duration, Instant};
@@ -105,6 +105,14 @@ async fn save_settings(
     service.save(input).await
 }
 #[tauri::command]
+async fn get_local_history(
+    service: State<'_, Service>,
+    mode: shared::HistoryMode,
+) -> Result<shared::LocalHistorySnapshot, String> {
+    service.local_history(mode).await
+}
+
+#[tauri::command]
 async fn get_history(
     service: State<'_, Service>,
     mode: shared::HistoryMode,
@@ -121,8 +129,45 @@ async fn get_activity(service: State<'_, Service>) -> Result<Detail<Activity>, S
     service.activity().await
 }
 #[tauri::command]
-async fn refresh_now(service: State<'_, Service>) -> Result<(), String> {
-    service.refresh_and_wait().await
+async fn get_cached_day(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<Option<shared::CachedDaily>>, String> {
+    service.cached_day(date).await
+}
+
+#[tauri::command]
+async fn begin_day_refresh(
+    date: String,
+    service: State<'_, Service>,
+) -> Result<Detail<u64>, String> {
+    service.begin_day_refresh(date).await
+}
+
+#[tauri::command]
+async fn get_day_usage(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyUsage>, String> {
+    service.day_usage_in_refresh(date, force, refresh).await
+}
+#[tauri::command]
+async fn get_day_costs(
+    date: String,
+    force: bool,
+    refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<Detail<shared::DailyCosts>, String> {
+    service.day_costs_in_refresh(date, force, refresh).await
+}
+#[tauri::command]
+async fn refresh_now(
+    today_refresh: Option<u64>,
+    service: State<'_, Service>,
+) -> Result<(), String> {
+    service.refresh_with_day(today_refresh).await
 }
 
 /// Bouton « Tester » des paramètres.
@@ -178,7 +223,12 @@ pub fn run() {
             save_settings,
             get_week,
             get_history,
+            get_local_history,
             get_activity,
+            get_day_usage,
+            begin_day_refresh,
+            get_cached_day,
+            get_day_costs,
             refresh_now,
             test_notification,
             get_update_status,
@@ -243,6 +293,14 @@ pub fn run() {
                 app.handle().clone(),
                 service.clone(),
             ));
+            let mut calendar = service.subscribe_local_history();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while calendar.changed().await.is_ok() {
+                    let snapshot = calendar.borrow_and_update().clone();
+                    let _ = handle.emit("local-history-updated", snapshot);
+                }
+            });
             app.manage(service);
             updater::start(
                 app.handle(),
@@ -485,28 +543,38 @@ mod tests {
 
     mod cycle {
         use super::super::*;
-        use crate::{
-            litellm::Client,
-            service::{apply, run_cycle, Event},
-        };
+        use crate::service::tests::{finished, start_with_notify};
         use httpmock::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
-        /// Applique les mises à jour sur un `Stats` local, comme le fait le vrai `update`.
-        async fn run(server: &MockServer, stats: &Mutex<Stats>, notified: &AtomicUsize) {
-            let c = Client::new(&server.base_url(), "k".into()).unwrap();
-            run_cycle(&c, |event| {
-                let mut stats = stats.lock().unwrap();
-                if matches!(event, Event::Key(_)) {
-                    stats.error = None;
-                    notified.fetch_add(1, Ordering::SeqCst);
-                }
-                if matches!(event, Event::Today(..)) {
-                    stats.updated_at = Some(Local::now().format("%H:%M:%S").to_string());
-                }
-                apply(&mut stats, event);
-            })
-            .await;
+        /// Un cycle complet du vrai coordinateur, tel que l'application le lance au démarrage.
+        async fn run(server: &MockServer, previous: Stats, notified: &Arc<AtomicUsize>) -> Stats {
+            let path = std::env::temp_dir().join(format!("tray-{}.json", uuid::Uuid::new_v4()));
+            let store = Arc::new(crate::settings::SettingsStore::for_test(&server.base_url()));
+            crate::persistence::write(
+                &path,
+                &Stats {
+                    source_id: store.get().source_id,
+                    ..previous
+                },
+            )
+            .unwrap();
+            let calls = notified.clone();
+            let (service, task) = start_with_notify(
+                store,
+                Some(path.clone()),
+                Arc::new(move |_, request| {
+                    if matches!(request, crate::service::NotificationRequest::Budget(_)) {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(false)
+                }),
+            );
+            let stats = finished(&service, 1).await;
+            task.abort();
+            let _ = std::fs::remove_file(path);
+            stats
         }
 
         fn mock_all(server: &MockServer) {
@@ -530,14 +598,17 @@ mod tests {
         async fn successful_cycle_fills_the_state_and_notifies_once() {
             let server = MockServer::start();
             mock_all(&server);
-            let stats = Mutex::new(Stats {
-                error: Some("avant".into()),
-                ..Default::default()
-            });
-            let notified = AtomicUsize::new(0);
-            run(&server, &stats, &notified).await;
+            let notified = Arc::new(AtomicUsize::new(0));
+            let s = run(
+                &server,
+                Stats {
+                    error: Some("avant".into()),
+                    ..Default::default()
+                },
+                &notified,
+            )
+            .await;
 
-            let s = stats.lock().unwrap();
             assert_eq!(s.period_spend, 10.0);
             assert_eq!(s.max_budget, Some(100.0));
             assert_eq!(s.period_start.as_deref(), Some("2026-10-05T00:00:00+00:00"));
@@ -558,15 +629,18 @@ mod tests {
                 when.path("/key/info");
                 then.status(500);
             });
-            let stats = Mutex::new(Stats {
-                total_spend: 3.0,
-                updated_at: Some("09:00:00".into()),
-                ..Default::default()
-            });
-            let notified = AtomicUsize::new(0);
-            run(&server, &stats, &notified).await;
+            let notified = Arc::new(AtomicUsize::new(0));
+            let s = run(
+                &server,
+                Stats {
+                    total_spend: 3.0,
+                    updated_at: Some("09:00:00".into()),
+                    ..Default::default()
+                },
+                &notified,
+            )
+            .await;
 
-            let s = stats.lock().unwrap();
             assert_eq!(s.total_spend, 3.0);
             assert_eq!(s.updated_at.as_deref(), Some("09:00:00"));
             assert!(s.error.as_deref().unwrap().contains("500"));
@@ -585,11 +659,9 @@ mod tests {
                 when.path("/spend/logs");
                 then.status(503);
             });
-            let stats = Mutex::new(Stats::default());
-            let notified = AtomicUsize::new(0);
-            run(&server, &stats, &notified).await;
+            let notified = Arc::new(AtomicUsize::new(0));
+            let s = run(&server, Stats::default(), &notified).await;
 
-            let s = stats.lock().unwrap();
             assert_eq!(s.total_spend, 5.0);
             assert!(s.error.is_some());
             assert_eq!(notified.load(Ordering::SeqCst), 1);

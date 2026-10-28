@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use shared::{Activity, Stats, WeekDetails};
 
 use crate::{
-    chart::{Bars, Donut, TokenSplit},
+    chart::Bars,
     details::{self, ActivityTab, Remote, WeekTab},
     settings::Settings,
     tauri,
@@ -121,8 +121,80 @@ pub fn App() -> impl IntoView {
     });
     // Les données des onglets secondaires vivent ici pour survivre à l'ouverture des paramètres.
     let week = RwSignal::new(Remote::<WeekDetails>::default());
-    let history = RwSignal::new(Remote::<shared::HistoryDetails>::default());
+    let history = crate::history::CalendarState::new();
     let activity = RwSignal::new(Remote::<Activity>::default());
+    let selected_day = RwSignal::new(None::<String>);
+    let day_usage = RwSignal::new(Remote::<shared::DailyUsage>::default());
+    let day_costs = RwSignal::new(Remote::<shared::DailyCosts>::default());
+    let day_epoch = RwSignal::new(0u64);
+    let previous_calendar = StoredValue::new(String::new());
+    let previous_revisions = StoredValue::new(Vec::<(String, u64)>::new());
+    Effect::new(move |_| {
+        let snapshot = history.snapshot.get();
+        let initialized = previous_calendar.with_value(|old| !old.is_empty());
+        let changed =
+            previous_calendar.with_value(|old| !old.is_empty() && *old != snapshot.calendar_id);
+        previous_calendar.set_value(snapshot.calendar_id.clone());
+        // Des tokens revalidés à coût identique remplacent aussi la journée affichée.
+        let selected = selected_day.get_untracked();
+        let usage_changed = initialized
+            && previous_revisions.with_value(|old| {
+                crate::history::usage_revision(old, selected.as_deref())
+                    != crate::history::usage_revision(
+                        &snapshot.usage_revisions,
+                        selected.as_deref(),
+                    )
+            });
+        previous_revisions.set_value(snapshot.usage_revisions.clone());
+        let outdated = day_usage.with_untracked(|u| {
+            day_costs.with_untracked(|c| {
+                !u.loading
+                    && !c.loading
+                    && crate::history::daily_details_outdated(
+                        selected_day.get_untracked().as_deref(),
+                        &snapshot.exact_costs,
+                        u.data.as_ref(),
+                        c.data.as_ref(),
+                    )
+            })
+        });
+        if changed || usage_changed || outdated {
+            details::reset(day_usage);
+            details::reset(day_costs);
+            day_epoch.update(|e| *e += 1);
+        }
+    });
+    let today_date = RwSignal::new(crate::usage::local_today());
+    let selected_bounds = StoredValue::new(None::<(String, Option<(i64, i64)>)>);
+    Effect::new(move |_| {
+        selected_bounds.set_value(selected_day.get().map(|date| {
+            let bounds = crate::usage::local_day_bounds(&date);
+            (date, bounds)
+        }));
+    });
+    // Horloge locale uniquement : aucune requête réseau supplémentaire à minuit.
+    // Une vérification toutes les 30 s suffit pour un changement de jour ou de fuseau.
+    if let Ok(clock) = leptos::leptos_dom::helpers::set_interval_with_handle(
+        move || {
+            crate::usage::update_today(today_date);
+            if let Some(date) = selected_day.get_untracked() {
+                let next = (date.clone(), crate::usage::local_day_bounds(&date));
+                let changed = selected_bounds.with_value(|old| {
+                    old.as_ref()
+                        .is_some_and(|old| old.0 == date && old.1 != next.1)
+                });
+                selected_bounds.set_value(Some(next));
+                if changed {
+                    details::reset(day_usage);
+                    details::reset(day_costs);
+                    day_epoch.update(|e| *e += 1);
+                }
+            }
+        },
+        std::time::Duration::from_secs(30),
+    ) {
+        on_cleanup(move || clock.clear());
+    }
 
     let listener = StoredValue::new_local(None::<tauri::Listener>);
     on_cleanup(move || {
@@ -131,12 +203,19 @@ pub fn App() -> impl IntoView {
         });
     });
     let accept = move |incoming: Stats| {
+        today_date.try_set(crate::usage::local_today());
         stats.try_update(|current| {
             if incoming.revision >= current.revision {
                 if incoming.generation != current.generation {
                     details::reset(week);
-                    details::reset(history);
+                    history.reset_details();
+                    history.snapshot.set(shared::LocalHistorySnapshot {
+                        generation: incoming.generation,
+                        ..Default::default()
+                    });
                     details::reset(activity);
+                    details::reset(day_usage);
+                    details::reset(day_costs);
                 }
                 *current = incoming;
             }
@@ -156,18 +235,45 @@ pub fn App() -> impl IntoView {
             accept(s);
         }
     });
+    let calendar_listener = StoredValue::new_local(None::<tauri::Listener>);
+    on_cleanup(move || {
+        calendar_listener.try_update_value(|v| {
+            v.take();
+        });
+    });
+    leptos::task::spawn_local(async move {
+        if let Ok(listener) = tauri::on_event(
+            "local-history-updated",
+            move |next: shared::LocalHistorySnapshot| {
+                if let Some(generation) = stats.try_with_untracked(|s| s.generation) {
+                    history.accept(next, generation);
+                }
+            },
+        )
+        .await
+        {
+            calendar_listener.try_set_value(Some(listener));
+        }
+        if let Ok(next) = tauri::get_local_history(shared::HistoryMode::Cached).await {
+            if let Some(generation) = stats.try_with_untracked(|s| s.generation) {
+                history.accept(next, generation);
+            }
+        }
+    });
     let close_settings = Callback::new(move |_| {
         // L'endpoint ou la clé ont pu changer : les données à la demande sont à recharger.
         details::reset(week);
-        details::reset(history);
+        history.reset_details();
         details::reset(activity);
+        details::reset(day_usage);
+        details::reset(day_costs);
         show_settings.set(false);
     });
 
     view! {
       <div class="scroller" node_ref=scroller>
         <Show when=move || show_settings.get()
-            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses /> }>
+            fallback=move || view! { <Main stats show_settings tab week history activity updates harnesses selected_day day_usage day_costs day_epoch today_date /> }>
             <Settings on_close=close_settings updates harnesses />
         </Show>
       </div>
@@ -180,22 +286,50 @@ fn Main(
     show_settings: RwSignal<bool>,
     tab: RwSignal<Tab>,
     week: RwSignal<Remote<WeekDetails>>,
-    history: RwSignal<Remote<shared::HistoryDetails>>,
+    history: crate::history::CalendarState,
     activity: RwSignal<Remote<Activity>>,
     updates: RwSignal<shared::UpdateStatus>,
     harnesses: RwSignal<shared::HarnessSnapshot>,
+    selected_day: RwSignal<Option<String>>,
+    day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    day_costs: RwSignal<Remote<shared::DailyCosts>>,
+    day_epoch: RwSignal<u64>,
+    today_date: RwSignal<String>,
 ) -> impl IntoView {
+    today_date.set(crate::usage::local_today());
     let generation = Signal::from(Memo::new(move |_| stats.with(|s| s.generation)));
     // Chargement à la demande à l'ouverture d'un onglet secondaire (pas au rafraîchissement périodique).
     Effect::new(move |_| {
         generation.track();
+        day_epoch.track();
+        let selected = selected_day.get();
         match tab.get() {
             Tab::History => {
                 details::load(week, tauri::get_week, generation);
-                details::load_history(history, generation, shared::HistoryMode::Refresh);
+                history.refresh(shared::HistoryMode::Refresh, generation);
             }
             Tab::Activity => details::load(activity, tauri::get_activity, generation),
-            Tab::Usage | Tab::Agents => {}
+            Tab::Usage => {
+                if let Some(date) = selected {
+                    details::load_day_costs(day_costs, date.clone(), false, generation);
+                    details::load(
+                        day_usage,
+                        move || tauri::get_day_usage(date.clone(), false),
+                        generation,
+                    );
+                }
+            }
+            Tab::Agents => {}
+        }
+    });
+    let calendar_id = Memo::new(move |_| history.snapshot.with(|s| s.calendar_id.clone()));
+    Effect::new(move |_| {
+        generation.track();
+        history.selected.track();
+        calendar_id.track();
+        history.epoch.track();
+        if tab.get() == Tab::History {
+            history.load_details(generation);
         }
     });
     let max_budget = Signal::derive(move || stats.with(|s| s.max_budget));
@@ -203,11 +337,21 @@ fn Main(
     // L'état du cycle, y compris son échec, pilote l'animation.
     let refreshing = Signal::derive(move || stats.with(|s| s.refreshing));
     let force_refresh = move |_| {
+        let mut selections = Vec::new();
+        if tab.get_untracked() == Tab::History {
+            if let Some(date) = history.selected.get_untracked() {
+                selections.push((date, history.costs, history.usage));
+            }
+            history.refresh(shared::HistoryMode::Force, generation);
+        }
+        if let Some(date) = selected_day.get_untracked() {
+            selections.push((date, day_costs, day_usage));
+        }
+        details::refresh_days(selections, generation, !refreshing.get_untracked());
         if refreshing.get_untracked() {
             return;
         }
         leptos::task::spawn_local(async move {
-            tauri::refresh_now().await;
             if week.is_disposed() {
                 return;
             }
@@ -216,7 +360,6 @@ fn Main(
             match tab.get_untracked() {
                 Tab::History => {
                     details::load(week, tauri::get_week, generation);
-                    details::load_history(history, generation, shared::HistoryMode::Force);
                 }
                 Tab::Activity => details::load(activity, tauri::get_activity, generation),
                 Tab::Usage | Tab::Agents => {}
@@ -265,8 +408,8 @@ fn Main(
 
         {move || match tab.get() {
             Tab::Agents => view! { <crate::harness::Agents snapshot=harnesses /> }.into_any(),
-            Tab::Usage => view! { <UsageTab stats /> }.into_any(),
-            Tab::History => view! { <crate::history::HistoryCalendar history /><Show when=move ||stats.with(|s|s.whole_proxy)><div class="caption">"Toutes les clés du proxy (clé administrateur)"</div></Show><WeekTab week max_budget /> }.into_any(),
+            Tab::Usage => view! { <UsageTab stats selected_day day_usage day_costs today_date /> }.into_any(),
+            Tab::History => view! { <crate::history::HistoryCalendar state=history /><Show when=move ||stats.with(|s|s.whole_proxy)><div class="caption">"Toutes les clés du proxy (clé administrateur)"</div></Show><crate::history::DayRecap state=history /><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
     }
@@ -337,13 +480,48 @@ mod tests {
 }
 
 #[component]
-fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
-    let today: Signal<Vec<shared::ModelUsage>> =
-        Memo::new(move |_| stats.with(|s| s.today.clone())).into();
-    let today_spend: Signal<f64> =
-        Signal::derive(move || today.with(|t| t.iter().map(|u| u.spend).sum()));
-    let today_tokens: Signal<u64> =
-        Signal::derive(move || today.with(|t| t.iter().map(|u| u.total_tokens).sum()));
+fn UsageTab(
+    stats: RwSignal<Stats>,
+    selected_day: RwSignal<Option<String>>,
+    day_usage: RwSignal<Remote<shared::DailyUsage>>,
+    day_costs: RwSignal<Remote<shared::DailyCosts>>,
+    today_date: RwSignal<String>,
+) -> impl IntoView {
+    let visible = Memo::new(move |_| {
+        stats.with(|stats| {
+            day_usage.with(|remote| {
+                day_costs.with(|costs| {
+                    crate::usage::visible_usage(
+                        selected_day.get().as_deref(),
+                        &today_date.get(),
+                        stats,
+                        crate::usage::compatible_usage(
+                            remote.data.as_ref().map(|u| (u, remote.validated_at())),
+                            costs.data.as_ref().map(|c| (c, costs.validated_at())),
+                        ),
+                    )
+                })
+            })
+        })
+    });
+    let costs = Memo::new(move |_| {
+        visible.with(|full| {
+            day_costs.with(|remote| {
+                crate::usage::visible_costs(
+                    selected_day.get().as_deref(),
+                    full.as_deref(),
+                    remote.data.as_ref(),
+                )
+            })
+        })
+    });
+    let on_select = Callback::new(move |date: Option<String>| {
+        if selected_day.get_untracked() != date {
+            details::reset(day_usage);
+            details::reset(day_costs);
+            selected_day.set(date);
+        }
+    });
     let totals_rows: Signal<_> = Memo::new(move |_| {
         stats.with(|s| {
             s.models_total
@@ -354,58 +532,20 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
         })
     })
     .into();
-    let token_rows: Signal<_> = Memo::new(move |_| {
-        today.with(|t| {
-            t.iter()
-                .filter(|u| u.total_tokens > 0)
-                .map(|u| {
-                    (
-                        u.model.clone(),
-                        u.total_tokens as f64,
-                        fmt_tokens(u.total_tokens),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-    })
-    .into();
-    let spend_rows: Signal<_> = Memo::new(move |_| {
-        today.with(|t| {
-            let mut v: Vec<_> = t.iter().filter(|u| u.spend > 0.0).collect();
-            v.sort_by(|a, b| b.spend.total_cmp(&a.spend));
-            v.into_iter()
-                .map(|u| (u.model.clone(), u.spend, format!("${:.2}", u.spend)))
-                .collect::<Vec<_>>()
-        })
-    })
-    .into();
-    let donut_tokens: Signal<_> = Memo::new(move |_| {
-        today.with(|t| {
-            t.iter()
-                .filter(|u| u.total_tokens > 0)
-                .map(|u| u.total_tokens as f64)
-                .collect::<Vec<_>>()
-        })
-    })
-    .into();
-    let donut_label = Signal::derive(move || fmt_tokens(today_tokens.get()));
 
     view! {
         <section class="card">
-            <h2>"Aujourd'hui"</h2>
+            <h2>{move || selected_day.get().map(|d| format!("Consommation · {d}")).unwrap_or_else(|| "Aujourd'hui".into())}</h2>
             <Show when=move ||stats.with(|s|s.whole_proxy)><div class="caption">"Toutes les clés du proxy (clé administrateur)"</div></Show>
-            <div class="today">
-                <Donut values=donut_tokens center_label=donut_label center_caption="tokens" />
-                <div class="today-stats">
-                    <div class="big">{move || format!("${:.2}", today_spend.get())}</div>
-                    <div class="caption">{move || format!("{} tokens", fmt_tokens(today_tokens.get()))}</div>
-                    <TokenSplit usage=today />
-                </div>
-            </div>
-            <h3>"Tokens par modèle"</h3>
-            <Bars rows=token_rows />
-            <h3>"$ par modèle"</h3>
-            <Bars rows=spend_rows />
+            <crate::usage::DayNavigation selected=selected_day today=today_date on_select />
+            <div class="hint">"Journée locale"</div>
+            {move ||(day_usage.with(|r|r.stale) && visible.with(Option::is_some)).then(||view!{<div class="caption">"Données en cache · validation en cours ou indisponible"</div>})}
+            {move ||(day_costs.with(|r|r.stale) && visible.with(Option::is_none)).then(||view!{<div class="caption">"Coûts en cache · validation en cours ou indisponible"</div>})}
+            {move || selected_day.with(Option::is_some).then(|| view! {
+                {move || day_usage.with(|r| r.loading).then(|| view! { <div class="refreshing">{move || if costs.with(Option::is_some) {"Chargement des détails de tokens…"} else {"Chargement de la journée…"}}</div> })}
+                {move || day_usage.with(|r| r.error.clone()).map(|error| view! { <div class="error" role="alert">{error}</div> })}
+            })}
+            <crate::daily_view::DailyBreakdown usage=Signal::from(visible) costs=Signal::from(costs) known_total=Signal::derive(||None) />
         </section>
 
         <section class="card">

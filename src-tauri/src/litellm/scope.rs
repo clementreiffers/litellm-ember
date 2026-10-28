@@ -9,16 +9,16 @@ use std::time::Duration;
 
 #[derive(Clone)]
 pub(super) struct Scope {
+    pub user_id: Option<String>,
     pub key_hash: Option<String>,
 }
 
 impl Scope {
-    /// Une clé sans utilisateur (admin, master) voit tout le proxy : aucun filtre.
     fn new(user_id: Option<String>, key: &str) -> Self {
         let key_hash = user_id
             .as_ref()
             .map(|_| format!("{:x}", Sha256::digest(key.as_bytes())));
-        Self { key_hash }
+        Self { user_id, key_hash }
     }
 
     pub fn append_key(&self, path: String) -> String {

@@ -18,9 +18,11 @@ pub struct Remote<T> {
     pub data: Option<T>,
     pub loading: bool,
     pub error: Option<String>,
+    pub stale: bool,
     fetched_at: f64,
     request_id: u64,
     pending: bool,
+    validated_at: i64,
 }
 
 impl<T> Default for Remote<T> {
@@ -29,15 +31,35 @@ impl<T> Default for Remote<T> {
             data: None,
             loading: false,
             error: None,
+            stale: false,
             fetched_at: 0.0,
             request_id: 0,
             pending: false,
+            validated_at: 0,
         }
     }
 }
 
 /// Transitions sans horloge JS, testables sur la cible native.
 impl<T> Remote<T> {
+    /// Instant de validation backend de la donnée affichée (µs) ; 0 si inconnu.
+    pub fn validated_at(&self) -> i64 {
+        self.validated_at
+    }
+    fn preview(
+        &mut self,
+        request_id: u64,
+        generation: u64,
+        current_generation: u64,
+        data: T,
+        validated_at: Option<i64>,
+    ) {
+        if self.request_id == request_id && generation == current_generation {
+            self.data = Some(data);
+            self.stale = true;
+            self.validated_at = validated_at.unwrap_or(0);
+        }
+    }
     fn begin(&mut self, now: f64) -> Option<u64> {
         if self.loading
             || (self.data.is_some() && self.fetched_at > 0.0 && now - self.fetched_at < FRESH_MS)
@@ -67,7 +89,9 @@ impl<T> Remote<T> {
         }
         match result {
             Ok(detail) if detail.generation == generation => {
+                self.stale = false;
                 self.data = Some(detail.data);
+                self.validated_at = detail.validated_at.unwrap_or(0);
                 self.fetched_at = if reload { 0.0 } else { now };
             }
             Ok(_) => self.error = Some("La configuration a changé ; rechargez cet onglet".into()),
@@ -85,6 +109,177 @@ impl<T> Remote<T> {
             ..Default::default()
         };
     }
+    fn refresh(&mut self) {
+        self.request_id += 1;
+        self.loading = false;
+        self.pending = false;
+        self.fetched_at = 0.0;
+        self.error = None;
+        self.stale = self.data.is_some();
+    }
+}
+
+/// Un seul cycle forcé pour les coûts et les tokens, sans effacer la dernière valeur saine.
+pub type DailySelection = (
+    String,
+    RwSignal<Remote<shared::DailyCosts>>,
+    RwSignal<Remote<shared::DailyUsage>>,
+);
+
+pub fn refresh_days(
+    selections: Vec<DailySelection>,
+    generation: Signal<u64>,
+    refresh_budget: bool,
+) {
+    let mut dates = std::collections::HashMap::<String, Vec<_>>::new();
+    for (date, costs, usage) in selections {
+        let Some(Some(cost_id)) = costs.try_update(|r| {
+            r.refresh();
+            r.begin(js_sys::Date::now())
+        }) else {
+            continue;
+        };
+        let Some(Some(usage_id)) = usage.try_update(|r| {
+            r.refresh();
+            r.begin(js_sys::Date::now())
+        }) else {
+            continue;
+        };
+        dates
+            .entry(date)
+            .or_default()
+            .push((costs, usage, cost_id, usage_id));
+    }
+    let requested = generation.get_untracked();
+    let today = crate::usage::local_today();
+    let has_today = dates.contains_key(&today);
+    if refresh_budget && !has_today {
+        leptos::task::spawn_local(async {
+            crate::tauri::refresh_now(None).await;
+        });
+    }
+    for (date, mut targets) in dates {
+        let refresh_budget = refresh_budget && date == today;
+        leptos::task::spawn_local(async move {
+            let refresh = match crate::tauri::begin_day_refresh(date.clone()).await {
+                Ok(value) if value.generation == requested => Ok(value.data),
+                Ok(_) => Err("La configuration a changé ; rechargez cet onglet".to_owned()),
+                Err(error) => Err(error),
+            };
+            if refresh_budget {
+                let token = refresh.as_ref().ok().copied();
+                crate::tauri::refresh_now(token).await;
+            }
+            if generation.try_get_untracked() != Some(requested) {
+                return;
+            }
+            targets.retain(|(costs, usage, cost_id, usage_id)| {
+                costs.try_with_untracked(|r| r.request_id) == Some(*cost_id)
+                    && usage.try_with_untracked(|r| r.request_id) == Some(*usage_id)
+            });
+            if targets.is_empty() {
+                return;
+            }
+            let refresh = match refresh {
+                Ok(id) => id,
+                Err(error) => {
+                    for (costs, usage, cost_id, usage_id) in targets {
+                        costs.try_update(|r| {
+                            r.complete(
+                                cost_id,
+                                requested,
+                                requested,
+                                Err(error.clone()),
+                                js_sys::Date::now(),
+                            );
+                        });
+                        usage.try_update(|r| {
+                            r.complete(
+                                usage_id,
+                                requested,
+                                requested,
+                                Err(error.clone()),
+                                js_sys::Date::now(),
+                            );
+                        });
+                    }
+                    return;
+                }
+            };
+            let cost_date = date.clone();
+            let cost_targets = targets.clone();
+            leptos::task::spawn_local(async move {
+                let result =
+                    crate::tauri::get_day_costs_in_refresh(cost_date, true, Some(refresh)).await;
+                for (costs, _, cost_id, _) in cost_targets {
+                    costs.try_update(|r| {
+                        if let Some(current) = generation.try_get_untracked() {
+                            r.complete(
+                                cost_id,
+                                requested,
+                                current,
+                                result.clone(),
+                                js_sys::Date::now(),
+                            );
+                        }
+                    });
+                }
+            });
+            let result = crate::tauri::get_day_usage_in_refresh(date, true, Some(refresh)).await;
+            for (_, usage, _, usage_id) in targets {
+                usage.try_update(|r| {
+                    if let Some(current) = generation.try_get_untracked() {
+                        r.complete(
+                            usage_id,
+                            requested,
+                            current,
+                            result.clone(),
+                            js_sys::Date::now(),
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Affiche les coûts persistés, puis valide le jour sans bloquer les détails de tokens.
+pub fn load_day_costs(
+    slot: RwSignal<Remote<shared::DailyCosts>>,
+    date: String,
+    force: bool,
+    generation: Signal<u64>,
+) {
+    let Some(Some(id)) = slot.try_update(|r| r.begin(js_sys::Date::now())) else {
+        return;
+    };
+    let requested = generation.get_untracked();
+    leptos::task::spawn_local(async move {
+        if !force {
+            if let Ok(cached) = crate::tauri::get_cached_day(date.clone()).await {
+                if cached.generation == requested {
+                    let validated_at = cached.validated_at;
+                    if let Some(cached) = cached.data {
+                        slot.try_update(|r| {
+                            if let Some(current) = generation.try_get_untracked() {
+                                r.preview(id, requested, current, cached.costs, validated_at);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        let result = crate::tauri::get_day_costs(date.clone(), force).await;
+        let mut reload = false;
+        slot.try_update(|r| {
+            if let Some(current) = generation.try_get_untracked() {
+                reload = r.complete(id, requested, current, result, js_sys::Date::now());
+            }
+        });
+        if reload && !slot.is_disposed() {
+            load_day_costs(slot, date, true, generation);
+        }
+    });
 }
 
 /// Lance `fetch` sauf si un appel est en cours ou si les données sont encore fraîches.
@@ -114,53 +309,6 @@ where
         });
         if reload && slot.try_with_untracked(|_| ()).is_some() {
             load(slot, fetch, generation);
-        }
-    });
-}
-
-/// Publie d'abord le cache local, puis actualise sans masquer les cases déjà connues.
-pub fn load_history(
-    slot: RwSignal<Remote<shared::HistoryDetails>>,
-    generation: Signal<u64>,
-    mode: shared::HistoryMode,
-) {
-    let Some(Some(id)) = slot.try_update(|r| {
-        if mode == shared::HistoryMode::Force {
-            r.invalidate();
-        }
-        // La fraîcheur est centralisée dans le backend, y compris au changement de jour UTC.
-        r.fetched_at = 0.0;
-        r.begin(js_sys::Date::now())
-    }) else {
-        return;
-    };
-    let requested_generation = generation.get_untracked();
-    leptos::task::spawn_local(async move {
-        if let Ok(cached) = crate::tauri::get_history(shared::HistoryMode::Cached).await {
-            slot.try_update(|r| {
-                if r.request_id == id
-                    && generation.try_get_untracked() == Some(requested_generation)
-                    && cached.generation == requested_generation
-                {
-                    r.data = Some(cached.data);
-                }
-            });
-        }
-        let result = crate::tauri::get_history(mode).await;
-        let mut reload = false;
-        slot.try_update(|r| {
-            if let Some(current) = generation.try_get_untracked() {
-                reload = r.complete(
-                    id,
-                    requested_generation,
-                    current,
-                    result,
-                    js_sys::Date::now(),
-                );
-            }
-        });
-        if reload && slot.try_with_untracked(|_| ()).is_some() {
-            load_history(slot, generation, shared::HistoryMode::Force);
         }
     });
 }
@@ -453,7 +601,111 @@ fn PromptCacheCard(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forced_refresh_preserves_data_and_rejects_superseded_results() {
+        let mut remote = super::Remote::<u64>::default();
+        let first = remote.begin(1.0).unwrap();
+        remote.complete(
+            first,
+            1,
+            1,
+            Ok(shared::Detail {
+                generation: 1,
+                data: 7,
+                validated_at: None,
+            }),
+            2.0,
+        );
+        remote.refresh();
+        let refresh = remote.begin(3.0).unwrap();
+        remote.complete(
+            first,
+            1,
+            1,
+            Ok(shared::Detail {
+                generation: 1,
+                data: 99,
+                validated_at: None,
+            }),
+            4.0,
+        );
+        remote.complete(refresh, 1, 1, Err("offline".into()), 5.0);
+        assert_eq!(remote.data, Some(7));
+        assert!(remote.stale && remote.error.is_some());
+    }
+    #[test]
+    fn cached_preview_keeps_its_backend_validation_instant() {
+        let mut remote = super::Remote::<u64>::default();
+        let id = remote.begin(1.0).unwrap();
+        remote.preview(id, 1, 1, 9, Some(500));
+        remote.complete(id, 1, 1, Err("offline".into()), 2.0);
+        assert_eq!((remote.data, remote.validated_at()), (Some(9), 500));
+    }
+    #[test]
+    fn cached_preview_survives_error_and_rejects_old_requests() {
+        let mut remote = super::Remote::<u64>::default();
+        let id = remote.begin(1.0).unwrap();
+        remote.preview(id, 1, 1, 7, None);
+        assert_eq!(remote.data, Some(7));
+        assert!(remote.stale && remote.loading);
+        remote.complete(id, 1, 1, Err("offline".into()), 2.0);
+        assert_eq!(remote.data, Some(7));
+        assert!(remote.stale && remote.error.is_some());
+        remote.reset();
+        let latest = remote.begin(3.0).unwrap();
+        remote.preview(id, 1, 1, 99, None);
+        assert!(remote.data.is_none());
+        remote.preview(latest, 1, 2, 99, None);
+        assert!(remote.data.is_none());
+        remote.complete(
+            latest,
+            2,
+            2,
+            Ok(shared::Detail {
+                generation: 2,
+                data: 8,
+                validated_at: None,
+            }),
+            4.0,
+        );
+        assert_eq!(remote.data, Some(8));
+        assert!(!remote.stale);
+    }
     use super::*;
+    #[test]
+    fn dated_responses_survive_a_b_a_navigation_and_distinguish_empty_from_failure() {
+        let mut remote = Remote::<shared::DailyUsage>::default();
+        let a = remote.begin(100.0).unwrap();
+        remote.reset();
+        let b = remote.begin(200.0).unwrap();
+        remote.reset();
+        let newest_a = remote.begin(300.0).unwrap();
+        let data = |date: &str| {
+            Ok(Detail {
+                generation: 1,
+                data: shared::DailyUsage {
+                    date: date.into(),
+                    models: vec![],
+                },
+                validated_at: None,
+            })
+        };
+        remote.complete(a, 1, 1, data("2024-02-29"), 400.0);
+        remote.complete(b, 1, 1, data("2024-02-28"), 500.0);
+        assert!(remote.loading);
+        assert!(remote.data.is_none());
+        remote.complete(newest_a, 1, 1, Err("offline".into()), 600.0);
+        assert!(remote.data.is_none());
+        assert!(remote.error.is_some());
+        let retry = remote.begin(700.0).unwrap();
+        remote.complete(retry, 1, 1, data("2024-02-29"), 800.0);
+        assert!(remote.data.as_ref().unwrap().models.is_empty());
+        assert!(remote.error.is_none());
+        remote.reset();
+        let old_connection = remote.begin(900.0).unwrap();
+        remote.complete(old_connection, 1, 2, data("2024-02-29"), 1000.0);
+        assert!(remote.data.is_none());
+    }
     #[test]
     fn prompt_cache_labels_distinguish_missing_data_from_zero_usage() {
         let mut usage = shared::PromptCacheUsage::default();
@@ -480,6 +732,7 @@ mod tests {
         Ok(Detail {
             generation,
             data: value,
+            validated_at: None,
         })
     }
     #[test]
