@@ -1,9 +1,10 @@
 //! Calculs déterministes : aucune entrée/sortie ni lecture de l'horloge.
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
+#[cfg(test)]
+use shared::ModelUsage;
 use shared::{
-    Activity, DayCost, HourBucket, ModelActivity, ModelCost, ModelUsage, PromptCacheUsage,
-    TopRequest,
+    Activity, DayCost, HourBucket, ModelActivity, ModelCost, PromptCacheUsage, TopRequest,
 };
 use std::collections::HashMap;
 
@@ -249,6 +250,7 @@ pub(super) fn aggregate_totals(days: &[DaySummary]) -> Vec<ModelCost> {
     out
 }
 
+#[cfg(test)]
 pub(super) fn aggregate_today(
     rows: &[LogRow],
     today: NaiveDate,

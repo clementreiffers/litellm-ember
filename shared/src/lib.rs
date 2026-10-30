@@ -60,6 +60,56 @@ pub struct ModelUsage {
     pub total_tokens: u64,
 }
 
+/// Consommation à la demande, distincte des statistiques de la période courante.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyUsage {
+    /// Jour local au format YYYY-MM-DD.
+    pub date: String,
+    pub models: Vec<ModelUsage>,
+}
+
+/// Aperçu des coûts d'une journée locale, sans compteurs de tokens inventés.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DailyCosts {
+    pub date: String,
+    pub models: Vec<ModelCost>,
+}
+
+/// Coûts par modèle concordants à 1e-8 près ; un modèle absent d'un côté compte pour zéro
+/// (modèles sans tarif, seaux vidés par la correction des frontières locales).
+pub fn costs_match(usage: &[ModelUsage], costs: &[ModelCost]) -> bool {
+    let used = |model: &str| -> f64 {
+        usage
+            .iter()
+            .filter(|m| m.model == model)
+            .map(|m| m.spend)
+            .sum()
+    };
+    let billed = |model: &str| -> f64 {
+        costs
+            .iter()
+            .filter(|c| c.model == model)
+            .map(|c| c.spend)
+            .sum()
+    };
+    usage
+        .iter()
+        .map(|m| m.model.as_str())
+        .chain(costs.iter().map(|c| c.model.as_str()))
+        .all(|model| (used(model) - billed(model)).abs() <= 1e-8)
+}
+
+/// Agrégats locaux persistés ; une valeur périmée reste un aperçu jusqu'à validation réseau.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedDaily {
+    pub costs: DailyCosts,
+    pub usage: Option<DailyUsage>,
+    pub stale: bool,
+    pub usage_stale: bool,
+    pub usage_fetched_at: Option<String>,
+    pub fetched_at: String,
+}
+
 /// État complet envoyé au front. `#[serde(default)]` : un cache écrit par une ancienne version reste lisible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -250,6 +300,32 @@ pub struct Activity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn costs_match_treats_missing_models_as_zero() {
+        let usage = |model: &str, spend| ModelUsage {
+            model: model.into(),
+            spend,
+            ..Default::default()
+        };
+        let cost = |model: &str, spend| ModelCost {
+            model: model.into(),
+            spend,
+        };
+        assert!(costs_match(
+            &[usage("m", 2.0), usage("free", 0.0)],
+            &[cost("m", 2.0)]
+        ));
+        assert!(costs_match(
+            &[usage("m", 2.0)],
+            &[cost("m", 2.0), cost("", 0.0)]
+        ));
+        assert!(costs_match(&[usage("m", 2.0)], &[cost("m", 2.0 + 1e-12)]));
+        assert!(!costs_match(&[usage("m", 2.0)], &[cost("m", 9.0)]));
+        assert!(!costs_match(
+            &[usage("m", 2.0)],
+            &[cost("m", 2.0), cost("x", 1.0)]
+        ));
+    }
     use super::*;
 
     #[test]
@@ -372,6 +448,9 @@ mod tests {
 pub struct Detail<T> {
     pub generation: u64,
     pub data: T,
+    /// Instant de validation côté backend (µs Unix) : ordonne coûts et tokens d'une journée.
+    #[serde(default)]
+    pub validated_at: Option<i64>,
 }
 
 #[cfg(test)]
@@ -448,6 +527,22 @@ pub struct HistoryDetails {
     pub first_weekday: u8,
     pub updated_at: Option<String>,
     pub error: Option<String>,
+}
+
+/// Calendrier local publié progressivement ; la révision ordonne commandes et événements.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalHistorySnapshot {
+    pub generation: u64,
+    pub revision: u64,
+    pub calendar_id: String,
+    pub loading: bool,
+    pub details: HistoryDetails,
+    /// Coûts locaux vérifiés lors d'une sélection, distincts des estimations du calendrier.
+    #[serde(default)]
+    pub exact_costs: Vec<HistoryDay>,
+    /// Révision des détails de tokens par jour local : change même à coût identique.
+    #[serde(default)]
+    pub usage_revisions: Vec<(String, u64)>,
 }
 mod harness;
 pub use harness::*;

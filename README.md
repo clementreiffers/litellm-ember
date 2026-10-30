@@ -248,8 +248,6 @@ The application interface is currently in French. The tab names used above corre
 
 Your key must have access to the `/key/info` and `/spend/logs` endpoints. Without a saved key, the application makes no requests to LiteLLM.
 
-Spend queries are filtered by the key's SHA-256 hash when `/key/info` reports a user ID, so a user key only sees its own spending. Keys whose `/key/info` has no user ID (admin or master keys) send no key filter: every spend view then covers the whole proxy and shows **Toutes les clés du proxy (clé administrateur)**. If `/key/info` fails, spend queries fail too rather than guessing a scope. Error messages show the endpoint path without its query string.
-
 ### Local storage
 
 After upgrading from a build with the previous application identity, enter your endpoint and API key again. Existing local data and Keychain entries are left untouched and are not imported automatically. macOS may ask you to allow notifications again.
@@ -258,15 +256,47 @@ Your API key is stored in the **macOS Keychain** and is never sent back to the i
 
 Alerts remember which thresholds have already been reported. They reset when a new budget period starts or when spending drops below the relevant threshold.
 
+### Daily usage navigation
+
+In **Consommation**, use the date picker or previous/next-day buttons to inspect daily costs, tokens, and model breakdowns. **Aujourd'hui** returns to today's live usage. Dates follow your Mac's local calendar; future dates are unavailable. The selected date stays selected while you switch tabs or open Settings, until you choose another date or restart Ember.
+
+Past days load on demand, and **Rafraîchir tout** reloads the selected day's figures. You can select dates older than 30 days, provided your LiteLLM server still retains their logs. An empty response means no usage was returned; Ember cannot distinguish an unused day from logs removed by server retention. Loading and network errors do not display another day's figures.
+
+Costs and model costs appear first from a lightweight spending summary while token details load separately. Because summaries use UTC days, Ember adds or subtracts the boundary intervals needed to match your local day. Token charts stay hidden until their counters arrive, rather than showing zero. If the summary or its boundary correction is unavailable, the full usage request still supplies the figures. Once complete details arrive, they take precedence over an older preview; a newer preview whose costs disagree hides the older token figures until fresh details arrive.
+
+Historical loading uses `/spend/logs/v2` with exact local-day boundaries converted to UTC, 1,000 records per page, and up to three concurrent page requests. This endpoint omits prompt and response bodies. Ember checks that all pages are complete before showing totals. A day still in progress stops at the request start; if late logs change the page total, the whole download restarts, up to three attempts. Servers that deny or lack this endpoint, or cap the result count, use the original `/spend/logs` query instead.
+
+If the legacy endpoint also reports truncation, Ember shows an error instead of presenting incomplete totals as a full day's usage.
+
+Up to 30 recently visited daily aggregates stay in memory for 15 minutes, making return visits fast. Validated costs and complete usage are also stored atomically in `daily-usage.json`, keyed by connection identity and exact local-day boundaries. This is a cache limit, not a limit on selectable dates. Today's data, and any day validated before its end plus one minute, expires after 60 seconds; expiry uses the wall clock, so time asleep counts. **Rafraîchir tout** bypasses the selected day's cache; changing the endpoint or API key clears connection-specific data. No historical request logs or API keys are written to this cache.
+
+Cost previews are cached with the same 30-day capacity and 15-minute expiry, even while token details are still loading. After a restart, fresh persisted aggregates avoid another daily download. Older costs within the last 30 days appear immediately with a cache label while network validation runs; unavailable or truncated responses do not overwrite a healthy entry. Missing tokens remain absent until complete usage is available. Dates outside that window use LiteLLM directly.
+
+Today's automatic refresh populates the same validated daily cache used by the heatmap recap. Selecting today therefore reuses current Consommation results within the 60-second freshness window. After the first current-day refresh, Ember also preloads yesterday in the background, reusing fresh persisted data when available. This runs once per connection/local day and does not delay current budget updates. Activity metrics keep their separate raw-request cache.
+
+Selecting a day while its preload is still running joins that download. Today's recap and the global refresh share one forced attempt; superseded results cannot replace current figures. Accepted daily usage updates current-day stats, persistent aggregates and exact heatmap costs through the same guarded publication path.
+
+For complete usage, Ember first tries `/user/daily/activity/aggregated`, scoped to the key's hash and its user ID from `/key/info`. Keys whose `/key/info` has no user ID (admin or master keys) send no key filter, so every spend view covers the whole proxy and shows a label saying so. This endpoint can return model costs and token counters without downloading the whole day's request logs. Its historical buckets are UTC, so Ember corrects the local-day boundaries for costs and tokens. Forbidden, missing, slow, malformed, or incomplete analytics responses fall back to the paginated endpoint described above. A forbidden, missing or incompatible analytics source is retried after 15 minutes; timeouts and server errors after 60 seconds; **Rafraîchir tout** retries immediately. API keys without permission continue to work through the existing endpoints.
+
+Concurrent dates share the initial key lookup without holding an async mutex during HTTP. Cost previews and analytics share complete boundary-page downloads through a bounded, short-lived in-memory cache. Failures and incomplete pages are not retained; manual refresh bypasses completed boundary values while parallel consumers can share an in-flight request.
+
+Each manual daily refresh uses one shared attempt for costs and tokens. It supersedes older boundary downloads and rejects obsolete persistence; compatible displayed figures remain visible with a cache label if validation fails. Costs and usage retain separate validation timestamps, so a later preview cannot discard complete tokens or renew their freshness. In-memory reads preserve those timestamps. Legacy daily queries use the same key scope as the other spend queries, and incomplete counters or unreconciled model summaries are rejected before caching. Selected historical dates also track their own local midnight boundaries, including dates older than the heatmap window.
+
+When both screens select the same date, **Rafraîchir tout** shares one request pair between them. Stale persisted usage revalidates normally, reusing fresh memory caches and the analytics retry window; only **Rafraîchir tout** forces a download. Newer corrected costs hide older tokens that no longer match them until fresh tokens arrive. Daily results require usable model names and checked aggregate totals, so missing models or numeric overflow cannot silently produce incomplete figures.
+
+LiteLLM can log failures before identifying a model. An unnamed failed request is ignored only when spending and all three token counters are explicitly zero; an unnamed summary bucket is allowed only at zero cost. Nonzero or incomplete unnamed usage still produces an error rather than silently reducing totals.
+
+The header, budget gauge, period model costs, and menu-bar amount always describe the **current budget period**. Consommation and the selected-date recap use exact local calendar days. The heatmap uses local date labels with explicitly estimated colors from UTC daily aggregates.
+
 ### Daily spending calendar
 
-Open **Historique** for a GitHub-style calendar: weeks run left to right and Monday through Sunday run top to bottom. The 30-day rolling window includes today, which is marked **en cours**. All dates are UTC. Hover, focus with the keyboard, or select a square to read its date and cost.
+Open **Historique** for a GitHub-style calendar: weeks run left to right and Monday through Sunday run top to bottom. The 30-day rolling window includes local today, which is marked **en cours**. Colors load from one lightweight aggregate request before any date is selected. They are labeled estimates because the server aggregates UTC days, so costs near midnight may differ from the selected local day's figures. Click a square, or activate it with Enter or Space, to open a daily recap below the heatmap. Exact local model costs and token charts reuse today's refresh and yesterday's background preload; other dates load on selection. The recap shares the main screen's daily caches while keeping its date selection independent. Close the recap with its close button.
 
 Purple intensity represents spending relative to the largest known amount in the visible window: a neutral square for zero and four levels for positive spending. Hatched squares mean unknown data, not zero. The total is marked incomplete while any day is unknown. Existing projections, yesterday comparisons and spending charts remain below the calendar.
 
-Ember loads a small, versioned `history.json` cache once and keeps at most 30 daily totals in memory. At first synchronization and on a new UTC day, it fetches all 30 days of LiteLLM summaries to incorporate corrections. Later visits update only today, at most once per minute; **Rafraîchir tout** requests the full window. No extra polling loop or detailed request logs are needed for the calendar. Network failures preserve the cached figures and show an error. Changing the endpoint or key clears the displayed history.
+Ember keeps aggregate estimates and verified local costs separately in the versioned `history-local.json` cache. At first synchronization and on a new local day, one summary request refreshes the window; it makes no boundary-log or token-detail requests. Later visits update today's estimate at most once per minute; **Rafraîchir tout** refreshes the full window and visible recap. Network failures retain cached figures with an error. Connection changes clear both datasets; timezone changes invalidate incompatible exact local values. A local clock checked every 30 seconds advances the calendar after midnight without additional network polling. Cache files are written in the background; a failed write is logged and does not trigger a refetch. New exact daily results refresh stale recap data across screens.
 
-This history is shared with unusual-spending detection, which still compares 21 completed days and ignores today. With those alerts disabled, calendar data is fetched only on demand. Days missing from a successful server response count as zero; server retention limits can still make an apparently complete window underestimate actual spending.
+Unusual-spending detection uses its independent UTC `history.json` cache, compares 21 completed days, and ignores today. Calendar data is fetched only on demand. Days missing from a successful server response count as zero; server retention limits can still make an apparently complete window underestimate actual spending.
 
 ### Unusual spending alerts
 
