@@ -266,7 +266,7 @@ fn Main(
         {move || match tab.get() {
             Tab::Agents => view! { <crate::harness::Agents snapshot=harnesses /> }.into_any(),
             Tab::Usage => view! { <UsageTab stats /> }.into_any(),
-            Tab::History => view! { <crate::history::HistoryCalendar history /><WeekTab week max_budget /> }.into_any(),
+            Tab::History => view! { <crate::history::HistoryCalendar history /><Show when=move ||stats.with(|s|s.whole_proxy)><div class="caption">"Toutes les clés du proxy (clé administrateur)"</div></Show><WeekTab week max_budget /> }.into_any(),
             Tab::Activity => view! { <ActivityTab activity /> }.into_any(),
         }}
     }
@@ -393,6 +393,7 @@ fn UsageTab(stats: RwSignal<Stats>) -> impl IntoView {
     view! {
         <section class="card">
             <h2>"Aujourd'hui"</h2>
+            <Show when=move ||stats.with(|s|s.whole_proxy)><div class="caption">"Toutes les clés du proxy (clé administrateur)"</div></Show>
             <div class="today">
                 <Donut values=donut_tokens center_label=donut_label center_caption="tokens" />
                 <div class="today-stats">

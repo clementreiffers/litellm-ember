@@ -75,6 +75,8 @@ pub struct Stats {
     pub total_spend: f64,
     /// Dépense de la période de budget en cours (`/key/info`, remise à zéro périodiquement).
     pub period_spend: f64,
+    /// Indique que les statistiques de consommation couvrent toutes les clés du proxy.
+    pub whole_proxy: bool,
     pub max_budget: Option<f64>,
     /// Instant ISO 8601 du prochain reset ; accepte aussi les anciennes dates YYYY-MM-DD.
     pub budget_reset_at: Option<String>,
@@ -335,11 +337,24 @@ mod tests {
         let stats: Stats = serde_json::from_str(old).unwrap();
         assert_eq!(stats.total_spend, 3.0);
         assert_eq!(stats.max_budget, None);
+        assert!(!stats.whole_proxy);
         assert!(stats.today.is_empty());
         assert_eq!(
             serde_json::from_str::<Stats>("{}").unwrap(),
             Stats::default()
         );
+    }
+
+    #[test]
+    fn whole_proxy_flag_roundtrips_without_exposing_scope_identity() {
+        let stats = Stats {
+            whole_proxy: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("\"whole_proxy\":true"));
+        assert!(!json.contains("user_id") && !json.contains("api_key"));
+        assert_eq!(serde_json::from_str::<Stats>(&json).unwrap(), stats);
     }
 
     #[test]
